@@ -7,3 +7,4 @@ from .joystick import (
     G1WalkRewardConfig,
     G1WalkRoughCfg,
 )
+from .rough_raycast import G1WalkRoughRaycastCfg, G1WalkRoughRaycastEnv

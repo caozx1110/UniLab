@@ -37,6 +37,8 @@ from ..base import (
     BackendHeightScanner,
     BackendPlayCapabilities,
     BackendPlayRenderPlan,
+    BackendRaycaster,
+    RaycastResult,
     SimBackend,
     normalize_play_render_mode,
 )
@@ -47,6 +49,31 @@ def _root_state_dims(model) -> tuple[int, int]:
     if model.njnt > 0 and int(model.jnt_type[0]) == int(mujoco.mjtJoint.mjJNT_FREE):
         return 7, 6
     return 0, 0
+
+
+def _rotate_vectors_by_quat(q: np.ndarray, v: np.ndarray) -> np.ndarray:
+    """Rotate broadcast-compatible vectors by wxyz quaternions."""
+    if q.shape[-1] != 4 or v.shape[-1] != 3:
+        raise ValueError(f"Expected q (..., 4) and v (..., 3), got {q.shape} and {v.shape}")
+    lead_shape = np.broadcast_shapes(q.shape[:-1], v.shape[:-1])
+    q = np.broadcast_to(q, (*lead_shape, 4))
+    v = np.broadcast_to(v, (*lead_shape, 3))
+
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    vx, vy, vz = v[..., 0], v[..., 1], v[..., 2]
+
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+
+    return v + np.stack(
+        [
+            w * tx + y * tz - z * ty,
+            w * ty + z * tx - x * tz,
+            w * tz + x * ty - y * tx,
+        ],
+        axis=-1,
+    )
 
 
 @dataclass
@@ -72,6 +99,66 @@ class _MuJoCoHeightScanner(BackendHeightScanner):
             output=self.output,
         )
         return np.asarray(heights, dtype=self.backend._np_dtype)
+
+
+@dataclass
+class _MuJoCoRaycaster(BackendRaycaster):
+    backend: "MuJoCoBackend"
+    frame_body_id: int
+    directions: np.ndarray
+    origin_offsets: np.ndarray
+    alignment: str
+    geomgroup: np.ndarray | None
+    flg_static: int
+    bodyexclude: int | np.ndarray
+    return_normal: bool
+    cutoff: float
+
+    def cast(self) -> RaycastResult:
+        pool = self.backend._pool
+        if pool is None:
+            raise RuntimeError("MuJoCo backend pool must be materialized before raycasting")
+        multi_ray = getattr(pool, "multi_ray", None)
+        if not callable(multi_ray):
+            raise NotImplementedError(
+                "MuJoCo batch raycaster requires mujoco-uni with BatchEnvPool.multi_ray "
+                "(for example the TestPyPI mujoco-uni==3.8.0.post1 build)."
+            )
+
+        origins, directions = self.backend._raycast_world_origins_and_dirs(
+            frame_body_id=self.frame_body_id,
+            local_directions=self.directions,
+            local_origin_offsets=self.origin_offsets,
+            alignment=self.alignment,
+        )
+        dist, geomid, normal = multi_ray(
+            self.backend._physics_state,
+            origins,
+            directions,
+            geomgroup=self.geomgroup,
+            flg_static=self.flg_static,
+            bodyexclude=self.bodyexclude,
+            return_normal=self.return_normal,
+            cutoff=self.cutoff,
+        )
+        distances = np.asarray(dist, dtype=self.backend._np_dtype)
+        geom_ids = np.asarray(geomid, dtype=np.int32)
+        expected = (self.backend.num_envs, self.directions.shape[0])
+        if distances.shape != expected or geom_ids.shape != expected:
+            raise ValueError(
+                "BatchEnvPool.multi_ray returned invalid shapes: "
+                f"dist={distances.shape}, geomid={geom_ids.shape}, expected={expected}"
+            )
+        normals = None
+        if normal is not None:
+            normals = np.asarray(normal, dtype=self.backend._np_dtype)
+            expected_normal = (*expected, 3)
+            if normals.shape != expected_normal:
+                raise ValueError(
+                    "BatchEnvPool.multi_ray returned invalid normal shape: "
+                    f"{normals.shape}, expected={expected_normal}"
+                )
+        return RaycastResult(distances=distances, geom_ids=geom_ids, normals=normals)
 
 
 def _prepare_variant_model_xml(
@@ -686,6 +773,163 @@ class MuJoCoBackend(SimBackend):
             frame_body_id=int(frame_body_id),
             alignment=alignment,
             output=output,
+        )
+
+    def create_raycaster(
+        self,
+        *,
+        frame_body_id: int,
+        directions: np.ndarray,
+        origin_offsets: np.ndarray | None = None,
+        origin_offset: np.ndarray | None = None,
+        alignment: str = "yaw",
+        geomgroup: np.ndarray | Sequence[int] | None = None,
+        flg_static: int = 1,
+        bodyexclude: int | np.ndarray | None = None,
+        return_normal: bool = False,
+        cutoff: float = 1.0e10,
+    ) -> BackendRaycaster:
+        directions_np = np.ascontiguousarray(np.asarray(directions, dtype=np.float64))
+        if directions_np.ndim != 2 or directions_np.shape[1] != 3:
+            raise ValueError(f"directions must have shape (num_rays, 3), got {directions_np.shape}")
+        norms = np.linalg.norm(directions_np, axis=1)
+        if np.any(norms <= 0.0):
+            raise ValueError("ray directions must be non-zero")
+        directions_np = np.ascontiguousarray(directions_np / norms[:, None], dtype=np.float64)
+
+        if origin_offsets is not None and origin_offset is not None:
+            raise ValueError("Provide only one of origin_offsets or origin_offset")
+        if origin_offsets is None:
+            if origin_offset is None:
+                origin_offsets_np = np.zeros_like(directions_np, dtype=np.float64)
+            else:
+                origin_offset_np = np.asarray(origin_offset, dtype=np.float64)
+                if origin_offset_np.shape != (3,):
+                    raise ValueError(
+                        f"origin_offset must have shape (3,), got {origin_offset_np.shape}"
+                    )
+                origin_offsets_np = np.broadcast_to(
+                    origin_offset_np[None, :], directions_np.shape
+                ).copy()
+        else:
+            origin_offsets_np = np.asarray(origin_offsets, dtype=np.float64)
+            if origin_offsets_np.shape == (3,):
+                origin_offsets_np = np.broadcast_to(
+                    origin_offsets_np[None, :], directions_np.shape
+                ).copy()
+            elif origin_offsets_np.shape != directions_np.shape:
+                raise ValueError(
+                    "origin_offsets must have shape (3,) or "
+                    f"{directions_np.shape}, got {origin_offsets_np.shape}"
+                )
+        origin_offsets_np = np.ascontiguousarray(origin_offsets_np, dtype=np.float64)
+
+        geomgroup_np: np.ndarray | None
+        if geomgroup is None:
+            geomgroup_np = None
+        else:
+            geomgroup_arr = np.asarray(geomgroup)
+            if geomgroup_arr.shape == (6,) and geomgroup_arr.dtype == np.uint8:
+                geomgroup_np = np.ascontiguousarray(geomgroup_arr, dtype=np.uint8)
+            else:
+                groups = np.asarray(geomgroup_arr, dtype=np.int32).reshape(-1)
+                if np.any((groups < 0) | (groups > 5)):
+                    raise ValueError(f"geomgroup entries must be in [0, 5], got {groups}")
+                mask = np.zeros((6,), dtype=np.uint8)
+                mask[groups] = 1
+                geomgroup_np = mask
+
+        if bodyexclude is None:
+            bodyexclude_np: int | np.ndarray = int(frame_body_id)
+        elif np.isscalar(bodyexclude):
+            bodyexclude_np = int(bodyexclude)
+        else:
+            bodyexclude_arr = np.asarray(bodyexclude, dtype=np.int32)
+            if bodyexclude_arr.shape != (self._num_envs,):
+                raise ValueError(
+                    f"bodyexclude must be scalar or shape ({self._num_envs},), "
+                    f"got {bodyexclude_arr.shape}"
+                )
+            bodyexclude_np = np.ascontiguousarray(bodyexclude_arr, dtype=np.int32)
+
+        alignment_norm = str(alignment).lower()
+        if alignment_norm in {"none"}:
+            alignment_norm = "world"
+        if alignment_norm in {"full"}:
+            alignment_norm = "body"
+        if alignment_norm not in {"yaw", "world", "body"}:
+            raise ValueError("alignment must be one of 'yaw', 'world', or 'body'")
+
+        return _MuJoCoRaycaster(
+            backend=self,
+            frame_body_id=int(frame_body_id),
+            directions=directions_np,
+            origin_offsets=origin_offsets_np,
+            alignment=alignment_norm,
+            geomgroup=geomgroup_np,
+            flg_static=int(flg_static),
+            bodyexclude=bodyexclude_np,
+            return_normal=bool(return_normal),
+            cutoff=float(cutoff),
+        )
+
+    def _raycast_world_origins_and_dirs(
+        self,
+        *,
+        frame_body_id: int,
+        local_directions: np.ndarray,
+        local_origin_offsets: np.ndarray,
+        alignment: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if frame_body_id == self._base_body_id:
+            frame_pos = np.asarray(self.get_base_pos(), dtype=np.float64)
+            frame_quat = np.asarray(self.get_base_quat(), dtype=np.float64)
+        else:
+            if not self.add_body_sensors:
+                raise ValueError(
+                    "Raycast frame_body_id is not the backend base body; construct the "
+                    "MuJoCo backend with add_body_sensors=True or attach raycasts to the base."
+                )
+            body_ids = np.asarray([frame_body_id], dtype=np.int32)
+            frame_pos = np.asarray(self.get_body_pos_w(body_ids)[:, 0, :], dtype=np.float64)
+            frame_quat = np.asarray(self.get_body_quat_w(body_ids)[:, 0, :], dtype=np.float64)
+
+        if alignment == "world":
+            origins = frame_pos[:, None, :] + local_origin_offsets[None, :, :]
+            directions = np.broadcast_to(
+                local_directions[None, :, :],
+                (self._num_envs, local_directions.shape[0], 3),
+            )
+            return (
+                np.ascontiguousarray(origins, dtype=np.float64),
+                np.ascontiguousarray(directions, dtype=np.float64),
+            )
+
+        if alignment == "yaw":
+            w = frame_quat[:, 0]
+            x = frame_quat[:, 1]
+            y = frame_quat[:, 2]
+            z = frame_quat[:, 3]
+            yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+            half = 0.5 * yaw
+            rot_quat = np.stack(
+                [
+                    np.cos(half),
+                    np.zeros_like(half),
+                    np.zeros_like(half),
+                    np.sin(half),
+                ],
+                axis=1,
+            )
+        else:
+            rot_quat = frame_quat
+
+        offsets = _rotate_vectors_by_quat(rot_quat[:, None, :], local_origin_offsets[None, :, :])
+        directions = _rotate_vectors_by_quat(rot_quat[:, None, :], local_directions[None, :, :])
+        origins = frame_pos[:, None, :] + offsets
+        return (
+            np.ascontiguousarray(origins, dtype=np.float64),
+            np.ascontiguousarray(directions, dtype=np.float64),
         )
 
     def get_body_subtree_ids(self, root_body_id: int) -> np.ndarray:

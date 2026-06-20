@@ -254,6 +254,49 @@ def test_go2_joystick_rough_terrain_cfg_is_independent_per_instance():
     assert b.scene.terrain.generator.num_rows == 3
 
 
+def test_g1_walk_rough_raycast_task_compose():
+    from hydra import compose, initialize_config_dir
+    from hydra.core.global_hydra import GlobalHydra
+
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=str(CONF_DIR / "ppo"), version_base="1.3"):
+        cfg = compose("config", overrides=["task=g1_walk_rough_raycast/mujoco"])
+    assert cfg.training.task_name == "G1WalkRoughRaycast"
+    assert cfg.training.sim_backend == "mujoco"
+    assert cfg.algo.num_steps_per_env == 24
+    assert cfg.algo.max_iterations == 30000
+    assert cfg.algo.policy.actor_hidden_dims == [512, 256, 128]
+    assert cfg.algo.policy.critic_hidden_dims == [512, 256, 128]
+    assert cfg.algo.algorithm.learning_rate == 1.0e-3
+    assert cfg.algo.algorithm.entropy_coef == 1.0e-2
+    assert cfg.algo.algorithm.num_learning_epochs == 5
+    assert cfg.algo.algorithm.num_mini_batches == 4
+    assert cfg.env.raycast_scan.enabled is True
+    assert cfg.env.raycast_scan.pattern == "grid"
+    assert cfg.env.raycast_scan.num_rays == 187
+    assert cfg.env.raycast_scan.grid_size == [1.6, 1.0]
+    assert cfg.env.raycast_scan.resolution == 0.1
+    assert cfg.env.scene.terrain.geom_name == "floor"
+    assert cfg.env.scene.terrain.generator.curriculum is True
+    assert cfg.env.scene.terrain.generator.num_rows == 10
+    assert cfg.env.scene.terrain.generator.num_cols == 20
+    assert cfg.env.scene.terrain.generator.border_width == 20.0
+    assert cfg.env.scene.terrain.generator.sub_terrains.flat.proportion == 0.2
+    assert cfg.env.scene.terrain.generator.sub_terrains.pyramid_stairs.step_height_range == [
+        0.0,
+        0.1,
+    ]
+    assert cfg.env.commands.vel_limit == [[-1.0, -1.0, -0.5], [1.0, 1.0, 0.5]]
+    assert cfg.env.commands.resampling_time == 5.5
+    assert cfg.env.commands.heading_command is True
+    assert cfg.env.commands.heading_control_stiffness == 0.5
+    assert cfg.env.commands.rel_standing_envs == 0.1
+    assert cfg.env.commands.rel_heading_envs == 0.3
+    assert cfg.env.commands.rel_forward_envs == 0.2
+    assert cfg.algo.obs_groups.actor == ["actor"]
+    assert cfg.algo.obs_groups.critic == ["critic"]
+
+
 def test_go2_joystick_rough_playback_model_uses_backend_scene(tmp_path):
     """Offline playback / video rendering must reuse the backend-compiled scene model."""
     import mujoco

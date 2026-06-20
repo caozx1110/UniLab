@@ -1,0 +1,131 @@
+# @package _global_
+defaults:
+  - /task/g1_walk_flat/base
+  - _self_
+
+training:
+  # Migrates mjlab task: Mjlab-Velocity-Rough-Unitree-G1.
+  task_name: G1WalkRoughRaycast
+  sim_backend: mujoco
+  play_steps: 500
+  play_env_num: 16
+  render_spacing: 0.0
+  cam_tracking: true
+  cam_tracking_env_idx: 0
+  cam_tracking_extra_envs: 9
+
+interactive:
+  action_mode: policy
+  policy_obs_mode: auto
+  camera_follow_body: true
+  use_env_visual_model: false
+
+algo:
+  num_envs: 2048
+  max_iterations: 30000
+  empirical_normalization: false
+  obs_groups:
+    actor:
+      - actor
+    critic:
+      - critic
+  policy:
+    actor_hidden_dims: [512, 256, 128]
+    critic_hidden_dims: [512, 256, 128]
+  algorithm:
+    learning_rate: 1.0e-3
+    entropy_coef: 1.0e-2
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    gamma: 0.99
+    lam: 0.95
+    desired_kl: 0.01
+    max_grad_norm: 1.0
+
+env:
+  sim_dt: 0.005
+  ctrl_dt: 0.02
+  commands:
+    vel_limit:
+      - [-1.0, -1.0, -0.5]
+      - [1.0, 1.0, 0.5]
+    resampling_time: 5.5
+    heading_command: true
+    heading_range: [-3.141592653589793, 3.141592653589793]
+    heading_control_stiffness: 0.5
+    rel_standing_envs: 0.1
+    rel_heading_envs: 0.3
+    rel_forward_envs: 0.2
+  curriculum:
+    enabled: false
+  noise_config:
+    level: 1.0
+    scale_joint_angle: 0.01
+    scale_joint_vel: 1.5
+    scale_gyro: 0.2
+  scene:
+    model_file: src/unilab/assets/robots/g1/g1.xml
+    fragment_files:
+      - src/unilab/assets/robots/g1/locomotion_task.xml
+    terrain:
+      hfield_name: terrain_hfield
+      geom_name: floor
+      generator:
+        seed: 42
+        curriculum: true
+        size: [8.0, 8.0]
+        num_rows: 10
+        num_cols: 20
+        border_width: 20.0
+        sub_terrains:
+          flat:
+            proportion: 0.2
+          pyramid_stairs:
+            proportion: 0.2
+            step_height_range: [0.0, 0.1]
+          pyramid_stairs_inv:
+            proportion: 0.2
+            step_height_range: [0.0, 0.1]
+          hf_pyramid_slope:
+            proportion: 0.1
+            slope_range: [0.0, 1.0]
+          hf_pyramid_slope_inv:
+            proportion: 0.1
+            slope_range: [0.0, 1.0]
+          random_rough:
+            proportion: 0.1
+          wave_terrain:
+            proportion: 0.1
+  raycast_scan:
+    enabled: true
+    frame_body_name: pelvis
+    pattern: grid
+    num_rays: 187
+    grid_size: [1.6, 1.0]
+    resolution: 0.1
+    forward_range: [-0.8, 0.8]
+    lateral_range: [-0.5, 0.5]
+    alignment: yaw
+    geom_groups: [0]
+    cutoff: 5.0
+    scale: 0.2
+
+reward:
+  scales:
+    tracking_lin_vel: 2.0
+    tracking_ang_vel: 0.2
+    feet_phase: 1.0
+    lin_vel_z: -1.0
+    ang_vel_xy: -0.25
+    base_height: -500.0
+    orientation: -5.0
+    action_rate: -0.01
+    pose: -0.1
+  tracking_sigma: 0.25
+  gait_frequency: 1.5
+  feet_phase_swing_height: 0.09
+  feet_phase_tracking_sigma: 0.008
+  base_height_target: 0.754
+  min_base_height: 0.55
+  max_tilt_deg: 35.0
+  pose_weights: [0.01, 1.0, 5.0, 0.01, 5.0, 5.0, 0.01, 1.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]

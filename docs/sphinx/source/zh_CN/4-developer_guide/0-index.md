@@ -95,4 +95,5 @@ DR provider 的 init、reset、interval 与后端能力边界。
 7-motion_assets
 8-motrix_contact_sensor
 9-sim2sim_contract_status
+10-raycast_rough_terrain
 ```

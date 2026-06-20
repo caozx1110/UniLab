@@ -33,6 +33,27 @@ class BackendHeightScanner(abc.ABC):
         """Return sampled values with shape ``(num_envs, num_points)``."""
 
 
+@dataclass(frozen=True)
+class RaycastResult:
+    """Batched raycast outputs returned by backend-owned raycasters."""
+
+    distances: np.ndarray
+    geom_ids: np.ndarray
+    normals: np.ndarray | None = None
+
+
+class BackendRaycaster(abc.ABC):
+    """Backend-owned raycaster created on the env init path."""
+
+    @abc.abstractmethod
+    def cast(self) -> RaycastResult:
+        """Return batched ray distances and hit geom ids.
+
+        ``distances`` and ``geom_ids`` have shape ``(num_envs, num_rays)``.
+        ``normals`` is either ``None`` or shape ``(num_envs, num_rays, 3)``.
+        """
+
+
 PLAY_RENDER_MODES = frozenset({"auto", "interactive", "record", "none"})
 
 
@@ -163,6 +184,28 @@ class SimBackend(abc.ABC):
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support native height-field scanners"
         )
+
+    def create_raycaster(
+        self,
+        *,
+        frame_body_id: int,
+        directions: np.ndarray,
+        origin_offsets: np.ndarray | None = None,
+        origin_offset: np.ndarray | None = None,
+        alignment: str = "yaw",
+        geomgroup: np.ndarray | Sequence[int] | None = None,
+        flg_static: int = 1,
+        bodyexclude: int | np.ndarray | None = None,
+        return_normal: bool = False,
+        cutoff: float = 1.0e10,
+    ) -> BackendRaycaster:
+        """Create a reusable backend-native raycaster on the init/cold path.
+
+        The contract supports one direction per ray and optional per-ray local
+        origin offsets attached to one body frame. Backends may rotate the
+        pattern by full body orientation, yaw-only orientation, or world frame.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support native raycasters")
 
     def get_body_subtree_ids(self, root_body_id: int) -> np.ndarray:
         """Return body ids in the subtree rooted at ``root_body_id``."""
