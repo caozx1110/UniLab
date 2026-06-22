@@ -97,13 +97,6 @@ src/unilab/assets/checkpoints/**/*.onnx
 # Backend temp XML emitted next to robot.xml (motrix/mujoco scene materialization)
 src/unilab/assets/robots/**/tmp*.xml
 
-# --- issue-627 LiDAR demo inputs: tracked on purpose ---
-# Demo INPUTS for scripts/lidar_{go2,g1}_demo.py, placed under the asset root per
-# UniLab convention. They are NOT training artifacts, so they are re-included
-# here (overriding the broad `checkpoints/` ignore above) while everything else
-# under checkpoints/motions/caches stays untracked. The robot model + scene XMLs
-# live in src/unilab/assets/robots/{go2,g1}/ (not ignored). Robot meshes are not
-# vendored: those XMLs reference robots/{go2,g1}/assets relatively.
 !src/unilab/assets/checkpoints/lidar_demo/
 !src/unilab/assets/checkpoints/lidar_demo/**
 !src/unilab/assets/lidar_demo/

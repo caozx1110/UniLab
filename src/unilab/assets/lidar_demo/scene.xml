@@ -1,12 +1,9 @@
 <mujoco model="scene_demo">
   <visual>
     <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
-    <!-- <rgba haze="0.15 0.25 0.35 1"/> -->
     <global azimuth="120" elevation="-20"/>
   </visual>
 
-  <!-- Floor texture borrowed from src/unilab/assets/robots/g1/scene_flat.xml
-       (builtin checker pattern, no external texture file needed). -->
   <asset>
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
       markrgb="0.8 0.8 0.8" width="300" height="300"/>
@@ -19,14 +16,12 @@
     <light pos="0  6 10." dir="0 0 -1"/>
     <light pos="0 -6 10." dir="0 0 -1"/>
 
-    <!-- 地面+四面墙 -->
     <geom name="ground" type="plane" size="10 10 0.1" pos="0 0 0" material="groundplane"/>
     <geom name="wall1" type="box" size="1e-3 8 0.5" pos=" 8 0 0.5" rgba="0.9 0.9 0.9 1"/>
     <geom name="wall2" type="box" size="1e-3 8 0.5" pos="-8 0 0.5" rgba="0.9 0.9 0.9 1"/>
     <geom name="wall3" type="box" size="8 1e-3 0.5" pos="0  8 0.5" rgba="0.9 0.9 0.9 1"/>
     <geom name="wall4" type="box" size="8 1e-3 0.5" pos="0 -8 0.5" rgba="0.9 0.9 0.9 1"/>
 
-    <!-- 盒子 -->
     <geom name="box1" type="box" size="0.5 0.5 0.5" pos="5 0 0.5" euler="45 -45 0" rgba="1 0 0 1"/>
     <geom name="box2" type="box" size="1.3 0.8 0.2" pos="-5 -1 0.2" rgba="1 0 0 0.7"/>
     <geom name="box3" type="box" size="0.6 0.2 0.3" pos="4.4 -4 0.3" rgba="1 0 0 0.7"/>
@@ -35,24 +30,18 @@
     <geom name="box6" type="box" size="0.7 0.5 0.2" pos="4.2 5 0.2" rgba="1 0 0 0.7"/>
     <geom name="box7" type="box" size="1.0 0.5 0.35" pos="0 3 0.4" rgba="1 0 0 0.7"/>
 
-    <!-- 球体 -->
     <geom name="sphere1" type="sphere" size="0.5" pos="4 2 0.5" rgba="0 1 0 1"/>
     <geom name="sphere2" type="sphere" size="0.4" pos="-5 2 0.3" rgba="0 1 0 0.7"/>
 
-    <!-- 圆柱体 -->
     <geom name="cylinder1" type="cylinder" size="0.4 0.6" pos="-3 -5 0.4" quat="1 0 1 0" rgba="0 0 1 1"/>
     <geom name="cylinder2" type="cylinder" size="0.2 0.3" pos="2 -2 0.3" rgba="0 0 1 0.7"/>
 
-    <!-- 椭球体 -->
     <geom name="ellipsoid1" type="ellipsoid" size="0.4 0.3 0.5" pos="3 -6 0.5" rgba="1 1 0 1"/>
     <geom name="ellipsoid2" type="ellipsoid" size="0.2 0.4 0.3" pos="-5 5 0.3" rgba="1 1 0 0.7"/>
 
-    <!-- 胶囊体 -->
     <geom name="capsule1" type="capsule" size="0.3 0.5" pos="-3 1 0.8" quat="1 3 1 1" rgba="1 0 1 1"/>
     <geom name="capsule2" type="capsule" size="0.2 0.4" pos="-3 -2 0.6" quat="0.1 0 0.6 0.2" rgba="1 0 1 0.7"/>
     
-    <!-- primitive obstacle replacing the former "eight" mesh decoration
-         (kept so the scene/point-cloud still has an object here; no external mesh asset) -->
     <geom name="tower1" type="box" size="0.3 0.3 0.6" pos="-3 4 0.6" euler="0 0 30" rgba="0 1 0 1"/>
 
   </worldbody>

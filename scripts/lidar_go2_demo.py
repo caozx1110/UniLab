@@ -1,37 +1,3 @@
-"""Interactive Go2 LiDAR demo on mujoco-uni 3.8.0.post1's batched raycaster.
-
-This reproduces MuJoCo-LiDAR's ``examples/unitree_go2.py --backend warp``
-(interactive MuJoCo window + Go2 walking via an ONNX policy + a mid360 LiDAR
-point cloud colored by height), but the LiDAR ranges are produced by
-``mujoco.batch_env.BatchEnvPool.multi_ray`` -- the batched ``mj_multiRay``
-primitive added in mujoco-uni 3.8.0.post1 (UniLab issue-627) -- instead of the
-Warp ray-casting backend.
-
-It is a *validation* demo for the post1 raycaster, and is fully self-contained
-inside UniLab and its assets live under the repo asset root per UniLab
-convention: the robot model + scene XMLs in ``src/unilab/assets/robots/{go2,g1}/``,
-the ONNX policies in ``src/unilab/assets/checkpoints/lidar_demo/``, and the shared
-obstacle scene + mid360 pattern in ``src/unilab/assets/lidar_demo/`` -- all
-referenced via paths relative to this file. Robot meshes are read from UniLab's
-own ``src/unilab/assets/robots/{go2,g1}/assets``. It does NOT depend on the
-MuJoCo-LiDAR project and contains no absolute paths.
-
-Prereqs: UniLab env synced with mujoco-uni==3.8.0.post1 (see pyproject + uv sync)
-and a desktop session (e.g. DISPLAY=:1).
-
-Run (call the venv python directly for a clean exit code):
-
-    ./.venv/bin/python scripts/lidar_go2_demo.py
-    ./.venv/bin/python scripts/lidar_go2_demo.py --stand --lidar mid360
-
-`uv run --no-sync python scripts/lidar_go2_demo.py` also works, but in this env
-`uv run` triggers a harmless non-zero (120) exit during interpreter shutdown
-(an onnxruntime/native-lib finalization quirk under uv run); the demo itself
-runs fine. Prefer the direct venv-python form above.
-
-Camera: mouse drag = rotate, scroll = zoom, right-drag = pan.
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -44,27 +10,13 @@ import numpy as np
 import onnxruntime as rt
 from mujoco.batch_env import BatchEnvPool
 
-# NOTE: do NOT `import matplotlib` here. mujoco-uni's bundled native libs and
-# matplotlib's segfault when matplotlib is imported after mujoco in this env, so
-# the height colormap below is a dependency-free vectorized HSV->RGB instead.
-
 _JOINT_NUM = 12
-# Demo assets live under the repo asset root (src/unilab/assets), per UniLab
-# convention. Robot meshes are NOT duplicated: the model XMLs reference UniLab's
-# own robots/{go2,g1}/assets relatively. (parent.parent: scripts/ -> repo root.)
 _ASSETS = Path(__file__).resolve().parent.parent / "src" / "unilab" / "assets"
 
 
-# ---------------------------------------------------------------------------
-# Scan patterns (vendored minimal copy of MuJoCo-LiDAR's scan_gen, so this demo
-# does not need to install the `mujoco-lidar` package into UniLab's env, which
-# would pull official `mujoco` and clash with `mujoco-uni`).
-# ---------------------------------------------------------------------------
 class LivoxGenerator:
-    """Roll through a precomputed Livox mid360 ray pattern, 24000 rays / frame."""
-
     def __init__(self, npy_path: Path, samples: int = 24000):
-        self.ray_angles = np.load(npy_path.as_posix())  # (N, 2): [:,0]=theta, [:,1]=phi
+        self.ray_angles = np.load(npy_path.as_posix())
         self.samples = samples
         self.n_rays = len(self.ray_angles)
         self.curr = 0
@@ -82,7 +34,6 @@ class LivoxGenerator:
 
 
 def generate_airy96() -> tuple[np.ndarray, np.ndarray]:
-    """Robosense Airy-96 uniform grid pattern (static)."""
     phi = np.deg2rad(np.linspace(0.0, 89.5, 96))
     theta = np.deg2rad(np.linspace(-180.0, 180.0, 900))
     tg, pg = np.meshgrid(theta, phi)
@@ -90,14 +41,12 @@ def generate_airy96() -> tuple[np.ndarray, np.ndarray]:
 
 
 def angles_to_local_dirs(theta: np.ndarray, phi: np.ndarray) -> np.ndarray:
-    """(theta, phi) sensor-frame angles -> unit direction vectors (nray, 3)."""
     cp, sp = np.cos(phi), np.sin(phi)
     ct, st = np.cos(theta), np.sin(theta)
     return np.stack([cp * ct, cp * st, sp], axis=1).astype(np.float64)
 
 
 def hsv_rgba(t: np.ndarray) -> np.ndarray:
-    """Vectorized matplotlib-'hsv'-like colormap: t in [0,1] -> (N,4) RGBA (S=V=1)."""
     t = np.clip(np.asarray(t, dtype=np.float64), 0.0, 1.0)
     h = t * 6.0
     i = np.floor(h).astype(int) % 6
@@ -111,12 +60,7 @@ def hsv_rgba(t: np.ndarray) -> np.ndarray:
     return out
 
 
-# ---------------------------------------------------------------------------
-# LiDAR backend: mujoco-uni post1 batched multi_ray on a single live MjData.
-# ---------------------------------------------------------------------------
 class BatchRayLidar:
-    """Wrap ``BatchEnvPool.multi_ray`` (nbatch=1) as a LiDAR over a live MjData."""
-
     def __init__(
         self,
         mj_model: mujoco.MjModel,
@@ -135,10 +79,7 @@ class BatchRayLidar:
         self._state = np.zeros(self.pool.nstate, dtype=np.float64)
 
     def trace(self, mj_data: mujoco.MjData, theta: np.ndarray, phi: np.ndarray):
-        """Return (dist[nray], origin[3], world_dirs[nray,3]) for the current pose."""
-        mujoco.mj_getState(
-            self.model, mj_data, self._state, mujoco.mjtState.mjSTATE_FULLPHYSICS
-        )
+        mujoco.mj_getState(self.model, mj_data, self._state, mujoco.mjtState.mjSTATE_FULLPHYSICS)
         origin = mj_data.site_xpos[self.site_id].astype(np.float64)
         site_rot = mj_data.site_xmat[self.site_id].reshape(3, 3)
         world_dirs = angles_to_local_dirs(theta, phi) @ site_rot.T
@@ -154,12 +95,7 @@ class BatchRayLidar:
         return dist[0], origin, world_dirs
 
 
-# ---------------------------------------------------------------------------
-# ONNX walking controller (verbatim port of MuJoCo-LiDAR examples/unitree_go2.py).
-# ---------------------------------------------------------------------------
 class OnnxController:
-    """ONNX controller for the Go-2 robot."""
-
     def __init__(
         self,
         policy_path: str,
@@ -188,7 +124,7 @@ class OnnxController:
         command = np.zeros(3, dtype=np.float32)
         if not self.stand:
             if mj_data.time % 20.0 < 5.0:
-                command[0] = 1.0  # forward
+                command[0] = 1.0
             elif 5.0 < mj_data.time % 20.0 < 10.0:
                 command[1] = -1.0
             elif 10.0 < mj_data.time % 20.0 < 15.0:
@@ -241,7 +177,6 @@ def main() -> None:
         stand=args.stand,
     )
 
-    # Scan pattern (mid360 rotates frame-by-frame; airy is static).
     if args.lidar == "mid360":
         if not mid360_npy.is_file():
             raise SystemExit(f"Missing mid360 pattern: {mid360_npy}")
@@ -255,11 +190,14 @@ def main() -> None:
     rays_theta = np.ascontiguousarray(rays_theta, dtype=np.float64)
     rays_phi = np.ascontiguousarray(rays_phi, dtype=np.float64)
 
-    # geomgroup: keep groups 0..2 (robot + scene), drop 3+ (matches the warp demo).
     geomgroup = np.ones((mujoco.mjNGROUP,), dtype=np.uint8)
     geomgroup[3:] = 0
     lidar = BatchRayLidar(
-        mj_model, site_name="lidar", bodyexclude_name="base", geomgroup=geomgroup, cutoff=args.cutoff
+        mj_model,
+        site_name="lidar",
+        bodyexclude_name="base",
+        geomgroup=geomgroup,
+        cutoff=args.cutoff,
     )
 
     n_rays = rays_theta.shape[0]
@@ -307,14 +245,14 @@ def main() -> None:
                     z_min, z_max = float(z[hit].min()), float(z[hit].max())
                     rng = z_max - z_min
                     z_norm = (z_max - z) / rng if rng > 0 else np.zeros_like(z)
-                    colors = hsv_rgba(z_norm)  # (n_rays, 4)
+                    colors = hsv_rgba(z_norm)
                     for i in range(n_rays):
                         geom = viewer.user_scn.geoms[i]
                         if hit[i]:
                             geom.pos[:] = world_points[i]
                             geom.rgba[:] = colors[i]
                         else:
-                            geom.rgba[3] = 0.0  # hide missed rays
+                            geom.rgba[3] = 0.0
 
             viewer.sync()
             run_time = time.time() - _start_time
