@@ -96,3 +96,12 @@ src/unilab/assets/checkpoints/**/*.onnx
 
 # Backend temp XML emitted next to robot.xml (motrix/mujoco scene materialization)
 src/unilab/assets/robots/**/tmp*.xml
+
+# --- issue-627 LiDAR demo inputs: tracked on purpose ---
+# Bundled scene/model XMLs, ONNX policies and the mid360 scan pattern used by the
+# self-contained demos scripts/lidar_{go2,g1}_demo.py. These are demo INPUTS, not
+# training artifacts, so they are explicitly whitelisted here (overriding any
+# broad ignore) while the rules above keep checkpoints/motions/caches untracked.
+# Robot meshes are NOT vendored: the demo XMLs reference src/unilab/assets/robots.
+!scripts/lidar_demo_assets/
+!scripts/lidar_demo_assets/**
