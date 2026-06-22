@@ -50,22 +50,22 @@
     <material name="white" rgba="1 1 1 1"/>
     <material name="gray" rgba="0.671705 0.692426 0.774270 1"/>
 
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/base_0.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/base_1.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/base_2.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/base_3.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/base_4.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/hip_0.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/hip_1.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/thigh_0.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/thigh_1.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/thigh_mirror_0.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/thigh_mirror_1.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/calf_0.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/calf_1.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/calf_mirror_0.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/calf_mirror_1.obj"/>
-    <mesh file="../../../src/unilab/assets/robots/go2/assets/foot.obj"/>
+    <mesh file="assets/base_0.obj"/>
+    <mesh file="assets/base_1.obj"/>
+    <mesh file="assets/base_2.obj"/>
+    <mesh file="assets/base_3.obj"/>
+    <mesh file="assets/base_4.obj"/>
+    <mesh file="assets/hip_0.obj"/>
+    <mesh file="assets/hip_1.obj"/>
+    <mesh file="assets/thigh_0.obj"/>
+    <mesh file="assets/thigh_1.obj"/>
+    <mesh file="assets/thigh_mirror_0.obj"/>
+    <mesh file="assets/thigh_mirror_1.obj"/>
+    <mesh file="assets/calf_0.obj"/>
+    <mesh file="assets/calf_1.obj"/>
+    <mesh file="assets/calf_mirror_0.obj"/>
+    <mesh file="assets/calf_mirror_1.obj"/>
+    <mesh file="assets/foot.obj"/>
   </asset>
 
   <worldbody>

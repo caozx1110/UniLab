@@ -1,6 +1,6 @@
 <mujoco model="scene_g1">
-  <include file="unitree_g1/g1_mjx_feetonly.xml"/>
-  <include file="scene.xml"/>
+  <include file="g1_mjx_feetonly.xml"/>
+  <include file="../../lidar_demo/scene.xml"/>
 
   <keyframe>
     <key name="home"

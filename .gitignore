@@ -56,7 +56,7 @@ run_summary.json
 *.temp
 *.tmp
 *~
-src/unilab/assets/checkpoints/
+src/unilab/assets/checkpoints/*
 
 benchmark/outputs/
 src/unilab/algos/torch/rsl_rl
@@ -98,10 +98,13 @@ src/unilab/assets/checkpoints/**/*.onnx
 src/unilab/assets/robots/**/tmp*.xml
 
 # --- issue-627 LiDAR demo inputs: tracked on purpose ---
-# Bundled scene/model XMLs, ONNX policies and the mid360 scan pattern used by the
-# self-contained demos scripts/lidar_{go2,g1}_demo.py. These are demo INPUTS, not
-# training artifacts, so they are explicitly whitelisted here (overriding any
-# broad ignore) while the rules above keep checkpoints/motions/caches untracked.
-# Robot meshes are NOT vendored: the demo XMLs reference src/unilab/assets/robots.
-!scripts/lidar_demo_assets/
-!scripts/lidar_demo_assets/**
+# Demo INPUTS for scripts/lidar_{go2,g1}_demo.py, placed under the asset root per
+# UniLab convention. They are NOT training artifacts, so they are re-included
+# here (overriding the broad `checkpoints/` ignore above) while everything else
+# under checkpoints/motions/caches stays untracked. The robot model + scene XMLs
+# live in src/unilab/assets/robots/{go2,g1}/ (not ignored). Robot meshes are not
+# vendored: those XMLs reference robots/{go2,g1}/assets relatively.
+!src/unilab/assets/checkpoints/lidar_demo/
+!src/unilab/assets/checkpoints/lidar_demo/**
+!src/unilab/assets/lidar_demo/
+!src/unilab/assets/lidar_demo/**

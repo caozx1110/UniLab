@@ -8,12 +8,14 @@ primitive added in mujoco-uni 3.8.0.post1 (UniLab issue-627) -- instead of the
 Warp ray-casting backend.
 
 It is a *validation* demo for the post1 raycaster, and is fully self-contained
-inside UniLab: the scene/model XMLs, the ONNX policy and the mid360 scan pattern
-are bundled under ``scripts/lidar_demo_assets/`` (all referenced via paths
-relative to this file), and the robot meshes are read from UniLab's own
-``src/unilab/assets/robots/{go2,g1}/assets`` (referenced relatively from the
-bundled model XMLs). It does NOT depend on the MuJoCo-LiDAR project and contains
-no absolute paths. This is the G1 counterpart of ``scripts/lidar_go2_demo.py``.
+inside UniLab and its assets live under the repo asset root per UniLab
+convention: the robot model + scene XMLs in ``src/unilab/assets/robots/{go2,g1}/``,
+the ONNX policies in ``src/unilab/assets/checkpoints/lidar_demo/``, and the shared
+obstacle scene + mid360 pattern in ``src/unilab/assets/lidar_demo/`` -- all
+referenced via paths relative to this file. Robot meshes are read from UniLab's
+own ``src/unilab/assets/robots/{go2,g1}/assets``. It does NOT depend on the
+MuJoCo-LiDAR project and contains no absolute paths. This is the G1 counterpart
+of ``scripts/lidar_go2_demo.py``.
 
 Prereqs: UniLab env synced with mujoco-uni==3.8.0.post1 (see pyproject + uv sync)
 and a desktop session (e.g. DISPLAY=:1).
@@ -48,10 +50,10 @@ from mujoco.batch_env import BatchEnvPool
 # the height colormap below is a dependency-free vectorized HSV->RGB instead.
 
 _JOINT_NUM = 29
-# Bundled, self-contained demo assets next to this script. Robot meshes are not
-# duplicated here: the model XMLs under models/ reference UniLab's own
-# src/unilab/assets/robots/{go2,g1}/assets via relative paths.
-_ASSETS = Path(__file__).resolve().parent / "lidar_demo_assets"
+# Demo assets live under the repo asset root (src/unilab/assets), per UniLab
+# convention. Robot meshes are NOT duplicated: the model XMLs reference UniLab's
+# own robots/{go2,g1}/assets relatively. (parent.parent: scripts/ -> repo root.)
+_ASSETS = Path(__file__).resolve().parent.parent / "src" / "unilab" / "assets"
 
 
 # ---------------------------------------------------------------------------
@@ -221,9 +223,9 @@ def main() -> None:
     parser.add_argument("--cutoff", type=float, default=100.0, help="max ray distance (m)")
     args = parser.parse_args()
 
-    scene_path = _ASSETS / "models" / "scene_g1.xml"
-    policy_path = _ASSETS / "onnx" / "g1_policy.onnx"
-    mid360_npy = _ASSETS / "scan_mode" / "mid360.npy"
+    scene_path = _ASSETS / "robots" / "g1" / "scene_g1.xml"
+    policy_path = _ASSETS / "checkpoints" / "lidar_demo" / "g1_policy.onnx"
+    mid360_npy = _ASSETS / "lidar_demo" / "mid360.npy"
     for p in (scene_path, policy_path):
         if not p.is_file():
             raise SystemExit(f"Missing bundled demo asset: {p}")
