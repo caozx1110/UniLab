@@ -1,0 +1,139 @@
+# @package _global_
+# A2 + P7v3 (joint3+joint5-frozen, 5-DOF) + UMI gripper v3 pos-force task.
+# SIBLING of a2arm_v2_pos_force: SAME training hyperparameters (reward scales,
+# force curriculum, estimator) — the task difference is the frozen arm joints
+# (joint3 upper-arm ROLL and joint5 wrist ROLL, instead of joint7 wrist PITCH),
+# leaving active arm joints joint1,2,4,6,7. Kept otherwise identical here so the
+# two variants are directly comparable under the same tuning. Arm-specific
+# differences (frozen joints, PD gains, sphere center, recomputed default/init)
+# live in A2ArmV2J3PosForceCfg.
+#   - Sphere center (0.2, 0, 0.75), sampling range carried over from the
+#     joint7-frozen variant (single-variable isolation).
+#   - Home keyframe at [0.4494 m, 0.8115 rad, 0] from the sphere center,
+#     FK-verified (test_a2arm_v2_j3_home_pose_fk).
+
+training:
+  task_name: A2ArmPosForce
+  sim_backend: mujoco
+
+algo:
+  # STABLE BASELINE — verified by run
+  # logs/ppo_cse/A2ArmV2J3PosForce/2026-07-08_09-56-53_mujoco (matches its
+  # run_config.json field-for-field). This config trains stably all the way THROUGH
+  # force onset: force_start_step 192000 / num_steps_per_env 24 = iteration 8000.
+  # num_envs 1024 is the CPU-sim production limit (do not raise).
+  # Two experiments that DIVERGED from this baseline both collapsed:
+  #   - enlarge EE sampling shell -> broke BEFORE iter 8000 (lost standing pre-force);
+  #   - enlarge gripper force      -> degraded slowly AFTER iter 8000 (post-force).
+  # => keep the sampling shell within reach and the force moderate; changes here
+  #    should be single-variable and re-verified against this run.
+  num_envs: 1024
+  max_iterations: 20000
+  num_one_step_obs: 73
+  num_actor_history: 32
+  num_critic_history: 3
+  empirical_normalization: false
+
+  policy:
+    init_noise_std: 1.0
+
+  algorithm:
+    learning_rate: 5.0e-4
+    # entropy 0.01 (UniFP value) is STABLE at 1024 envs in this baseline — it does NOT
+    # cause a post-force std runaway here (the 09-56-53 run holds through force onset).
+    # Do not lower without a specific observed reason.
+    entropy_coef: 1.0e-2
+    num_learning_epochs: 5
+    desired_kl: 0.01
+    min_learning_rate: 1.0e-5
+
+  estimator:
+    target_start: 0
+    learning_rate: 1.0e-5
+    latent_dim: 64
+    enc_hidden_dims: [512, 256, 128]
+    dec_hidden_dims: [128, 64]
+    target_group_sizes: [3, 3, 3, 3]
+    target_weights: [0.2, 0.2, 1.0, 1.0]
+
+reward:
+  tracking_sigma: 0.25
+  tracking_ee_sigma: 1.0
+  base_height_target: 0.45           # keyframe base z=0.465, settles ~0.41-0.45
+  max_contact_force: 400.0
+  feet_height_target: 0.12
+  feet_height_high_target: 0.24
+  soft_torque_limit: 0.9
+  soft_dof_pos_limit: 0.9            # baseline value (overrides dataclass default 0.8); penalize dof only past the 0.9 band
+  ref_dof_scale: 0.1                 # UniFP exp(-L1*0.1); shape rate, NOT the ref_dof_leg weight
+  stand_still_scale: 0.05            # UniFP exp(-L1*0.05) at zero command; shape rate, NOT the stand_still weight
+  feet_air_time_threshold: 0.5
+
+  scales:
+    tracking_lin_vel_force_world: 2.0
+    tracking_ee_force_world: 2.0
+    tracking_ang_vel: 1.0
+    ref_dof_leg: 3.0
+    alive: 1.5
+    orientation: 0
+    feet_contact_number: 2.0
+    feet_air_time: 1.0
+    feet_height: 1.0
+    feet_height_high: -15.0
+    stand_still: 0.5
+    lin_vel_z: -1.5
+    ang_vel_xy: -0.02
+    dof_vel: -8.0e-4
+    dof_vel_arm: -2.0e-4
+    dof_acc: -2.5e-7
+    dof_acc_arm: -4.5e-7
+    action_rate: -0.02
+    action_rate_arm: -0.045
+    torques: -5.0e-6
+    base_height: -2.0                 # baseline (relaxed from -20.0): don't punish force-induced base drift
+    hip_pos: -0.5                     # baseline (relaxed from -3.0)
+    feet_pos_xy: -3.0
+    feet_drag: -8e-4
+    feet_contact_forces: -1.0e-3
+    collision: -5.0
+    dof_pos_limits: -10.0             # baseline (relaxed from -25.0): the term that spiked in the pre-relaxation collapse
+    torque_limits: -0.005
+env:
+  history:
+    num_actor_history: 32
+    num_critic_history: 3
+
+  control_config:
+    action_delay_steps: 0
+
+  # goal_ee: NOT overridden — the stable baseline uses the A2ArmV2J3PosForceCfg
+  # dataclass defaults (src/unilab/envs/locomotion/go2_arm/pos_force.py):
+  #   sphere_center z_invariant_offset=0.75 (x_offset=0.2, y_offset=0.0),
+  #   pos_l=[0.28, 0.60], pos_p=[-60, 72] deg, pos_y=[-108, 108] deg,
+  #   init_pos_start=[0.4494, 0.8115, 0], init_pos_end=[0.4494, 0, 0]
+  #   (keyframe EE FK-consistent; test_a2arm_v2_j3_home_pose_fk).
+  # The "enlarge sampling shell" experiment overrode these (bigger pos_l / lower
+  # center) and collapsed BEFORE force onset — keep any future shell within reach
+  # and re-verify against the 09-56-53 run.
+
+  commands:
+    # Force-magnitude curriculum (2026-07-08): ramp force in 3 gears instead of
+    # 0->full at force_start. Gear factor scales ALL four channels (gripper/base
+    # x cmd/ext). force_start advanced to iter 5000 (=120000 steps) to leave
+    # budget: gear1 5000-8000 (33%), gear2 8000-11000 (66%), gear3 11000+ (100%).
+    force_start_step: 120000
+    # force_curriculum_scales: [0.33, 0.66, 1.0]
+    # force_curriculum_stage_steps: 72000     # 3000 iter/gear (x num_steps_per_env 24)
+    zero_vel_cmd_prob_after_force: 0.8
+    max_push_force_xyz_gripper_cmd: [-18.0, 15.0]
+    max_push_force_xyz_gripper_ext: [-30.0, 30.0]
+    # Gripper vertical (z) attenuation: arm's vertical wrench capacity at extended
+    # reach is ~17-19 N (shoulder-pitch torque saturates), vs 40+ N horizontal.
+    # 0.5 caps vertical gripper force to keep it inside capacity and stop it
+    # confounding the horizontal base-force experiment. Applied to cmd+ext together.
+    force_z_gripper_cmd_scale: 0.33
+    force_z_gripper_ext_scale: 0.33
+    max_push_force_xyz_base_cmd: [-25.0, 25.0]
+    max_push_force_xyz_base_ext: [-20.0, 20.0]
+    base_forced_prob_cmd: 0.8
+    base_forced_prob_ext: 0.8

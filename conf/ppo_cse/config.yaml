@@ -1,0 +1,112 @@
+defaults:
+  - _self_
+  - task: a2arm_pos_force/mujoco
+
+algo:
+  algo_log_name: ppo_cse
+  seed: 1
+  num_envs: 128
+  num_steps_per_env: 24
+  max_iterations: 6000
+  save_interval: 500
+  empirical_normalization: false
+  load_run: "-1"
+  checkpoint: -1
+  # ── CSE-PPO specific ────────────────────────────────────────────────
+  num_one_step_obs: ???        # REQUIRED: actor single-step obs dim (a2arm: 73)
+  num_actor_history: 32        # actor sees H * num_one_step_obs history
+  num_critic_history: 1        # critic sees the current privileged step
+  policy:
+    init_noise_std: 1.0
+    actor_hidden_dims: [512, 256, 128]
+    critic_hidden_dims: [512, 256, 128]
+    activation: elu
+  estimator:
+    # Concurrent state estimator: encoder(history) -> latent -> decoder(targets).
+    num_pred: 12               # [base_lin_vel(3), ee_pos_sphere(3), force_ee(3), force_base(3)]
+    enc_hidden_dims: [256, 128]
+    latent_dim: 19
+    dec_hidden_dims: [64]
+    learning_rate: 1.0e-5      # UniFP adaptation_module_learning_rate
+    max_grad_norm: 10.0
+    target_start: 0            # target block sits at the front of the critic obs
+    # UniFP per-GROUP weights [base_lin_vel, ee_pos, force_ee, force_base], applied
+    # as sum_g mse(pred_g*w_g, tgt_g*w_g) (force groups dominate).
+    target_group_sizes: [3, 3, 3, 3]
+    target_weights: [0.2, 0.2, 1.0, 1.0]
+  algorithm:
+    value_loss_coef: 1.0
+    use_clipped_value_loss: true
+    clip_param: 0.2
+    # Lowered 0.01 -> 0.003: at 1024 envs the advantage "precision pull" on the
+    # global std is weaker than UniFP's 4096-env signal, so the constant entropy
+    # up-push wins in the post-force regime and std runs away. Less entropy keeps
+    # the std equilibrium low. Re-raise toward 0.01 if env count is increased.
+    entropy_coef: 0.003
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    learning_rate: 1.0e-3
+    schedule: adaptive
+    desired_kl: 0.01
+    min_learning_rate: 1.0e-5    # KL-adaptive LR clamp floor
+    max_learning_rate: 1.0e-2    # KL-adaptive LR clamp ceiling
+    min_policy_std: 1.0e-2       # std floor (keeps Normal scale > 0)
+    max_policy_std: 0.7          # std ceiling: halts entropy-driven exploration runaway under force
+    gamma: 0.99
+    lam: 0.95
+    max_grad_norm: 1.0
+    # bf16 mixed precision on the update forward/loss (CUDA only; no GradScaler).
+    # The 32-frame encoder's matmuls dominate the update — bf16 ~halves it.
+    # Disabled: rollout runs fp32 but the update ran bf16, so old_log_prob/value
+    # (fp32) vs new_log_prob/value (bf16) disagree by ~0.1x desired_kl every step
+    # — an on-policy precision mismatch UniFP never had. fp32 removes that noise
+    # floor (~1.7x slower update). Re-enable only with fp32 rollout consistency.
+    use_amp: false
+    amp_dtype: bfloat16
+
+training:
+  task_name: ???
+  device: null
+  logger: tensorboard
+  wandb_project: unilab
+  wandb_entity: null
+  wandb_group: null
+  wandb_job_type: null
+  wandb_name: null
+  wandb_tags: []
+  wandb_notes: null
+  wandb_mode: null
+  sim_backend: mujoco
+  play_only: false
+  no_play: false
+  play_env_num: 4
+  render_spacing: 1.0
+  play_steps: 800
+  cam_distance: 6.0
+  cam_elevation: -20.0
+  cam_azimuth: 90.0
+  cam_lookat: null
+  cam_tracking: false
+  cam_tracking_env_idx: 0
+  cam_tracking_extra_envs: 2
+  log_root: null
+  num_timesteps: null
+  log_dir: null
+  nan_guard:
+    enabled: true
+    buffer_size: 100
+    max_envs_to_dump: 5
+    output_dir: null
+
+env:
+  post_step_forward_sensor: false
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+  job_logging:
+    root:
+      handlers: [console]
