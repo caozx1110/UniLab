@@ -288,6 +288,11 @@ class RslRlVecEnvWrapper:
 
         if "log" in state.info:
             infos["log"] = state.info["log"]
+        if "timing" in state.info:
+            # Forward env-owned step sub-timings (physics/update_state/reset/...)
+            # so runners can attribute the per-iteration waterfall. Diagnostic
+            # passthrough only; ignored by runners that don't consume it.
+            infos["timing"] = state.info["timing"]
 
         return (
             self._obs_to_tensordict(state.obs, getattr(state, "info", None)),
