@@ -63,7 +63,7 @@ from unilab.training import (
     parse_checkpoint_path,
 )
 from unilab.training.rsl_rl import RslRlVecEnvWrapper
-from unilab.utils.rotation import np_quat_apply, np_yaw_quat
+from unilab.utils.rotation import np_quat_apply, np_quat_apply_inverse, np_yaw_quat
 
 # ── GLFW key codes (mujoco passive viewer key_callback) ────────────────────
 _KEY_SPACE = ord(" ")
@@ -166,6 +166,13 @@ class TeleopState:
     _base_target: np.ndarray = field(default_factory=lambda: np.zeros(3, dtype=np.float64))
     _ee_step: int = -1
     _base_step: int = -1
+    # Sustained-force mode: when hold_mode is on, a push ramps up and HOLDS at the
+    # target indefinitely (no ramp-down) until hold is toggled off (smooth
+    # ramp-down) or forces are cleared. Per-body flags record whether the CURRENT
+    # episode is a held one.
+    hold_mode: bool = False
+    _ee_held: bool = False
+    _base_held: bool = False
 
     def __post_init__(self) -> None:
         self.ee_sphere[:] = self.ee_init
@@ -197,11 +204,30 @@ class TeleopState:
         self._ee_target[:] = 0.0
         self._ee_target[axis] = sign * self.impulse_ee_n
         self._ee_step = 0
+        self._ee_held = self.hold_mode
 
     def push_base(self, axis: int, sign: float) -> None:
         self._base_target[:] = 0.0
         self._base_target[axis] = sign * self.impulse_base_n
         self._base_step = 0
+        self._base_held = self.hold_mode
+
+    def toggle_hold(self) -> None:
+        """Flip sustained-force mode. Turning it OFF releases any held force with a
+        smooth ramp-down (so the robot is not shocked by an instantaneous drop)."""
+        self.hold_mode = not self.hold_mode
+        if not self.hold_mode:
+            self.release_held()
+
+    def release_held(self) -> None:
+        """Convert any currently-held episode to its ramp-down phase (1 -> 0 over
+        ``ramp``), matching the trailing edge of the training trapezoid."""
+        if self._ee_held:
+            self._ee_step = max(1, self.ee_ramp) + self.ee_hold  # start of ramp-down
+            self._ee_held = False
+        if self._base_held:
+            self._base_step = max(1, self.base_ramp) + self.base_hold
+            self._base_held = False
 
     def clear_forces(self) -> None:
         self.ee_force[:] = 0.0
@@ -210,6 +236,8 @@ class TeleopState:
         self._base_target[:] = 0.0
         self._ee_step = -1
         self._base_step = -1
+        self._ee_held = False
+        self._base_held = False
 
     @staticmethod
     def _trapezoid_frac(step: int, ramp: int, hold: int) -> float:
@@ -229,23 +257,34 @@ class TeleopState:
         physics applies follows the smooth ramp/hold the policy was trained on.
         """
         if self._ee_step >= 0:
-            ee_total = 2 * max(1, self.ee_ramp) + self.ee_hold
-            self.ee_force[:] = self._ee_target * self._trapezoid_frac(
-                self._ee_step, self.ee_ramp, self.ee_hold
-            )
-            self._ee_step += 1
-            if self._ee_step > ee_total:
-                self.ee_force[:] = 0.0
-                self._ee_step = -1
+            if self._ee_held:
+                # Ramp up over ``ee_ramp`` then hold at the target indefinitely.
+                frac = min(1.0, self._ee_step / max(1, self.ee_ramp))
+                self.ee_force[:] = self._ee_target * frac
+                self._ee_step += 1
+            else:
+                ee_total = 2 * max(1, self.ee_ramp) + self.ee_hold
+                self.ee_force[:] = self._ee_target * self._trapezoid_frac(
+                    self._ee_step, self.ee_ramp, self.ee_hold
+                )
+                self._ee_step += 1
+                if self._ee_step > ee_total:
+                    self.ee_force[:] = 0.0
+                    self._ee_step = -1
         if self._base_step >= 0:
-            base_total = 2 * max(1, self.base_ramp) + self.base_hold
-            self.base_force[:] = self._base_target * self._trapezoid_frac(
-                self._base_step, self.base_ramp, self.base_hold
-            )
-            self._base_step += 1
-            if self._base_step > base_total:
-                self.base_force[:] = 0.0
-                self._base_step = -1
+            if self._base_held:
+                frac = min(1.0, self._base_step / max(1, self.base_ramp))
+                self.base_force[:] = self._base_target * frac
+                self._base_step += 1
+            else:
+                base_total = 2 * max(1, self.base_ramp) + self.base_hold
+                self.base_force[:] = self._base_target * self._trapezoid_frac(
+                    self._base_step, self.base_ramp, self.base_hold
+                )
+                self._base_step += 1
+                if self._base_step > base_total:
+                    self.base_force[:] = 0.0
+                    self._base_step = -1
 
     def describe(self) -> str:
         return (
@@ -253,7 +292,8 @@ class TeleopState:
             f"yaw={self.base_vel[2]:+.2f}) "
             f"ee[l={self.ee_sphere[0]:.2f} p={self.ee_sphere[1]:+.2f} "
             f"y={self.ee_sphere[2]:+.2f}] "
-            f"F_ee={np.round(self.ee_force, 1)} F_base={np.round(self.base_force, 1)}"
+            f"F_ee={np.round(self.ee_force, 1)} F_base={np.round(self.base_force, 1)} "
+            f"hold={'ON' if self.hold_mode else 'off'}"
         )
 
 
@@ -545,8 +585,35 @@ def _print_legend() -> None:
         "  EE target : U/J radius | I/K pitch | O/L yaw | P reset target\n"
         "  EE push   : arrows = fx/fy, PageUp/PageDn = fz (trapezoid push)\n"
         "  Base push : 1/2 fx | 3/4 fy | 5/6 fz (trapezoid push)\n"
+        "  Hold mode : H toggle (push then STAYS on; H again = ramp down)\n"
         "  Forces off: F   |   Reset: Backspace   |   Pause: Space\n"
         "  Sample range viz: G (toggle blue reachable-goal shell wireframe)"
+    )
+
+
+def _print_force_estimate(runner: Any, env: Any, obs_tensor: Any) -> None:
+    """Print the CSE estimator's EXT-force estimate vs the true applied force.
+
+    Diagnostic for compliance behaviour: the policy only yields to a force it can
+    perceive. In teleop the commanded-force channel is 0, so the ONLY way the
+    policy knows about the push is the estimator latent. If ``est`` stays ~0 while
+    ``true`` is large, the policy cannot perceive the force (OOD sustained force /
+    weak observability) and will fall back to the stiff passive PD — NOT a policy
+    'tracking' failure. Values are in the yaw-local frame; the estimator target is
+    ``critic_obs[6:9]`` (force_ee) and ``[9:12]`` (force_base), scaled by
+    obs_scales, so we divide the scale back out."""
+    est = runner.actor_critic.estimator
+    pred = est.predict(obs_tensor).detach().cpu().numpy()[0]  # 12-dim CSE target estimate
+    s = env._cfg.obs_scales
+    est_ee = pred[6:9] / max(float(s.ee_force), 1e-8)
+    est_base = pred[9:12] / max(float(s.base_force), 1e-8)
+    byq = np_yaw_quat(env._backend.get_base_quat())
+    true_ee = np_quat_apply_inverse(byq, env._force_ee_world)[0]
+    true_base = np_quat_apply_inverse(byq, env._force_base_world)[0]
+    print(
+        f"[force] EE est={np.round(est_ee, 1)} |{np.linalg.norm(est_ee):5.1f}N  "
+        f"true={np.round(true_ee, 1)} |{np.linalg.norm(true_ee):5.1f}N   ||   "
+        f"BASE est|{np.linalg.norm(est_base):5.1f}N true|{np.linalg.norm(true_base):5.1f}N"
     )
 
 
@@ -634,6 +701,10 @@ def play_interactive(cfg: DictConfig, device: str) -> None:
             teleop.nudge_vel(2, -_STEP_VYAW)
         elif keycode in (ord("Z"), ord("z")):
             teleop.zero_vel()
+        # Sustained-force mode: H toggles hold (next push ramps up and STAYS on;
+        # toggling off ramps the held force back down).
+        elif keycode in (ord("H"), ord("h")):
+            teleop.toggle_hold()
         # EE target sphere
         elif keycode in (ord("U"), ord("u")):
             teleop.nudge_ee(0, +_STEP_EE_RADIUS)
@@ -682,6 +753,7 @@ def play_interactive(cfg: DictConfig, device: str) -> None:
     obs = wrapped_env.reset()[0]["actor"]
     _print_legend()
     print("[play] Opening viewer — close the window or press Esc to quit.")
+    diag = {"i": 0}  # throttles the force-estimate print (every 25 control steps)
 
     with mujoco.viewer.launch_passive(viz_model, viz_data, key_callback=_key_callback) as viewer:
         viewer.cam.distance = 2.5
@@ -704,6 +776,9 @@ def play_interactive(cfg: DictConfig, device: str) -> None:
                     if env.state is not None:
                         env.state.info["commands"][:, CMD_VEL] = teleop.base_vel
                     obs = wrapped_env.step(policy(obs))[0]["actor"]
+                    diag["i"] += 1
+                    if diag["i"] % 25 == 0:
+                        _print_force_estimate(runner, env, obs)
 
                 phys = env.get_physics_state_snapshot()[0].astype(np.float64)
                 mujoco.mj_setState(viz_model, viz_data, phys, state_spec)

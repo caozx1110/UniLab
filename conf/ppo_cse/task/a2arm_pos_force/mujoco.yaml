@@ -59,8 +59,8 @@ algo:
 reward:
   tracking_sigma: 0.25
   tracking_ee_sigma: 1.0
-  base_height_target: 0.45           # keyframe base z=0.465, settles ~0.41-0.45
-  max_contact_force: 400.0
+  base_height_target: 0.435          # NEUTRAL stance (2026-07-12, hip=0): keyframe base z=0.45, settles ~0.39-0.43.
+  max_contact_force: 200.0
   feet_height_target: 0.12
   feet_height_high_target: 0.24
   soft_torque_limit: 0.9
@@ -75,20 +75,20 @@ reward:
     tracking_ang_vel: 1.0
     ref_dof_leg: 3.0
     alive: 1.5
-    orientation: 0
+    orientation: -1.5                 # 2026-07-12: was 0 (base tilt unpenalized). Gentle flatness bias so the base walks level & stops flinging the arm. Kept SMALL so it doesn't fight force-induced base lean.
     feet_contact_number: 2.0
     feet_air_time: 1.0
     feet_height: 1.0
     feet_height_high: -15.0
     stand_still: 0.5
     lin_vel_z: -1.5
-    ang_vel_xy: -0.02
+    ang_vel_xy: -0.1                 # 2026-07-12: was -0.02. Damp base roll/pitch RATE — the walking wobble that flings the arm. Penalizes rate, not steady tilt, so it doesn't block force rejection.
     dof_vel: -8.0e-4
     dof_vel_arm: -2.0e-4
     dof_acc: -2.5e-7
     dof_acc_arm: -4.5e-7
     action_rate: -0.02
-    action_rate_arm: -0.045
+    action_rate_arm: -0.09
     torques: -5.0e-6
     base_height: -2.0                 # baseline (relaxed from -20.0): don't punish force-induced base drift
     hip_pos: -0.5                     # baseline (relaxed from -3.0)
@@ -106,12 +106,16 @@ env:
   control_config:
     action_delay_steps: 0
 
-  # goal_ee: NOT overridden — the stable baseline uses the A2ArmV2J3PosForceCfg
-  # dataclass defaults (src/unilab/envs/locomotion/go2_arm/pos_force.py):
-  #   sphere_center z_invariant_offset=0.75 (x_offset=0.2, y_offset=0.0),
+  # goal_ee: NOT overridden — the stable baseline uses the A2ArmPosForceCfg
+  # dataclass defaults (src/unilab/envs/locomotion/a2arm/pos_force.py):
+  #   sphere_center z_invariant_offset=0.735 (x_offset=0.2, y_offset=0.0),
   #   pos_l=[0.28, 0.60], pos_p=[-60, 72] deg, pos_y=[-108, 108] deg,
   #   init_pos_start=[0.4494, 0.8115, 0], init_pos_end=[0.4494, 0, 0]
-  #   (keyframe EE FK-consistent; test_a2arm_v2_j3_home_pose_fk).
+  #   (keyframe EE FK-consistent; test_a2arm_home_pose_fk).
+  # NOTE (2026-07-12 neutral stance, hip=0): center = keyframe base z (0.45) + 0.285,
+  # so init_pos_start/end are UNCHANGED (EE and center share the offset). Do NOT
+  # change the center without moving the keyframe base z by the same delta, or home
+  # FK self-consistency breaks.
   # The "enlarge sampling shell" experiment overrode these (bigger pos_l / lower
   # center) and collapsed BEFORE force onset — keep any future shell within reach
   # and re-verify against the 09-56-53 run.
@@ -121,7 +125,7 @@ env:
     # 0->full at force_start. Gear factor scales ALL four channels (gripper/base
     # x cmd/ext). force_start advanced to iter 5000 (=120000 steps) to leave
     # budget: gear1 5000-8000 (33%), gear2 8000-11000 (66%), gear3 11000+ (100%).
-    force_start_step: 120000
+    force_start_step: 192000
     # force_curriculum_scales: [0.33, 0.66, 1.0]
     # force_curriculum_stage_steps: 72000     # 3000 iter/gear (x num_steps_per_env 24)
     zero_vel_cmd_prob_after_force: 0.8
@@ -137,3 +141,5 @@ env:
     max_push_force_xyz_base_ext: [-20.0, 20.0]
     base_forced_prob_cmd: 0.8
     base_forced_prob_ext: 0.8
+    settling_time_force_gripper_s: 2.0
+    settling_time_force_base_s: 3.0

@@ -314,8 +314,6 @@ class PosForceCommandsConfig:
     lin_vel_y_clip: float = 0.1
     ang_vel_yaw_clip: float = 0.2
     zero_vel_cmd_prob: float = 0.3
-    # Once external forces are active, UniFP raises the zero-velocity command
-    # probability so the policy practises standing/holding under force.
     zero_vel_cmd_prob_after_force: float = 0.8
     resample_time_s: float = 5.0
     # Force command magnitudes (N). cmd = commanded force the policy must exert
@@ -517,7 +515,15 @@ class A2ArmPosForceCfg(A2ArmBaseCfg):
             # forcerange contract: MUST equal the a2arm.xml motor forceranges
             # (j1/j2/j4=30, j6/j7=10) or MuJoCo re-clamps the env-PD torque.
             arm_kp=[90.0, 120.0, 70.0, 30.0, 30.0],
-            arm_kd=[3.0, 4.0, 2.0, 1.0, 1.0],
+            # Retuned to zeta~0.7 (2026-07-12): the big joints j1/j2/j4 were badly
+            # underdamped (zeta 0.29-0.41 incl. XML damping 0.5), causing the arm to
+            # ring at 2-3 Hz (visible sway standing + amplified while walking). Kd
+            # only — Kp is fine (torque headroom OK below ~15deg error). Critical Kd
+            # (from mj_fullM inertia at home): j1~5.9 j2~15.8 j4~8.4; 0.7x minus the
+            # XML 0.5 gives these. j6/j7 already at zeta~1, left at 1.0. DEPLOYMENT
+            # CONTRACT: real-robot PD must match these exactly (retrain after any
+            # change). Retrain required — the action->torque map changed.
+            arm_kd=[5.5, 10.5, 5.5, 1.0, 1.0],
             arm_torque_limit=[30.0, 30.0, 30.0, 10.0, 10.0],
         )
     )
@@ -537,9 +543,13 @@ class A2ArmPosForceCfg(A2ArmBaseCfg):
     goal_ee: GoalEEConfig = field(
         default_factory=lambda: GoalEEConfig(
             # Terrain-relative sphere center at shoulder height (UniFP contract).
-            sphere_center=SphereCenter(x_offset=0.2, y_offset=0.0, z_invariant_offset=0.75),
+            # Lowered 0.75->0.71 (2026-07-12) by the SAME 0.04 delta as the wide
+            # keyframe base z (0.465->0.425): the EE and the sphere center drop
+            # together, so the EE-to-center vector — and thus init_pos_start/end
+            # and the arm keyframe — are UNCHANGED and stay FK self-consistent.
+            sphere_center=SphereCenter(x_offset=0.2, y_offset=0.0, z_invariant_offset=0.735),
             # P7v3 (5-DOF) reach: sampling range IK-verified safe.
-            pos_l=[0.28, 0.6],
+            pos_l=[0.28, 0.55],
             pos_p=[np.radians(-60), np.radians(72)],
             pos_y=[np.radians(-108), np.radians(108)],
             # Home keyframe FK (joint1,2,4,6,7 = -0.0461,-0.7427,-1.069,0.1581,
@@ -552,12 +562,12 @@ class A2ArmPosForceCfg(A2ArmBaseCfg):
     domain_rand: PosForceDomainRandConfig = field(
         default_factory=lambda: PosForceDomainRandConfig(
             push_body_name="base_link",
-            added_mass_range=[0.0, 8.0],
+            added_mass_range=[0.0, 4.0],
             com_offset_x=[-0.08, 0.08],
             com_offset_y=[-0.08, 0.08],
             com_offset_z=[-0.08, 0.08],
             # UMI gripper mass ~0.3 kg already modeled; randomize payload 0-0.15 kg.
-            gripper_added_mass_range=[0.0, 0.15],
+            gripper_added_mass_range=[0.0, 0.10],
         )
     )
     # Longer A2 legs -> slightly slower stride, larger swing amplitude.

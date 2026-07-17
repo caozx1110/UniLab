@@ -63,20 +63,31 @@
   <!-- Home: A2 per-pair stand (A2's front/rear thigh ranges differ ~0.78 rad, so
        uniform angles overload the rear and the arm's pitching moment knees it —
        per-pair angles plant the rear foot further back for a ~100 mm wider
-       fore-aft support polygon and a level, stable stand). Hip signs WIDE
-       convention (2026-07-07): left legs (FL,RL) hip +0.1, right (FR,RR) hip -0.1
-       -> feet splay to 0.485 m lateral (vs the 0.324 m narrow sibling convention),
-       for stronger lateral force rejection under the pos-force task. FRONT
-       0.75/-1.5, REAR 1.0/-1.5. P7v3 arm (joint3+joint5-frozen 5-DOF): EE FK is
-       invariant to the hip flip (arm mounts on base_link); against the DATACLASS
-       sphere center (0.2,0,0.75) it still lands at [0.4494 m, 0.8115 rad, 0]
-       (test_a2arm_v2_j3_home_pose_fk). The UniFP-experiment training sphere
-       center + sampling shell are OVERRIDDEN in the task YAML (env.goal_ee).
+       fore-aft support polygon and a level, stable stand). FRONT thigh/calf
+       0.75/-1.5, REAR 1.0/-1.5.
+       HIP SIGNS — NEUTRAL STANCE (2026-07-12). All four hips are 0, so the feet
+       sit directly under the hips: a ~0.406 m stance, between the official Unitree
+       A2 narrow (~0.324 m, L_hip -0.1 / R_hip +0.1, unitree_rl_mjlab a2_constants.py
+       INIT_STATE) and the earlier wide experiment (~0.485 m, FL/RL +0.1). Neutral
+       reads as the most natural stance (feet vertical); the hip_pos reward holds
+       the trained pose at this default. (a2arm already deviates from the official
+       thigh/calf/height for the arm, so this stance is custom regardless.) base z
+       is 0.45 so the legs start just above grounded (neutral static-grounds ~0.434,
+       dynamic-settles ~0.394).
+       P7v3 arm (joint3+joint5-frozen 5-DOF): EE FK is invariant to the hip sign
+       (arm mounts on base_link). The DATACLASS sphere center z_invariant_offset is
+       0.735 (= base z 0.45 + 0.285, the fixed EE-to-center gap), so the EE-to-center
+       vector — and thus init_pos_start/end and the arm keyframe — are UNCHANGED, and
+       home still lands at (0.2,0,0.735) as [0.4494 m, 0.8115 rad, 0]
+       (test_a2arm_home_pose_fk). If you change base z, move z_invariant_offset by
+       the same delta (keep the 0.285 gap) or home FK self-consistency breaks.
+       Training sphere center + sampling shell are OVERRIDDEN in the task YAML
+       (env.goal_ee).
        qpos order = base(7) + 12 leg (FL,FR,RL,RR x hip,thigh,calf) + 5 arm
        (joint1,2,4,6,7). ctrl all-zero (motors take raw torque from env PD law). -->
   <keyframe>
     <key name="home"
-      qpos="0 0 0.465 1 0 0 0  -0.1 0.75 -1.5  0.1 0.75 -1.5  -0.1 1.0 -1.5  0.1 1.0 -1.5  -0.0461 -0.7427 -1.069 0.1581 -0.4808"
+      qpos="0 0 0.45 1 0 0 0  0 0.75 -1.5  0 0.75 -1.5  0 1.0 -1.5  0 1.0 -1.5  -0.0461 -0.7427 -1.069 0.1581 -0.4808"
       ctrl="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"/>
   </keyframe>
 </mujoco>

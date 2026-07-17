@@ -101,7 +101,7 @@ def test_a2arm_config_geometry():
 
     cfg = A2ArmPosForceCfg()
     assert cfg.goal_ee.sphere_center.x_offset == pytest.approx(0.2)
-    assert cfg.goal_ee.sphere_center.z_invariant_offset == pytest.approx(0.75, abs=0.01)
+    assert cfg.goal_ee.sphere_center.z_invariant_offset == pytest.approx(0.735, abs=0.01)
     # Home target [radius, pitch, yaw] (recomputed from the joint3+joint5-frozen default FK).
     assert cfg.goal_ee.init_pos_start[0] == pytest.approx(0.4494, abs=1e-3)
     assert cfg.goal_ee.init_pos_start[1] == pytest.approx(0.8115, abs=1e-3)
