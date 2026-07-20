@@ -5,7 +5,13 @@ reset (D2 order) here. Synthetic motion backs the env (DP2: no real data yet).
 """
 import numpy as np
 
+from unilab.base.np_env import NpEnvState
 from unilab.envs.gh_tracking.motion_dataset import write_synthetic_dataset
+
+
+def _minimal_state(n):
+    return NpEnvState(obs={}, reward=np.zeros(n), terminated=np.zeros(n, bool),
+                      truncated=np.zeros(n, bool), info={"steps": np.zeros(n, np.uint32)})
 
 
 def _make_env(tmp_path, n=2):
@@ -32,14 +38,20 @@ def test_d2_reset_boot_protect_is_noised_pose(tmp_path):
 
 
 def test_student_cache_50_frame_fill_at_reset(tmp_path):
-    """Student root cache filled with 50 future motion frames at reset (Phase 7 ⑤)."""
+    """Student root cache filled with 50 future motion frames (Phase 7 ⑤). GH fills in the
+    first before_update after reset (last_reset_env_ids branch), so drive one step first."""
     env, _cfg = _make_env(tmp_path, 2)
     env.init_state()
-
     assert env.student_cache.steps == 50
     assert env.student_cache.ts_root_pos_w.shape == (2, 50, 3)
     assert env.student_cache.ts_root_quat_w.shape == (2, 50, 4)
-    assert np.any(env.student_cache.ts_root_pos_w != 0.0), "cache must be filled from motion"
+
+    # cache is filled on the first step's _before_update (GH-aligned post-increment t)
+    state = _minimal_state(2)
+    ctrl = env.apply_action(np.zeros((2, 29)), state)
+    env._backend.step(ctrl, _cfg.sim_substeps)
+    env.update_state(state)
+    assert np.any(env.student_cache.ts_root_pos_w != 0.0), "cache filled after first before_update"
     env.close()
 
 

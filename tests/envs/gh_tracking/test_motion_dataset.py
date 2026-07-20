@@ -18,7 +18,7 @@ from unilab.envs.gh_tracking.motion_dataset import (
 )
 from unilab.utils.rotation import np_quat_apply, np_yaw_to_quat
 
-NUM_J, NUM_B = 29, 28
+NUM_J, NUM_B = 29, 27  # 27 bodies: GH real training drops "world" (select_in_order)
 
 
 def _make_slice(

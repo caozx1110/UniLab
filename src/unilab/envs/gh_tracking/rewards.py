@@ -130,6 +130,54 @@ def joint_vel_l2(joint_vel_mean: np.ndarray) -> np.ndarray:
     return -(jv**2).sum(axis=1, keepdims=True)
 
 
+class FeetAirTimeRef:
+    """Height-weighted air-time reward, penalized at first contact when below ``thres``
+    (GH ``feet_air_time_ref`` rewards/locomotion.py:163-213). Stateful across control
+    steps: accumulates ``reward_time`` per foot (grows by ``step_dt * height_coef`` while
+    the robot/reference contact agree, decays by ``step_dt`` where they disagree), emits
+    ``sum((reward_time - thres).clamp_max(0) * first_contact)`` at each landing, then zeros
+    ``reward_time`` on contact. GH default ``skip_ref=False`` -> the feet_standing branch.
+    """
+
+    H_LOW, H_HIGH = 0.035, 0.12  # foot-height coefficient bounds (locomotion.py:183)
+    C_LOW, C_HIGH = 0.5, 2.0
+
+    def __init__(self, num_envs: int, num_feet: int, thres: float, step_dt: float) -> None:
+        self.thres = float(thres)
+        self.step_dt = float(step_dt)
+        self.reward_time = np.zeros((int(num_envs), int(num_feet)), dtype=np.float64)
+        self.last_contact = np.zeros((int(num_envs), int(num_feet)), dtype=bool)
+        self._exp_log_c_ratio = float(np.log(self.C_HIGH / self.C_LOW))
+
+    def reset(self, env_ids: np.ndarray) -> None:
+        env_ids = np.asarray(env_ids)
+        self.reward_time[env_ids] = 0.0
+        self.last_contact[env_ids] = False
+
+    def step(
+        self, current_contact: np.ndarray, feet_height: np.ndarray, feet_standing: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Advance one control step. Returns (reward (N,1), first_contact (N,num_feet) bool)."""
+        current_contact = np.asarray(current_contact, dtype=bool)
+        first_contact = (~self.last_contact) & current_contact
+        self.last_contact[:] = current_contact
+
+        t = np.clip(
+            (np.asarray(feet_height, dtype=np.float64) - self.H_LOW) / (self.H_HIGH - self.H_LOW),
+            0.0, 1.0,
+        )
+        feet_height_coef = self.C_LOW * np.exp(self._exp_log_c_ratio * t)
+        contact_diff = np.asarray(feet_standing, dtype=bool) ^ current_contact
+        self.reward_time = self.reward_time + np.where(
+            contact_diff, -self.step_dt, self.step_dt * feet_height_coef
+        )
+        reward = (
+            np.minimum(self.reward_time - self.thres, 0.0) * first_contact
+        ).sum(axis=1, keepdims=True)
+        self.reward_time = self.reward_time * (~current_contact)
+        return reward, first_contact
+
+
 def joint_pos_limits(
     joint_pos: np.ndarray, soft_lo: np.ndarray, soft_hi: np.ndarray, soft_factor: float
 ) -> np.ndarray:

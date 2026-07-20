@@ -54,9 +54,8 @@ _FORCE_BODIES = (
 _TORSO_BODY = "torso_link"
 
 # Reward group -> [(term, weight)] (blueprint §八 table). Signs live in the term
-# formulas (penalties return negative). feet_air_time_ref (weight 10.0) is OMITTED:
-# it needs Phase-9 air-time + motion feet_standing accounting (handoff §101 记账项)
-# and has no Phase-7 term function yet -> TODO(parity), tracked as a pending item.
+# formulas (penalties return negative). feet_air_time_ref (weight 10.0) wired in T10.1
+# via the stateful FeetAirTimeRef + motion feet_standing (GH locomotion.py:163-213).
 _REWARD_GROUPS: dict[str, list[tuple[str, float]]] = {
     "impedance": [
         ("force_reward", 2.0),
@@ -80,6 +79,7 @@ _REWARD_GROUPS: dict[str, list[tuple[str, float]]] = {
         ("feet_slip", 2.0),
         ("joint_vel_l2", 5e-4),
         ("action_rate_l2", 0.1),
+        ("feet_air_time_ref", 10.0),
         ("joint_pos_limits", 1.0),
     ],
 }
@@ -246,7 +246,7 @@ class GHTrackingEnv(NpEnv):
         )
         self.student_cache = StudentRootCache(num_envs, steps=50)
 
-        # motion-frame body indices (into the 28 motion BODY_NAMES) for the 11
+        # motion-frame body indices (into the 27 motion BODY_NAMES) for the 11
         # keypoints and 6 force bodies, plus each force body's slot among the 11
         # keypoints (keypoint_tracking_imp compliant-target substitution).
         self._motion_kp_idx = np.array([BODY_NAMES.index(n) for n in _KEYPOINT_BODIES], dtype=np.int64)
@@ -272,6 +272,15 @@ class GHTrackingEnv(NpEnv):
         # joint-velocity 2-slot sub-sampler for joint_vel_l2 (fed per substep in Task 9.4)
         self._joint_vel_2slot = rwd.JointVel2Slot(num_envs, num_dof)
 
+        # feet air-time reward state (T10.1) + motion feet-standing reference buffer
+        self._feet_air = rwd.FeetAirTimeRef(
+            num_envs, len(_FEET_BODIES), thres=cfg.reward.feet_air_time_thres, step_dt=cfg.ctrl_dt
+        )
+        self._motion_feet_idx = np.array(
+            [BODY_NAMES.index(n) for n in _FEET_BODIES], dtype=np.int64
+        )
+        self._feet_standing = np.zeros((num_envs, len(_FEET_BODIES)), dtype=bool)
+
         # reward manager (3-group vector · step_dt); reward context populated each step
         self._rc: dict[str, Any] = {}
         self._reward_manager = self._build_reward_manager()
@@ -289,6 +298,7 @@ class GHTrackingEnv(NpEnv):
         self.motion: WeightedMotionDataset | None = None
         self._motion_len = np.zeros(num_envs, dtype=np.int64)
         self._motion_slice = None
+        self._student_reset_ids: np.ndarray | None = None  # just-reset envs pending cache fill
         if cfg.motion.dirs:
             self.motion = WeightedMotionDataset(
                 dirs=list(cfg.motion.dirs),
@@ -397,6 +407,7 @@ class GHTrackingEnv(NpEnv):
             "joint_vel_l2": lambda s: rwd.joint_vel_l2(s["joint_vel_mean"]),
             "joint_pos_limits": lambda s: rwd.joint_pos_limits(
                 s["joint_pos"], s["soft_lo"], s["soft_hi"], s["soft_factor"]),
+            "feet_air_time_ref": lambda s: s["feet_air_time_reward"],
             # tracking
             "lower_keypoint_tracking": lambda s: rwd.lower_keypoint_tracking(
                 s["lower_actual_kp_w"], s["lower_target_kp_w"], sig["lower_keypoint"]),
@@ -424,7 +435,10 @@ class GHTrackingEnv(NpEnv):
                 s["actual_kp_w"], s["target_kp_w"], s["force_keypoint_w"],
                 s["force_in_kp_idx"], sig["keypoint_imp"])[0],
         }
-        return rwd.RewardManager(groups=_REWARD_GROUPS, term_fns=fns, step_dt=self._cfg.ctrl_dt)
+        return rwd.RewardManager(
+            groups=_REWARD_GROUPS, term_fns=fns, step_dt=self._cfg.ctrl_dt,
+            student_train=self._cfg.student_train,  # T10.3: student forces reward progress=1.0
+        )
 
     # ------------------------------------------------------------------ #
     # Lifecycle: update_state (GH _step steps 2-7, blueprint §四)          #
@@ -460,6 +474,18 @@ class GHTrackingEnv(NpEnv):
             self._motion_slice = self.motion.get_slice(
                 np.arange(self._num_envs), self._motion_t, FUTURE_STEPS
             )
+            # student root cache: fill 50 future frames for just-reset envs at the
+            # POST-increment t (GH update_reward_target last_reset_env_ids branch,
+            # motion_tracking.py:458-461) — aligns the 1-frame boundary with GH.
+            if self._student_reset_ids is not None:
+                self._fill_student_cache(self._student_reset_ids)
+                self._student_reset_ids = None
+            # motion feet-standing: reference foot XY speed < 0.1 (GH motion_tracking.py:492).
+            # feet_vel = (future[1] - future[0]) foot positions / their time gap.
+            dt01 = float(FUTURE_STEPS[1] - FUTURE_STEPS[0]) * self._cfg.ctrl_dt
+            feet_bp = self._motion_slice.body_pos_w[:, :, self._motion_feet_idx, :].astype(np.float64)
+            feet_vel = (feet_bp[:, 1] - feet_bp[:, 0]) / dt01  # (N, 2, 3)
+            self._feet_standing = np.linalg.norm(feet_vel[:, :, :2], axis=-1) < 0.1
             root_pos_w = self._backend.get_base_pos()
             root_quat_w = self._backend.get_base_quat()
             ref_kp_force_w = self._motion_slice.body_pos_w[:, 0][:, self._motion_force_idx, :].astype(
@@ -478,9 +504,42 @@ class GHTrackingEnv(NpEnv):
             return np.zeros((self._num_envs, 1), dtype=bool)
         return (self._motion_t >= (self._motion_len - 1)).reshape(-1, 1)
 
+    @staticmethod
+    def _body_frame_vel_err(cur_quat, cur_vel_w, ref_quat, ref_vel_w) -> np.ndarray:
+        """GH root_vel / root_ang_vel_tracking error: ‖ref_vel_b - cur_vel_b‖, each
+        velocity rotated into its OWN root frame (motion_tracking.py:369-406)."""
+        from unilab.utils.rotation import np_quat_apply_inverse
+
+        cur_b = np_quat_apply_inverse(
+            np.asarray(cur_quat, dtype=np.float64), np.asarray(cur_vel_w, dtype=np.float64))
+        ref_b = np_quat_apply_inverse(
+            np.asarray(ref_quat, dtype=np.float64), np.asarray(ref_vel_w, dtype=np.float64))
+        return np.linalg.norm(ref_b - cur_b, axis=-1, keepdims=True)
+
+    def _select_reward_root_target(
+        self, root_pos_w, root_quat_w, m_pos0, m_quat0, env_origins
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Reward root target (GH update_reward_target, motion_tracking.py:442-484):
+        teacher (train) = current motion frame + env_origins; student (adapt/finetune) =
+        StudentRootCache head, rolling in a robot-anchored ref t->t+50 displacement tail.
+
+        Cache-fill boundary (fill at reset-t vs GH's post-increment t) is a 1-frame
+        element-wise-parity detail (§十二:721, needs GH runtime dump)."""
+        if not self._cfg.student_train:
+            return rwd.teacher_reward_target(m_pos0, m_quat0, env_origins)
+        if self.motion is not None:
+            plus = self.motion.get_slice(
+                np.arange(self._num_envs), self._motion_t, np.array([50], dtype=np.int64))
+            ref_pos_t_plus = plus.root_pos_w[:, 0].astype(np.float64)
+            ref_quat_t_plus = plus.root_quat_w[:, 0].astype(np.float64)
+        else:
+            ref_pos_t_plus, ref_quat_t_plus = m_pos0, m_quat0
+        return self.student_cache.step(
+            root_pos_w, root_quat_w, m_pos0, m_quat0, ref_pos_t_plus, ref_quat_t_plus)
+
     def _compute_reward(self) -> np.ndarray:
         """Compute the 3-group reward vector and (as producer) the instantaneous
-        _cum_error (root-pos/rot/keypoint normalized errors, teacher target)."""
+        _cum_error (root-pos/rot/keypoint normalized errors, teacher/student target)."""
         bk = self._backend
         n = self._num_envs
         env_origins = np.zeros((n, 3), dtype=np.float64)  # MuJoCo: each env at world origin
@@ -488,22 +547,31 @@ class GHTrackingEnv(NpEnv):
         root_quat_w = bk.get_base_quat()
         actual_kp_w = bk.get_body_pos_w(self._keypoint_ids)  # (N,11,3)
 
-        # teacher reward target = current motion frame (student 50-cache mode -> Phase 10)
+        # motion references (current frame) for tracking + reward target
         if self.motion is not None:
             m_pos0 = self._motion_slice.root_pos_w[:, 0].astype(np.float64)
             m_quat0 = self._motion_slice.root_quat_w[:, 0].astype(np.float64)
             m_linvel0 = self._motion_slice.root_lin_vel_w[:, 0].astype(np.float64)
+            m_angvel0 = self._motion_slice.root_ang_vel_w[:, 0].astype(np.float64)
             target_kp_w = self._motion_slice.body_pos_w[:, 0][:, self._motion_kp_idx, :].astype(
                 np.float64
             )
             track_target = self._motion_slice.joint_pos[:, 0][:, self._track_joint_ids].astype(
                 np.float64
             )
+            m_joint_vel = self._motion_slice.joint_vel[:, 0][:, self._track_joint_ids].astype(
+                np.float64
+            )
         else:
-            m_pos0, m_quat0, m_linvel0 = root_pos_w, root_quat_w, bk.get_base_lin_vel()
+            m_pos0, m_quat0 = root_pos_w, root_quat_w
+            m_linvel0, m_angvel0 = bk.get_base_lin_vel(), bk.get_base_ang_vel_world()
             target_kp_w = actual_kp_w
             track_target = bk.get_dof_pos()[:, self._track_joint_ids]
-        reward_root_pos_w, reward_root_quat_w = rwd.teacher_reward_target(m_pos0, m_quat0, env_origins)
+            m_joint_vel = np.zeros((n, self._track_joint_ids.shape[0]), dtype=np.float64)
+        # reward root target: teacher = current motion frame; student = 50-cache head (T10.3)
+        reward_root_pos_w, reward_root_quat_w = self._select_reward_root_target(
+            root_pos_w, root_quat_w, m_pos0, m_quat0, env_origins
+        )
 
         # --- _cum_error producer (instantaneous normalized errors) ---
         _, cum_pos = rwd.root_pos_tracking(root_pos_w, reward_root_pos_w, _REWARD_SIGMA["root_pos"])
@@ -512,6 +580,13 @@ class GHTrackingEnv(NpEnv):
         self._cum_error[:, 0] = cum_pos[:, 0]
         self._cum_error[:, 1] = cum_rot[:, 0]
         self._cum_error[:, 2] = cum_kp[:, 0]
+
+        # --- feet air-time (T10.1): stateful step -> reward + shared first_contact ---
+        feet_air_reward, first_contact = self._feet_air.step(
+            bk.get_body_contact_state(self._feet_ids),
+            bk.get_body_pos_w(self._feet_ids)[:, :, 2],
+            self._feet_standing,
+        )
 
         # --- assemble the reward context (self._rc) for the term_fns ---
         fs = self.force_system
@@ -523,7 +598,8 @@ class GHTrackingEnv(NpEnv):
             mass_total=self._mass_total,
             action_buf=self.action_pipeline.action_buf,
             net_force_hist=self.obs_manager.contact.history,
-            first_contact=np.zeros((n, len(self._feet_ids))),  # TODO(parity): air-time first_contact
+            first_contact=first_contact.astype(np.float64),  # T10.1: shared with impact_force_l2
+            feet_air_time_reward=feet_air_reward,  # T10.1: precomputed stateful term value
             in_contact=bk.get_body_contact_state(self._feet_ids).astype(np.float64),
             feet_vel_xy=bk.get_body_lin_vel_w(self._feet_ids)[:, :, :2],
             joint_vel_mean=self._joint_vel_2slot.mean(),
@@ -537,12 +613,14 @@ class GHTrackingEnv(NpEnv):
             reward_root_pos_w=reward_root_pos_w,
             root_quat_w=root_quat_w,
             reward_root_quat_w=reward_root_quat_w,
-            root_vel_err=np.linalg.norm(m_linvel0 - bk.get_base_lin_vel(), axis=-1, keepdims=True),
-            root_ang_vel_err=np.zeros((n, 1)),  # TODO(parity): motion root ang-vel reference
+            root_vel_err=self._body_frame_vel_err(
+                root_quat_w, bk.get_base_lin_vel(), m_quat0, m_linvel0),
+            root_ang_vel_err=self._body_frame_vel_err(
+                root_quat_w, bk.get_base_ang_vel_world(), m_quat0, m_angvel0),
             track_joint_actual=track_actual,
             track_joint_target=track_target,
-            track_joint_vel_diff=track_actual - self._prev_track_joint_pos,
-            track_joint_vel_target=np.zeros_like(track_actual),  # TODO(parity): motion joint-vel ref
+            track_joint_vel_diff=(track_actual - self._prev_track_joint_pos) / self._cfg.ctrl_dt,
+            track_joint_vel_target=m_joint_vel,
             force_applied_w=fs.force_applied_w,
             force_expected_w=fs.force_expected_w,
             force_safe_limit=fs.force_safe_limit_tl.current,
@@ -672,18 +750,23 @@ class GHTrackingEnv(NpEnv):
         self.force_system.force_reset(env_ids)
         self.force_system.last_reset_env_ids = env_ids
         self.termination.reset(env_ids)
+        self._feet_air.reset(env_ids)
         self._episode_length[env_ids] = sample_reset_episode_length(
             len(env_ids), self._num_envs, self._cfg.termination.max_episode_length, self._rng
         )
-        self._fill_student_cache(env_ids, starts)
+        # student cache fill is deferred to the next _before_update (GH last_reset_env_ids
+        # branch, post-increment t) — aligns the 1-frame boundary with GH.
+        self._student_reset_ids = np.asarray(env_ids)
 
         info_updates = {"boot_protect": noised_init_joint_pos}
         return qpos, qvel, info_updates
 
-    def _fill_student_cache(self, env_ids: np.ndarray, starts: np.ndarray) -> None:
-        """Fill the student root cache with 50 future motion frames (Phase 7 ⑤)."""
-        fill = self.motion.get_slice(env_ids, starts, np.arange(50, dtype=np.int64))
-        env_origins = np.zeros((len(np.asarray(env_ids)), 3), dtype=np.float64)
+    def _fill_student_cache(self, env_ids: np.ndarray) -> None:
+        """Fill the student root cache with 50 future motion frames from the current
+        motion frame ``_motion_t`` (GH update_reward_target, post-increment t)."""
+        env_ids = np.asarray(env_ids)
+        fill = self.motion.get_slice(env_ids, self._motion_t[env_ids], np.arange(50, dtype=np.int64))
+        env_origins = np.zeros((len(env_ids), 3), dtype=np.float64)
         self.student_cache.reset(
             env_ids,
             fill.root_pos_w.astype(np.float64),

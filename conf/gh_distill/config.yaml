@@ -1,0 +1,38 @@
+# @package _global_
+# GHDistillPPO 3-phase runner — top-level Hydra config (Phase 10.10).
+#
+# Phases are a `phase/` override group (decision #1: mirrors offpolicy's `algo=` group,
+# the one proven override mechanism in UniLab; no GH-style `exp/` layer exists). Select
+# with `phase=train|adapt|finetune`. The task YAML carries training.task_name + the
+# DENYLIST fields; the phase group (# @package algo) carries the phase-specific trainer
+# knobs (phase/vecnorm/student_train/lr/entropy endpoints/total iters/train_every).
+defaults:
+  - _self_
+  - phase: train
+  - task: gh_tracking/mujoco
+
+training:
+  task_name: GHTracking
+  sim_backend: mujoco
+  device: null
+  logger: tensorboard
+  seed: 0
+  log_root: null
+
+algo:
+  algo_log_name: gh_distill
+  seed: 0
+  num_envs: 4096
+  max_iterations: 30000
+  save_interval: 500
+  rollout_length: 32          # T steps per outer iteration (GH train_every default)
+  # phase-specific fields (phase/vecnorm/student_train/lr/entropy_*/checkpoint_path)
+  # are supplied by the selected phase/*.yaml override group.
+  gamma: 0.99
+  lam: 0.95
+  desired_kl: 0.01
+  clip_param: 0.2
+  ppo_epochs: 5
+  num_minibatches: 8
+  estimator_epochs: 2
+  checkpoint_path: null       # prior-phase checkpoint to inherit (set by train.sh-style chaining)

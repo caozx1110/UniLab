@@ -1,0 +1,12 @@
+# @package algo
+# Phase 2: adapt — estimator only (no GAE/PPO/KL). GH ppo.py:89 (ppo_adapt),
+# cfg/exp/adapt.yaml: vecnorm=eval, train_every=16, total_frames=1e9, student_train=True.
+phase: adapt
+vecnorm: eval               # inherit + freeze the train-phase decay-EMA stats
+student_train: true         # reward progress forced to 1.0; student 50-cache target
+lr: 3.0e-4
+entropy_start: 0.005
+entropy_end: 0.002
+reg_lambda_max: 0.2
+train_every: 16
+total_frames: 1.0e9

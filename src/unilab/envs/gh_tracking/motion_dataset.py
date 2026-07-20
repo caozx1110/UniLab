@@ -36,7 +36,7 @@ JOINT_NAMES: tuple[str, ...] = (
     "right_wrist_yaw_joint",
 )
 BODY_NAMES: tuple[str, ...] = (
-    "world", "pelvis",
+    "pelvis",
     "left_hip_pitch_link", "left_hip_roll_link", "left_hip_yaw_link",
     "left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link",
     "right_hip_pitch_link", "right_hip_roll_link", "right_hip_yaw_link",
@@ -49,7 +49,8 @@ BODY_NAMES: tuple[str, ...] = (
     "head_mimic", "left_hand_mimic", "right_hand_mimic",
 )
 NUM_JOINTS = len(JOINT_NAMES)  # 29
-NUM_BODIES = len(BODY_NAMES)  # 28
+NUM_BODIES = len(BODY_NAMES)  # 27 (GH real training: "world" is dropped by
+# select_in_order(return_missing=False) since the GMR G1 model has no "world" body)
 
 FUTURE_STEPS: np.ndarray = np.array([0, 2, 4, 8, 16], dtype=np.int64)
 Z_OFFSET = 0.035

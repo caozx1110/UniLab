@@ -21,6 +21,10 @@ class SymmetryTransform(nn.Module):
         else:
             return x[..., self.perm]
 
+    def repeat(self, n: int) -> "SymmetryTransform":
+        """GH symmetry.py:26-27 — apply this transform to n consecutive blocks."""
+        return SymmetryTransform.cat([self] * n)
+
     @staticmethod
     def cat(transforms):
         """GH symmetry.py:29-40."""

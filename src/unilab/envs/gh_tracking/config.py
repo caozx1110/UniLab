@@ -143,6 +143,7 @@ class GHTrackingCfg(EnvCfg):
     ))
     asset: GHAssetCfg = field(default_factory=GHAssetCfg)
     sampling_mode: str = "sample_once"  # DENYLIST (sim2sim): motion episode sampling mode
+    student_train: bool = False  # train->teacher(current frame); adapt/finetune->student 50-cache
     motion: GHMotionCfg = field(default_factory=GHMotionCfg)
     action: GHActionCfg = field(default_factory=GHActionCfg)
     control_config: GHControlConfigCfg = field(default_factory=GHControlConfigCfg)

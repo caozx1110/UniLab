@@ -1,0 +1,13 @@
+# @package algo
+# Phase 3: finetune — student PPO (gated by progress>0.025). GH ppo.py:90 (ppo_finetune),
+# cfg/exp/finetune.yaml: vecnorm=eval, lr=1e-4, entropy 0.002->0.0005, total_frames=2e9,
+# student_train=True.
+phase: finetune
+vecnorm: eval               # inherit + freeze
+student_train: true
+lr: 1.0e-4
+entropy_start: 0.002
+entropy_end: 0.0005
+reg_lambda_max: 0.2
+train_every: 32
+total_frames: 2.0e9

@@ -1,0 +1,11 @@
+# @package algo
+# Phase 1: train — teacher PPO + estimator. GH ppo.py:88 (ppo_train), cfg/exp/train.yaml.
+phase: train
+vecnorm: train              # online decay-EMA update of the 3 obs groups
+student_train: false        # teacher reward target = current motion frame
+lr: 3.0e-4
+entropy_start: 0.005
+entropy_end: 0.002
+reg_lambda_max: 0.2
+train_every: 32
+total_frames: 1.0e9
