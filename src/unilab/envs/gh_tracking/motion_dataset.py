@@ -57,6 +57,17 @@ Z_OFFSET = 0.035
 LIFT_HEIGHT = 0.04
 MAX_STEP_SIZE = 1000
 
+# Float fields that get_slice must return as float32. The on-disk buffers are
+# float16, and every downstream consumer immediately re-casts to float64, so a
+# blanket fp16->fp32 cast on all float fields is pure overhead (fp16->fp64 is
+# bit-identical to fp16->fp32->fp64). Only two cases genuinely need fp32 in the
+# slice itself: (1) the positional fields that carry the +Z_OFFSET add below
+# (float16 can't represent the shifted value at 1e-3 tolerance — see
+# test_get_slice_applies_z_offset), and (2) joint_pos, whose float32 dtype is a
+# pinned part of the get_slice contract (test_get_slice_returns_float32). All
+# other float fields stay float16 and are cast on demand at their use sites.
+_SLICE_FP32_FIELDS: frozenset[str] = frozenset({"root_pos_w", "body_pos_w", "joint_pos"})
+
 # field name -> (dtype, per-frame feature shape). float->f16, int->i32.
 _FLOAT = np.float16
 _INT = np.int32
@@ -272,9 +283,12 @@ class WeightedMotionDataset:
         idx = np.minimum(idx, last)  # clamp-to-last
 
         out: dict[str, np.ndarray] = {}
-        for name, (dtype, _) in FIELD_SPEC.items():
+        for name in FIELD_SPEC:
             gathered = self._buf[name][env_ids[:, None], idx]
-            if np.issubdtype(dtype, np.floating):
+            # Cast to float32 only where the slice contract needs it (see
+            # _SLICE_FP32_FIELDS); other float fields stay float16 and are cast on
+            # demand by consumers (fp16->fp64 == fp16->fp32->fp64, no precision lost).
+            if name in _SLICE_FP32_FIELDS:
                 gathered = gathered.astype(np.float32)
             out[name] = gathered
         out["root_pos_w"][..., 2] += Z_OFFSET
