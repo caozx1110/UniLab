@@ -58,9 +58,10 @@ class HistoryBuffer:
         env_ids = np.asarray(env_ids)
         self.buffer[env_ids] = np.asarray(source, dtype=np.float64)[env_ids][:, None, :]
 
-    def compute(self) -> np.ndarray:
-        n = self.buffer.shape[0]
-        return self.buffer[:, self.history_steps].reshape(n, -1)
+    def compute(self, env_ids: np.ndarray | None = None) -> np.ndarray:
+        buf = self.buffer if env_ids is None else self.buffer[env_ids]
+        n = buf.shape[0]
+        return buf[:, self.history_steps].reshape(n, -1)
 
 
 class JointPosHistory:
@@ -103,9 +104,11 @@ class JointPosHistory:
         env_ids = np.asarray(env_ids)
         self.buffer[env_ids] = np.asarray(joint_pos, dtype=np.float64)[env_ids][:, None, :]
 
-    def compute(self) -> np.ndarray:
-        n = self.buffer.shape[0]
-        joint_pos = self.buffer - self.offset[:, None, :]  # minus actuator zero offset
+    def compute(self, env_ids: np.ndarray | None = None) -> np.ndarray:
+        buf = self.buffer if env_ids is None else self.buffer[env_ids]
+        offset = self.offset if env_ids is None else self.offset[env_ids]
+        n = buf.shape[0]
+        joint_pos = buf - offset[:, None, :]  # minus actuator zero offset
         return joint_pos[:, self.history_steps].reshape(n, -1)
 
 
@@ -125,10 +128,11 @@ class RootLinVelEMA:
     def reset(self, env_ids: np.ndarray) -> None:
         self.linvel_w[np.asarray(env_ids)] = 0.0
 
-    def compute(self, root_quat_w: np.ndarray) -> np.ndarray:
+    def compute(self, root_quat_w: np.ndarray, env_ids: np.ndarray | None = None) -> np.ndarray:
         from unilab.utils.rotation import np_quat_apply_inverse
 
-        return np_quat_apply_inverse(np.asarray(root_quat_w, dtype=np.float64), self.linvel_w)
+        linvel_w = self.linvel_w if env_ids is None else self.linvel_w[env_ids]
+        return np_quat_apply_inverse(np.asarray(root_quat_w, dtype=np.float64), linvel_w)
 
 
 class ContactForceHistory:
@@ -150,9 +154,10 @@ class ContactForceHistory:
     def reset(self, env_ids: np.ndarray) -> None:
         self.history[np.asarray(env_ids)] = 0.0
 
-    def compute(self) -> np.ndarray:
-        n = self.history.shape[0]
-        force = self.history.mean(axis=1) / self.denom  # (N, n_bodies, 3)
+    def compute(self, env_ids: np.ndarray | None = None) -> np.ndarray:
+        hist = self.history if env_ids is None else self.history[env_ids]
+        n = hist.shape[0]
+        force = hist.mean(axis=1) / self.denom  # (N, n_bodies, 3)
         return np.clip(force, -10.0, 10.0).reshape(n, -1)
 
 
@@ -430,16 +435,21 @@ class ObservationManager:
         self.pol_joint.update(self._rng)
         self.priv_joint.update(self._rng)
 
-    def compute(self, s: ObsState) -> dict[str, np.ndarray]:
+    def compute(self, s: ObsState, env_ids: np.ndarray | None = None) -> dict[str, np.ndarray]:
+        """Assemble the three obs groups. When ``env_ids`` is given, ``s`` must already
+        hold only those rows (subset ObsState); the persistent telemetry buffers are
+        indexed by ``env_ids`` so the result equals the full compute sliced to
+        ``env_ids`` (every term is per-env independent). Used by the reset path to
+        avoid recomputing obs for the ~98% of envs that did not reset."""
         policy = np.concatenate(
             [
                 boot_indicator_state_obs(s.boot_indicator, self.boot_max),  # [0:1]
                 command_obs(s.motion_root_pos_w, s.motion_root_quat_w, s.force_safe_limit),  # [1:23]
                 target_joint_pos_obs(s.motion_joint_pos),  # [23:168]
                 target_projected_gravity_b(s.motion_root_quat_w),  # [168:183]
-                self.pol_angvel.compute(),  # [183:186]
-                self.pol_grav.compute(),  # [186:189]
-                self.pol_joint.compute(),  # [189:363]
+                self.pol_angvel.compute(env_ids),  # [183:186]
+                self.pol_grav.compute(env_ids),  # [186:189]
+                self.pol_joint.compute(env_ids),  # [189:363]
                 prev_actions_obs(s.action_buf),  # [363:450]
             ],
             axis=-1,
@@ -451,11 +461,11 @@ class ObservationManager:
                 relative_quat_obs(s.motion_root_quat_w, s.root_quat_w),  # [30:45]
                 force_priv_obs(s.force_keypoint_b, s.force_applied_b, s.force_expected_b, s.force_sample_timer),  # [45:100]
                 body_height(s.body_pos_w_height),  # [100:104]
-                self.contact.compute(),  # [104:110]
-                self.root_ema.compute(s.root_quat_w),  # [110:113]
-                self.priv_angvel.compute(),  # [113:140]
-                self.priv_grav.compute(),  # [140:167]
-                self.priv_joint.compute(),  # [167:428]
+                self.contact.compute(env_ids),  # [104:110]
+                self.root_ema.compute(s.root_quat_w, env_ids),  # [110:113]
+                self.priv_angvel.compute(env_ids),  # [113:140]
+                self.priv_grav.compute(env_ids),  # [140:167]
+                self.priv_joint.compute(env_ids),  # [167:428]
                 current_keypoint_b(s.body_pos_w_kp, s.root_pos_w, s.root_quat_w),  # [428:461]
                 current_keypoint_vel_b(s.body_lin_vel_w_kp, s.root_quat_w),  # [461:494]
                 target_keypoints_diff_b_obs(

@@ -706,6 +706,15 @@ class GHTrackingEnv(NpEnv):
             net_contact_force=bk.get_body_net_contact_force_w(self._feet_ids),
         )
 
+    @staticmethod
+    def _slice_obs_state(state: ObsState, env_ids: np.ndarray) -> ObsState:
+        """Return a copy of ``state`` holding only the ``env_ids`` rows (env axis 0 on
+        every field). Used to feed ObservationManager.compute a subset so the reset
+        path computes obs for the ~1.6% of envs that reset, not the whole batch."""
+        from dataclasses import fields as _dc_fields
+
+        return ObsState(**{f.name: getattr(state, f.name)[env_ids] for f in _dc_fields(state)})
+
     def _compute_obs(self) -> dict[str, np.ndarray]:
         """Roll the control-step obs histories then assemble the 3 groups."""
         state = self._build_obs_state()
@@ -839,7 +848,14 @@ class GHTrackingEnv(NpEnv):
 
     def _build_reset_observation(self, env_ids: np.ndarray) -> dict[str, np.ndarray]:
         """GH D2 reset (post set_state): refresh the motion slice, reset the obs
-        history from the freshly-set sim state, and return the reset-env obs subset."""
+        history from the freshly-set sim state, and return the reset-env obs subset.
+
+        Only the ``env_ids`` obs are computed: ``obs_manager.reset`` needs the full
+        obs_state (it indexes ``source[env_ids]`` per buffer), but the final
+        ``compute`` is fed the ``env_ids`` slice of that same state + ``env_ids`` for
+        the persistent telemetry buffers. Every obs term is per-env independent, so
+        this equals the old full-batch ``compute(obs_state)[env_ids]`` bit-for-bit
+        while skipping the ~98% of envs that did not reset (was ~450ms/iter waste)."""
         env_ids = np.asarray(env_ids)
         self._motion_slice = self.motion.get_slice(
             np.arange(self._num_envs), self._motion_t, FUTURE_STEPS
@@ -849,8 +865,8 @@ class GHTrackingEnv(NpEnv):
         self._prev_track_joint_pos[env_ids] = (
             self._backend.get_dof_pos()[env_ids][:, self._track_joint_ids]
         )
-        obs = self.obs_manager.compute(obs_state)
-        return {k: v[env_ids] for k, v in obs.items()}
+        obs = self.obs_manager.compute(self._slice_obs_state(obs_state, env_ids), env_ids)
+        return obs
 
     def _reset_idx(self, env_ids: np.ndarray) -> None:
         """Standalone reset (bypasses the DR manager) for unit tests. The DR provider
