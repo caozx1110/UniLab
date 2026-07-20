@@ -1,0 +1,40 @@
+# @package _global_
+# GH tracking owner config (Motrix backend), Phase 9.6.
+#
+# The DENYLIST subtree (algo.obs_groups, env.action.action_scale, env.sampling_mode)
+# is byte-identical to mujoco.yaml (sim2sim cross-backend contract). Only ALLOWLIST
+# fields (sim_backend, scene, motion) may differ. Motrix physics parity is a
+# Phase-10 concern; this file exists so the contract is declared on both backends.
+training:
+  task_name: GHTracking
+  sim_backend: motrix
+  play_steps: 1000
+algo:
+  num_envs: 4096
+  max_iterations: 30000
+  save_interval: 500
+  obs_groups:            # DENYLIST — identical to mujoco.yaml
+    policy:
+      - policy
+    priv:
+      - priv
+    priv_critic:
+      - priv_critic
+env:
+  sampling_mode: sample_once   # DENYLIST — identical to mujoco.yaml
+  control_config:
+    action_scale:               # DENYLIST — identical to mujoco.yaml (G1_gentle.yaml:13-22)
+      .*elbow_joint: 1.0
+      .*shoulder.*: 1.0
+      .*wrist.*: 1.0
+      .*hip_roll.*: 0.25
+      .*hip_yaw.*: 0.25
+      .*hip_pitch.*: 0.5
+      .*knee.*: 0.5
+      .*waist.*: 0.25
+      .*ankle.*: 0.5
+  scene:
+    model_file: src/unilab/assets/robots/g1_gh/scene_flat.xml
+  motion:
+    dirs: []
+    weights: []
