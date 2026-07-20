@@ -1,0 +1,56 @@
+<mujoco model="g1_gh flat scene">
+  <include file="robot.xml"/>
+
+  <statistic center="1 -0.8 1.1" extent=".35"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0.9 0.9 0.9"/>
+    <rgba haze="0.15 0.25 0.35 1"/>
+    <global azimuth="140" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512" height="3072"/>
+    <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4" rgb2="0.1 0.2 0.3"
+      markrgb="0.8 0.8 0.8" width="300" height="300"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5" reflectance="0.2"/>
+  </asset>
+
+  <worldbody>
+    <geom name="floor" size="0 0 0.05" type="plane" material="groundplane"/>
+  </worldbody>
+
+  <!-- GH net external contact force + contact state on the feet (Phase-1 backend
+       contract: netcontact_<body> / contactfound_<body>). Used by GH
+       contact_forces obs, impact_force_l2, feet_air_time, first-contact. -->
+  <sensor>
+    <contact name="netcontact_left_ankle_roll_link" body1="left_ankle_roll_link" data="force" reduce="netforce"/>
+    <contact name="netcontact_right_ankle_roll_link" body1="right_ankle_roll_link" data="force" reduce="netforce"/>
+    <contact name="contactfound_left_ankle_roll_link" body1="left_ankle_roll_link" data="found"/>
+    <contact name="contactfound_right_ankle_roll_link" body1="right_ankle_roll_link" data="found"/>
+  </sensor>
+
+  <!-- GH default stand pose (humanoid.py init_state): root z=0.74, hip_pitch
+       -0.28, knee 0.5, ankle_pitch -0.23, elbow 0.87, shoulder pitch 0.35 /
+       roll +-0.16. Task-level keyframe (never in robot.xml, per AGENTS.md). -->
+  <keyframe>
+    <key name="stand"
+      qpos="
+      0 0 0.74
+      1 0 0 0
+      -0.28 0.0 0.0 0.5 -0.23 0.0
+      -0.28 0.0 0.0 0.5 -0.23 0.0
+      0.0 0.0 0.0
+      0.35 0.16 0.0 0.87 0.0 0.0 0.0
+      0.35 -0.16 0.0 0.87 0.0 0.0 0.0
+      "
+      ctrl="
+      -0.28 0.0 0.0 0.5 -0.23 0.0
+      -0.28 0.0 0.0 0.5 -0.23 0.0
+      0.0 0.0 0.0
+      0.35 0.16 0.0 0.87 0.0 0.0 0.0
+      0.35 -0.16 0.0 0.87 0.0 0.0 0.0
+      "/>
+  </keyframe>
+
+</mujoco>
