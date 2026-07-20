@@ -264,6 +264,35 @@ class SimBackend(abc.ABC):
             )
         return converted
 
+    def set_pre_step_wrench(self, fn) -> None:
+        """Register a per-physics-substep external-wrench recompute callback.
+
+        ``fn(backend)`` is invoked at the start of every physics substep AFTER the
+        pending external-wrench buffer is zeroed, so owner code re-applies the
+        compliant wrench from the current body pose (reflecting the previous
+        substep). Backends without a per-substep loop ignore this.
+        """
+        self._pre_step_wrench_fn = fn
+
+    def _apply_pre_step_wrench(self) -> None:
+        fn = getattr(self, "_pre_step_wrench_fn", None)
+        if fn is not None:
+            fn(self)
+
+    def set_post_step_callback(self, fn) -> None:
+        """Register a callback fired after every physics substep's sensor refresh.
+
+        ``fn(backend)`` lets owner code sample post-substep telemetry (joint
+        2-slot buffers, root-velocity EMA, contact-force history), covering the
+        final substep which a pre-step callback cannot reach.
+        """
+        self._post_step_callback_fn = fn
+
+    def _apply_post_step_callback(self) -> None:
+        fn = getattr(self, "_post_step_callback_fn", None)
+        if fn is not None:
+            fn(self)
+
     @abc.abstractmethod
     def set_state(
         self,
@@ -342,6 +371,31 @@ class SimBackend(abc.ABC):
         """
         raise NotImplementedError(
             f"{self.__class__.__name__} does not support interval body force perturbation"
+        )
+
+    def apply_body_wrench(
+        self,
+        body_ids: np.ndarray,
+        force: np.ndarray,
+        torque: np.ndarray,
+    ) -> None:
+        """Apply a world-frame force AND torque to specific bodies for the step.
+
+        Unlike :meth:`apply_body_force` (force half only), this writes the full 6D
+        external wrench (``xfrc_applied`` force half then torque half). GH
+        compliant forces need the torque half for eccentric torque and
+        net-wrench torso corrections.
+
+        Args:
+            body_ids: Body ids whose external wrench should be perturbed.
+            force: World-frame force, shape ``(num_envs, len(body_ids), 3)``.
+            torque: World-frame torque, shape ``(num_envs, len(body_ids), 3)``.
+
+        Returns:
+            None. Backends that support this mutate their pending simulation state.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support body wrench perturbation"
         )
 
     def get_play_capabilities(self) -> BackendPlayCapabilities:
@@ -476,6 +530,76 @@ class SimBackend(abc.ABC):
         Returns:
             (num_envs, 3)
         """
+
+    def get_base_ang_vel_world(self) -> np.ndarray:
+        """Return base angular velocity in the world frame (GH-migration impl).
+
+        NOTE (P1-2): the sibling :meth:`get_base_ang_vel` documents world-frame
+        but the MuJoCo implementation returns the free-joint LOCAL ``qvel[3:6]``.
+        That contract/impl mismatch is intentionally left untouched here; a global
+        fix is tracked as a separate follow-up issue. GH-migration code MUST use
+        this method when world-frame base angular velocity is required.
+
+        Returns:
+            (num_envs, 3)
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement get_base_ang_vel_world"
+        )
+
+    # ------------------------------------------------------------------ #
+    # GH-migration reads (post-saturation effort + net external contact)   #
+    # ------------------------------------------------------------------ #
+
+    def get_actuator_effort(self) -> np.ndarray:
+        """Return actual post-saturation actuator effort.
+
+        This is the force the actuator actually applied after gain/bias and
+        force-range clamping (MuJoCo ``actuator_force``), NOT the commanded
+        target. Requires per-actuator ``actfrc_<actuator_name>`` sensors in the
+        model.
+
+        Returns:
+            (num_envs, num_actuators)
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement get_actuator_effort"
+        )
+
+    def get_body_net_contact_force_w(self, body_ids: np.ndarray) -> np.ndarray:
+        """Return per-body NET EXTERNAL contact force in the world frame.
+
+        The returned force acts ON each queried body: a body resting on the
+        ground reports ``+m*g`` along ``+z`` (opposing gravity). This aggregates
+        the net external contact wrench from ``contact`` (netforce) sensors — NOT
+        the parent-child internal wrench a plain force/torque sensor reports.
+        Requires ``netcontact_<body_name>`` sensors in the model.
+
+        Args:
+            body_ids: Body ids to query.
+
+        Returns:
+            (num_envs, len(body_ids), 3)
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement get_body_net_contact_force_w"
+        )
+
+    def get_body_contact_state(self, body_ids: np.ndarray) -> np.ndarray:
+        """Return per-body boolean contact state (any contact found).
+
+        Requires ``contactfound_<body_name>`` sensors in the model. Useful for
+        first-contact / air-time bookkeeping.
+
+        Args:
+            body_ids: Body ids to query.
+
+        Returns:
+            bool array (num_envs, len(body_ids))
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not implement get_body_contact_state"
+        )
 
     # ------------------------------------------------------------------ #
     # DOF state                                                            #

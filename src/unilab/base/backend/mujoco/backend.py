@@ -32,6 +32,7 @@ from unilab.dr.types import (
     ResetRandomizationPayload,
 )
 from unilab.dtype_config import get_global_dtype
+from unilab.utils.rotation import np_quat_apply
 
 from ..base import (
     BackendHeightScanner,
@@ -305,6 +306,8 @@ class MuJoCoBackend(SimBackend):
             None if position_actuator_gains is None else dict(position_actuator_gains)
         )
         self._pre_step_control_fn = None
+        self._pre_step_wrench_fn = None
+        self._post_step_callback_fn = None
         self._model = self._load_base_model()
         self._base_body_id = (
             mujoco.mj_name2id(self._model, mujoco.mjtObj.mjOBJ_BODY, base_name)
@@ -782,7 +785,11 @@ class MuJoCoBackend(SimBackend):
     # ------------------------------------------------------------------ #
 
     def step(self, ctrl: np.ndarray, nsteps: int = 1) -> dict | None:
-        if self._pre_step_control_fn is not None:
+        if (
+            self._pre_step_control_fn is not None
+            or getattr(self, "_pre_step_wrench_fn", None) is not None
+            or getattr(self, "_post_step_callback_fn", None) is not None
+        ):
             return self._step_with_pre_step_control(ctrl, nsteps)
 
         t0 = time.perf_counter()
@@ -830,14 +837,24 @@ class MuJoCoBackend(SimBackend):
         set_ctrl_ms = 0.0
         physics_ms = 0.0
         refresh_cache_ms = 0.0
-        has_pending_xfrc = bool(np.any(self._pending_xfrc_applied))
+        wrench_fn = getattr(self, "_pre_step_wrench_fn", None)
+        post_fn = getattr(self, "_post_step_callback_fn", None)
+        # Legacy path: a statically staged xfrc broadcast unchanged across substeps.
+        has_static_xfrc = wrench_fn is None and bool(np.any(self._pending_xfrc_applied))
 
         for _ in range(nsteps):
             t0 = time.perf_counter()
             native_ctrl = self._apply_pre_step_control(ctrl)
+            if wrench_fn is not None:
+                # Zero + recompute the external wrench from the current body pose.
+                self._pending_xfrc_applied.fill(0.0)
+                self._apply_pre_step_wrench()
+                use_xfrc = bool(np.any(self._pending_xfrc_applied))
+            else:
+                use_xfrc = has_static_xfrc
             control_traj = native_ctrl[:, None, :]
             control_spec = int(mujoco.mjtState.mjSTATE_CTRL)
-            if has_pending_xfrc:
+            if use_xfrc:
                 control_spec |= int(mujoco.mjtState.mjSTATE_XFRC_APPLIED)
                 xfrc_traj = self._pending_xfrc_applied[:, None, :]
                 control_traj = np.concatenate((control_traj, xfrc_traj), axis=-1)
@@ -860,7 +877,10 @@ class MuJoCoBackend(SimBackend):
             self._sensor_data[:] = sensor_np.astype(self._np_dtype)
             refresh_cache_ms += (time.perf_counter() - t0) * 1000.0
 
-        if has_pending_xfrc:
+            if post_fn is not None:
+                self._apply_post_step_callback()
+
+        if wrench_fn is not None or has_static_xfrc:
             self._pending_xfrc_applied.fill(0.0)
 
         return {
@@ -1027,6 +1047,26 @@ class MuJoCoBackend(SimBackend):
                 force_np[:, body_offset, :]
             )
 
+    def apply_body_wrench(self, body_ids, force, torque) -> None:
+        """Accumulate one external world-frame force + torque per target body.
+
+        Writes the full 6D ``xfrc_applied`` slice ``6*id : 6*id+6`` (force half
+        then torque half), staged for the next step.
+        """
+        ids = np.asarray(body_ids, dtype=np.int32).reshape(-1)
+        force_np = np.asarray(force, dtype=np.float64)
+        torque_np = np.asarray(torque, dtype=np.float64)
+        expected_shape = (self._num_envs, ids.size, 3)
+        if force_np.shape != expected_shape or torque_np.shape != expected_shape:
+            raise ValueError(
+                f"body wrench must have shape {expected_shape}, got force "
+                f"{force_np.shape}, torque {torque_np.shape}"
+            )
+        for body_offset, body_id in enumerate(ids):
+            base = 6 * int(body_id)
+            self._pending_xfrc_applied[:, base : base + 3] += force_np[:, body_offset, :]
+            self._pending_xfrc_applied[:, base + 3 : base + 6] += torque_np[:, body_offset, :]
+
     def get_play_capabilities(self) -> BackendPlayCapabilities:
         return BackendPlayCapabilities(supports_physics_state_playback=True)
 
@@ -1112,6 +1152,60 @@ class MuJoCoBackend(SimBackend):
 
     def get_base_ang_vel(self) -> np.ndarray:
         return self._base_ang_vel_view
+
+    def get_base_ang_vel_world(self) -> np.ndarray:
+        return np_quat_apply(self._base_quat_view, self._base_ang_vel_view).astype(
+            self._np_dtype, copy=False
+        )
+
+    def get_actuator_effort(self) -> np.ndarray:
+        cols = []
+        for aid in range(self._model.nu):
+            name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_ACTUATOR, aid)
+            key = f"actfrc_{name}"
+            view = self._sensor_views.get(key)
+            if view is None:
+                raise KeyError(
+                    f"missing actuator-force sensor '{key}'; author "
+                    f"<actuatorfrc name='{key}' actuator='{name}'/> in the MJCF"
+                )
+            cols.append(view)
+        if not cols:
+            return np.zeros((self._num_envs, 0), dtype=self._np_dtype)
+        return np.concatenate(cols, axis=-1)
+
+    def get_body_net_contact_force_w(self, body_ids) -> np.ndarray:
+        ids = np.asarray(body_ids, dtype=np.int32).reshape(-1)
+        cols = []
+        for bid in ids:
+            name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_BODY, int(bid))
+            key = f"netcontact_{name}"
+            view = self._sensor_views.get(key)
+            if view is None:
+                raise KeyError(
+                    f"missing net-contact sensor '{key}'; author <contact "
+                    f"name='{key}' body1='{name}' data='force' reduce='netforce'/> in the MJCF"
+                )
+            # The raw `contact` netforce sensor reports -(force on body1); negate
+            # to return the force acting ON the queried body (validated
+            # analytically: a resting body -> +m*g along +z).
+            cols.append(-view)
+        return np.stack(cols, axis=1)
+
+    def get_body_contact_state(self, body_ids) -> np.ndarray:
+        ids = np.asarray(body_ids, dtype=np.int32).reshape(-1)
+        cols = []
+        for bid in ids:
+            name = mujoco.mj_id2name(self._model, mujoco.mjtObj.mjOBJ_BODY, int(bid))
+            key = f"contactfound_{name}"
+            view = self._sensor_views.get(key)
+            if view is None:
+                raise KeyError(
+                    f"missing contact-found sensor '{key}'; author <contact "
+                    f"name='{key}' body1='{name}' data='found'/> in the MJCF"
+                )
+            cols.append(view)
+        return np.concatenate(cols, axis=-1) > 0.0
 
     # ------------------------------------------------------------------ #
     # DOF state                                                          #
