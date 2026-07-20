@@ -504,7 +504,19 @@ class GHTrackingEnv(NpEnv):
                 # set spring origins for envs that resampled a new force this step
                 self._resample_force_origin(self.force_system._need_origin_resample)
             else:
-                self.force_system.last_reset_env_ids = None  # clear pending reset (no compliant update)
+                # non-compliant variants (no_force + extreme): perturb-target update
+                # (GH before_update:1041-1043). max_force=0 -> zero perturbation; the force
+                # target tracks the reference keypoints directly (no admittance).
+                root_pos_w = self._backend.get_base_pos()
+                root_quat_w = self._backend.get_base_quat()
+                ref_kp_force_w = self._motion_slice.body_pos_w[:, 0][:, self._motion_force_idx, :].astype(
+                    np.float64
+                )
+                self.force_system.perturb_force.update_time(1)
+                self.force_system.force_update_perturb_and_target(
+                    root_pos_w=root_pos_w, root_quat_w=root_quat_w, ref_keypoints_w=ref_kp_force_w
+                )
+                self.force_system.last_reset_env_ids = None  # consumed by the update above
 
     def _motion_finished(self) -> np.ndarray:
         if self.motion is None:

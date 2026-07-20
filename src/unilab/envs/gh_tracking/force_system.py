@@ -178,6 +178,8 @@ class ForceSystem:
         self.force_safe_limit_tl = TemporalLerp(
             (self.N, 1), default=FORCE_SAFE_DEFAULT, easing="linear", clamp=FORCE_SAFE_BOUNDS
         )
+        # non-compliant random perturbation force on the last 2 force bodies (GH :662)
+        self.perturb_force = TemporalLerp((self.N, 2, 3), easing="linear")
 
         self.admit = AdmittanceMassChain(
             num_envs=self.N, num_points=self.M, dt=self.physics_dt, mixed_loop_steps=1,
@@ -219,6 +221,7 @@ class ForceSystem:
         self.force_origin_tl.reset(env_ids)
         self.force_kp_tl.reset(env_ids)
         self.force_kp_ramping_down[env_ids] = False
+        self.perturb_force.reset(env_ids, value=0.0)  # GH force_reset :697
         if refresh_time:
             self.force_sample_timer[env_ids] = self._rng.integers(10, 60, size=len(env_ids))
             self.force_safe_limit_tl.reset(env_ids)
@@ -464,8 +467,61 @@ class ForceSystem:
         return fn
 
     def force_apply_perturb(self, substep, *, quat_w, root_quat_w):
-        """Extreme non-compliant random perturbation force — deferred to Task B."""
-        raise NotImplementedError("G1_extreme_force perturb path is Task B")
+        """Extreme non-compliant random perturbation force on the last 2 force bodies
+        (GH ``force_apply_perturb`` :1016-1031). No admittance; the perturbation is a
+        TemporalLerp value (constant within a control step). Returns (force_w, torque_w)
+        each (N, M, 3); only the last 2 bodies carry force."""
+        from unilab.utils.rotation import np_quat_apply_batched, np_quat_conjugate_batched
+
+        self.force_applied_w[:, -2:] = self.perturb_force.current  # (N,2,3); first M-2 stay 0
+        n = root_quat_w.shape[0]
+        q = np.broadcast_to(root_quat_w[:, None, :], (n, self.M, 4))
+        self.force_applied_b = np_quat_apply_batched(np_quat_conjugate_batched(q), self.force_applied_w)
+        # eccentric torque = cross(quat_apply(quat_w, force_pos_delta), force_applied_w).
+        # force_pos_delta is not resampled on the perturb path (GH), so it holds its reset value.
+        torque_w = compute_eccentric_torque(quat_w, self.force_pos_delta, self.force_applied_w)
+        return self.force_applied_w, torque_w
+
+    def force_update_perturb_and_target(
+        self, *, root_pos_w: np.ndarray, root_quat_w: np.ndarray, ref_keypoints_w: np.ndarray
+    ) -> None:
+        """Advance the non-compliant force curriculum + target (GH
+        ``force_update_perturb_and_target`` :925-956). Runs once per control step in
+        before_update for the non-compliant variants (no_force + extreme).
+
+        Resample (trapezoid timing): timer<=0 -> transit U(20,50) + hold U(20,100), a new
+        ``rand_points_isotropic(K, 2, max_force*force_alpha)`` perturbation with per-body
+        ``rand<0.5`` enable, transitioned over ``transit`` steps. The force TARGET tracks
+        the reference keypoints DIRECTLY (no admittance); ``force_keypoint_vel`` is the
+        adjacent-control-step difference. ``ref_keypoints_w`` are the M force-body reference
+        keypoints (world), (N, M, 3)."""
+        from unilab.utils.rotation import np_quat_apply_batched, np_quat_conjugate_batched
+
+        self.force_sample_timer -= 1
+        need = np.nonzero(self.force_sample_timer <= 0)[0]
+        if need.size > 0:
+            transit = self._rng.integers(20, 50, size=need.size)
+            hold = self._rng.integers(20, 100, size=need.size)
+            self.force_sample_timer[need] = (transit + hold).astype(np.int32)
+            force = rand_points_isotropic(
+                need.size, 2, self.max_force * self.force_alpha, self._rng
+            )  # (K, 2, 3)
+            enable = (self._rng.random((need.size, 2)) < 0.5)[:, :, None]
+            self.perturb_force.set(need, end=force * enable, total_steps=transit)
+
+        # force target: track the reference keypoints directly (no admittance).
+        self.force_keypoint_w[:] = np.asarray(ref_keypoints_w, dtype=np.float64)
+        n = root_pos_w.shape[0]
+        q = np.broadcast_to(root_quat_w[:, None, :], (n, self.M, 4))
+        self.force_keypoint_b[:] = np_quat_apply_batched(
+            np_quat_conjugate_batched(q), self.force_keypoint_w - root_pos_w[:, None, :]
+        )
+        if self.last_reset_env_ids is not None:
+            self.force_keypoint_w_prev[self.last_reset_env_ids] = self.force_keypoint_w[
+                self.last_reset_env_ids
+            ]
+        self.force_keypoint_vel_w[:] = (self.force_keypoint_w - self.force_keypoint_w_prev) / self.step_dt
+        self.force_keypoint_w_prev[:] = self.force_keypoint_w
 
 
 

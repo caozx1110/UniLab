@@ -1,0 +1,20 @@
+# @package _global_
+# G1_extreme_force variant (GH cfg/task/G1/G1_extreme_force.yaml: name G1EXTREMEFORCE).
+# Inherits the gentle owner config, overrides the force path: max_force=30 + compliance=False
+# -> non-compliant random perturbation force on the last 2 force bodies (no admittance), with
+# the force target tracking the reference keypoints directly (GH motion_tracking.py force_apply_
+# perturb / force_update_perturb_and_target). GH's extreme reward curriculum also disables the
+# two force-magnitude impedance terms (recorded below).
+defaults:
+  - gh_tracking/mujoco
+  - _self_
+
+env:
+  force:
+    max_force: 30.0
+    compliance: false
+
+reward:
+  impedance:
+    force_reward: {enabled: false}        # GH G1_extreme_force.yaml
+    force_exd_penalty: {enabled: false}
