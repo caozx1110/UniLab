@@ -125,6 +125,7 @@ class ForceSystem:
         net_force_limit: float = 30.0,
         net_torque_limit: float = 20.0,
         force_alpha: float = 1.0,
+        compliance: bool = True,
         seed: int = 0,
     ) -> None:
         from unilab.envs.gh_tracking.admittance import AdmittanceMassChain
@@ -138,6 +139,7 @@ class ForceSystem:
         self.net_force_limit = float(net_force_limit)
         self.net_torque_limit = float(net_torque_limit)
         self.force_alpha = float(force_alpha)
+        self.compliance = bool(compliance)  # GH force variant selector (motion_tracking.py:1045)
         self._rng = np.random.default_rng(seed)
 
         self.left_mask = _LEFT_MASK[None, :, None].copy()  # (1, M, 1)
@@ -438,7 +440,19 @@ class ForceSystem:
             root_quat = backend.get_base_quat()  # (N,4)
             torso_pos = backend.get_body_pos_w(np.array([torso_id]))[:, 0, :]  # (N,3)
 
-            f6, tau6 = self.force_apply(substep, pos_w=pos6, quat_w=quat6, root_quat_w=root_quat)
+            # GH step branch (motion_tracking.py:1045-1051): compliance -> force_apply;
+            # non-compliant + max_force>0 -> force_apply_perturb; else (no_force) -> no wrench.
+            if self.compliance:
+                f6, tau6 = self.force_apply(substep, pos_w=pos6, quat_w=quat6, root_quat_w=root_quat)
+            elif self.max_force > 0.0:
+                f6, tau6 = self.force_apply_perturb(substep, quat_w=quat6, root_quat_w=root_quat)
+            else:  # no_force: buffers stay zero, no external wrench
+                if substep == 0:
+                    self.force_applied_w[:] = 0.0
+                    self.force_applied_b[:] = 0.0
+                f6 = np.zeros((self.N, self.M, 3), dtype=np.float64)
+                tau6 = np.zeros((self.N, self.M, 3), dtype=np.float64)
+
             d_f, d_m = limit_net_wrench_about_torso(
                 pos6, f6, tau6, torso_pos, self.net_force_limit, self.net_torque_limit
             )
@@ -448,6 +462,10 @@ class ForceSystem:
             self._force_substep = substep + 1
 
         return fn
+
+    def force_apply_perturb(self, substep, *, quat_w, root_quat_w):
+        """Extreme non-compliant random perturbation force — deferred to Task B."""
+        raise NotImplementedError("G1_extreme_force perturb path is Task B")
 
 
 

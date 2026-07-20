@@ -99,13 +99,18 @@ class GHRewardCfg:
 
 @dataclass
 class GHForceCfg:
-    """Compliant external-force system (Phase 5 ForceSystem). Blueprint §五."""
+    """Compliant external-force system (Phase 5 ForceSystem). Blueprint §五.
+
+    ``compliance`` selects the GH force variant (motion_tracking.py:1045-1051):
+    True = gentle admittance force (default); False+max_force>0 = extreme random
+    perturbation; False+max_force<=0 = no_force (pure action tracking)."""
 
     num_force_bodies: int = 6
     max_force: float = 30.0
     net_force_limit: float = 30.0
     net_torque_limit: float = 20.0
     force_alpha: float = 1.0
+    compliance: bool = True
     seed: int = 0
 
 

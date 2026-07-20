@@ -213,6 +213,7 @@ class GHTrackingEnv(NpEnv):
             net_force_limit=cfg.force.net_force_limit,
             net_torque_limit=cfg.force.net_torque_limit,
             force_alpha=cfg.force.force_alpha,
+            compliance=cfg.force.compliance,
             seed=cfg.force.seed,
         )
 
@@ -486,18 +487,24 @@ class GHTrackingEnv(NpEnv):
             feet_bp = self._motion_slice.body_pos_w[:, :, self._motion_feet_idx, :].astype(np.float64)
             feet_vel = (feet_bp[:, 1] - feet_bp[:, 0]) / dt01  # (N, 2, 3)
             self._feet_standing = np.linalg.norm(feet_vel[:, :, :2], axis=-1) < 0.1
-            root_pos_w = self._backend.get_base_pos()
-            root_quat_w = self._backend.get_base_quat()
-            ref_kp_force_w = self._motion_slice.body_pos_w[:, 0][:, self._motion_force_idx, :].astype(
-                np.float64
-            )
-            self.force_system.force_update_origin_and_target(
-                root_pos_w=root_pos_w, root_quat_w=root_quat_w, ref_keypoints_w=ref_kp_force_w
-            )
-            self.force_system.last_reset_env_ids = None  # consumed by the update above
-            self.force_system.force_schedule(self._rng)
-            # set spring origins for envs that resampled a new force this step
-            self._resample_force_origin(self.force_system._need_origin_resample)
+            # compliant admittance force machinery (GH before_update:1032-1044, gentle branch).
+            # Non-compliant variants (no_force / extreme) skip it; the extreme perturb-target
+            # update lands in Task B.
+            if self.force_system.compliance:
+                root_pos_w = self._backend.get_base_pos()
+                root_quat_w = self._backend.get_base_quat()
+                ref_kp_force_w = self._motion_slice.body_pos_w[:, 0][:, self._motion_force_idx, :].astype(
+                    np.float64
+                )
+                self.force_system.force_update_origin_and_target(
+                    root_pos_w=root_pos_w, root_quat_w=root_quat_w, ref_keypoints_w=ref_kp_force_w
+                )
+                self.force_system.last_reset_env_ids = None  # consumed by the update above
+                self.force_system.force_schedule(self._rng)
+                # set spring origins for envs that resampled a new force this step
+                self._resample_force_origin(self.force_system._need_origin_resample)
+            else:
+                self.force_system.last_reset_env_ids = None  # clear pending reset (no compliant update)
 
     def _motion_finished(self) -> np.ndarray:
         if self.motion is None:

@@ -1,0 +1,20 @@
+# @package _global_
+# G1_no_force variant (GH cfg/task/G1/G1_no_force.yaml: name G1NOFORCE).
+# Inherits the gentle owner config, overrides only the force path: max_force=0 +
+# compliance=False -> the force system applies no external wrench (pure action tracking,
+# GH motion_tracking.py:1045-1051). GH's no_force reward curriculum also disables the two
+# force-magnitude impedance terms (recorded below); the remaining impedance/tracking/loco
+# terms are unchanged.
+defaults:
+  - gh_tracking/mujoco
+  - _self_
+
+env:
+  force:
+    max_force: 0.0
+    compliance: false
+
+reward:
+  impedance:
+    force_reward: {enabled: false}        # GH G1_no_force.yaml
+    force_exd_penalty: {enabled: false}
