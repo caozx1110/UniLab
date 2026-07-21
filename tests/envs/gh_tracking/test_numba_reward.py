@@ -57,6 +57,10 @@ def _rollout_reward(tmp_path, numba: bool, n: int = 8, steps: int = 3):
 @pytest.mark.skipif(not is_available(), reason="numba not installed")
 def test_reward_uses_kernel(tmp_path):
     env, _ = _make_env(tmp_path, numba=True, n=4)
+    # _reward_from_kernel is only flipped True inside _compute_reward_vec, so a
+    # step must actually run before we can assert the kernel executed.
+    n = 4
+    env.step(np.zeros((n, env._backend.num_actuators), dtype=np.float32))
     assert env._numba_accelerator._reward_from_kernel is True
     env.close()
 

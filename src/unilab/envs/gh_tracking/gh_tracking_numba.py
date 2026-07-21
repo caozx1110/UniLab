@@ -336,9 +336,11 @@ if _NUMBA:
 class GHTrackingNumbaAccelerator:
     def __init__(self, num_threads: int | None) -> None:
         self.num_threads = num_threads
-        # Task 2: the reward path is the fused kernel (wiring/capability flag,
-        # asserted by test_reward_uses_kernel right after construction).
-        self._reward_from_kernel = _NUMBA
+        # Task 2: proof-of-execution flag, not a capability flag. Only set to
+        # True inside _compute_reward_vec, right where the kernel is actually
+        # invoked, so it proves the kernel ran rather than just that numba is
+        # importable.
+        self._reward_from_kernel = False
         # float32 sigma constants (built once; reused every step)
         self._sig = {k: np.asarray(v, dtype=np.float32) for k, v in _SIGMA.items()}
         self._kp_force_map: np.ndarray | None = None
@@ -407,6 +409,7 @@ class GHTrackingNumbaAccelerator:
             np.float32(_FORCE_PENALTY_OFFSET), np.float32(env._cfg.ctrl_dt),
             reward_vec,
         )
+        self._reward_from_kernel = True
         return reward_vec
 
     def compute_update_state(self, env) -> GHNumbaResult:
