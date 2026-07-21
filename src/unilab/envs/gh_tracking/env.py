@@ -571,9 +571,12 @@ class GHTrackingEnv(NpEnv):
         return self.student_cache.step(
             root_pos_w, root_quat_w, m_pos0, m_quat0, ref_pos_t_plus, ref_quat_t_plus)
 
-    def _compute_reward(self) -> np.ndarray:
-        """Compute the 3-group reward vector and (as producer) the instantaneous
-        _cum_error (root-pos/rot/keypoint normalized errors, teacher/student target)."""
+    def _build_reward_context(self) -> None:
+        """Produce the instantaneous _cum_error (root-pos/rot/keypoint normalized
+        errors, teacher/student target) and populate the reward-term input context
+        ``self._rc``. Shared producer for both the numpy reward path and the numba
+        reward kernel — running it once keeps the stateful side-effects (feet
+        air-time, _prev_track_joint_pos, _cum_error) single-shot."""
         bk = self._backend
         n = self._num_envs
         env_origins = np.zeros((n, 3), dtype=np.float64)  # MuJoCo: each env at world origin
@@ -667,7 +670,12 @@ class GHTrackingEnv(NpEnv):
             force_in_kp_idx=self._force_in_kp_idx,
         )
         self._prev_track_joint_pos = track_actual.copy()
-        return self._reward_manager.compute(rc)  # (N, 3)
+
+    def _compute_reward(self) -> np.ndarray:
+        """Compute the 3-group reward vector (numpy path). Builds the reward
+        context (also producing _cum_error) then aggregates via RewardManager."""
+        self._build_reward_context()
+        return self._reward_manager.compute(self._rc)  # (N, 3)
 
     def _build_obs_state(self) -> ObsState:
         """Assemble the 26-field ObsState from backend + motion + force + action."""
