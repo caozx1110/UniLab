@@ -332,6 +332,317 @@ if _NUMBA:
             reward_vec[i, 1] = trk * step_dt
             reward_vec[i, 2] = loco * step_dt
 
+    # ---------------------------------------------------------------------- #
+    # Task 3: observation device fns + fused prange obs kernel.               #
+    # The stateful telemetry roll + rng noise stays in numpy                  #
+    # (obs_manager.update, called once before the kernel); the buffers        #
+    # arrive already-rolled/noised and the kernel does only per-env-          #
+    # independent assembly: quat-inverse-apply, keypoint diffs, axis-angle,   #
+    # gather-and-flatten. Slice layout replicates ObservationManager.compute  #
+    # exactly (policy 450 / priv 717 / priv_critic 3).                        #
+    # ---------------------------------------------------------------------- #
+    @_dev
+    def _qapply(w, x, y, z, vx, vy, vz):
+        # Rotate vector v by quaternion (w,x,y,z); ports np_quat_apply_batched.
+        tx = 2.0 * (y * vz - z * vy)
+        ty = 2.0 * (z * vx - x * vz)
+        tz = 2.0 * (x * vy - y * vx)
+        rx = vx + w * tx + y * tz - z * ty
+        ry = vy + w * ty + z * tx - x * tz
+        rz = vz + w * tz + x * ty - y * tx
+        return rx, ry, rz
+
+    @_dev
+    def _qinv_apply(w, x, y, z, vx, vy, vz):
+        # Rotate v by conj(quat); ports _qinv_apply (apply conjugate).
+        return _qapply(w, -x, -y, -z, vx, vy, vz)
+
+    @_dev
+    def _yaw_cw_sz(qw, qx, qy, qz):
+        # yaw-only quaternion (w,0,0,z) components; ports np_yaw_quat.
+        yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        half = 0.5 * yaw
+        return math.cos(half), math.sin(half)
+
+    @_dev
+    def _axis_angle(w, x, y, z):
+        # Axis-angle vector of a (possibly non-unit) quaternion; ports
+        # np_quat_to_axis_angle EXACTLY (canonicalize w>=0, atan2, Taylor near 0).
+        if w < 0.0:
+            w = -w
+            x = -x
+            y = -y
+            z = -z
+        norms = math.sqrt(x * x + y * y + z * z)
+        half = math.atan2(norms, w)
+        angle = 2.0 * half
+        if abs(angle) < 1e-6:
+            shao = 0.5 - angle * angle / 48.0
+        else:
+            shao = math.sin(half) / angle
+        return x / shao, y / shao, z / shao
+
+    @njit(parallel=True, fastmath=True, cache=True, nogil=True)
+    def _obs_kernel(
+        # --- policy inputs ---
+        boot_indicator, boot_max,
+        motion_root_pos_w, motion_root_quat_w, force_safe_limit, motion_joint_pos,
+        pol_angvel_buf, pol_grav_buf, pol_joint_buf, pol_joint_steps,
+        offset, action_buf,
+        # --- priv inputs ---
+        root_pos_w, root_quat_w, env_origins, motion_root_lin_vel_w,
+        force_keypoint_b, force_applied_b, force_expected_b, force_sample_timer,
+        body_pos_w_height, contact_hist, contact_denom, root_ema_linvel,
+        priv_angvel_buf, priv_grav_buf, priv_joint_buf, priv_steps,
+        body_pos_w_kp, body_lin_vel_w_kp, motion_body_pos_w_kp,
+        joint_pos_target, applied_torque,
+        # --- priv_critic input ---
+        cum_error,
+        # --- outputs ---
+        policy, priv, priv_critic,
+    ):
+        n = policy.shape[0]
+        S = motion_root_pos_w.shape[1]
+        NJ = motion_joint_pos.shape[2]
+        n_pol_steps = pol_joint_steps.shape[0]
+        n_act = action_buf.shape[1]
+        na = action_buf.shape[2]
+        nf = force_keypoint_b.shape[1]
+        nh = body_pos_w_height.shape[1]
+        hlen = contact_hist.shape[1]
+        nfe = contact_hist.shape[2]
+        nps = priv_steps.shape[0]
+        nkp = body_pos_w_kp.shape[1]
+        for i in prange(n):
+            # ===================== POLICY (450) ===================== #
+            # [0:1] boot_indicator_state_obs
+            policy[i, 0] = boot_indicator[i, 0] / boot_max
+            # [1:23] command_obs (heights 5, pos_diff_b xy 8, heading_b xy 8, limit 1)
+            cw0, sz0 = _yaw_cw_sz(
+                motion_root_quat_w[i, 0, 0], motion_root_quat_w[i, 0, 1],
+                motion_root_quat_w[i, 0, 2], motion_root_quat_w[i, 0, 3],
+            )
+            for s in range(S):
+                policy[i, 1 + s] = motion_root_pos_w[i, s, 2]
+            c_pos = 1 + S
+            for s in range(1, S):
+                dx = motion_root_pos_w[i, s, 0] - motion_root_pos_w[i, 0, 0]
+                dy = motion_root_pos_w[i, s, 1] - motion_root_pos_w[i, 0, 1]
+                dz = motion_root_pos_w[i, s, 2] - motion_root_pos_w[i, 0, 2]
+                px, py, pz = _qinv_apply(cw0, 0.0, 0.0, sz0, dx, dy, dz)
+                policy[i, c_pos + (s - 1) * 2 + 0] = px
+                policy[i, c_pos + (s - 1) * 2 + 1] = py
+            c_head = c_pos + (S - 1) * 2
+            for s in range(1, S):
+                cwf, szf = _yaw_cw_sz(
+                    motion_root_quat_w[i, s, 0], motion_root_quat_w[i, s, 1],
+                    motion_root_quat_w[i, s, 2], motion_root_quat_w[i, s, 3],
+                )
+                hx, hy, hz = _qapply(cwf, 0.0, 0.0, szf, 1.0, 0.0, 0.0)
+                bx, by, bz = _qinv_apply(cw0, 0.0, 0.0, sz0, hx, hy, hz)
+                policy[i, c_head + (s - 1) * 2 + 0] = bx
+                policy[i, c_head + (s - 1) * 2 + 1] = by
+            c_lim = c_head + (S - 1) * 2
+            policy[i, c_lim] = force_safe_limit[i, 0]
+            b = c_lim + 1  # = 23
+            # [23:168] target_joint_pos_obs
+            for s in range(S):
+                for j in range(NJ):
+                    policy[i, b + s * NJ + j] = motion_joint_pos[i, s, j]
+            b += S * NJ
+            # [168:183] target_projected_gravity_b
+            for s in range(S):
+                gx, gy, gz = _qinv_apply(
+                    motion_root_quat_w[i, s, 0], motion_root_quat_w[i, s, 1],
+                    motion_root_quat_w[i, s, 2], motion_root_quat_w[i, s, 3],
+                    0.0, 0.0, -1.0,
+                )
+                policy[i, b + s * 3 + 0] = gx
+                policy[i, b + s * 3 + 1] = gy
+                policy[i, b + s * 3 + 2] = gz
+            b += S * 3
+            # [183:186] pol_angvel (history step 0)
+            policy[i, b + 0] = pol_angvel_buf[i, 0, 0]
+            policy[i, b + 1] = pol_angvel_buf[i, 0, 1]
+            policy[i, b + 2] = pol_angvel_buf[i, 0, 2]
+            b += 3
+            # [186:189] pol_grav (history step 0)
+            policy[i, b + 0] = pol_grav_buf[i, 0, 0]
+            policy[i, b + 1] = pol_grav_buf[i, 0, 1]
+            policy[i, b + 2] = pol_grav_buf[i, 0, 2]
+            b += 3
+            # [189:363] pol_joint (buffer - actuator offset, gathered history steps)
+            for hi in range(n_pol_steps):
+                h = pol_joint_steps[hi]
+                for j in range(NJ):
+                    policy[i, b + hi * NJ + j] = pol_joint_buf[i, h, j] - offset[i, j]
+            b += n_pol_steps * NJ
+            # [363:450] prev_actions_obs
+            for t in range(n_act):
+                for j in range(na):
+                    policy[i, b + t * na + j] = action_buf[i, t, j]
+
+            # ===================== PRIV (717) ====================== #
+            qw = root_quat_w[i, 0]
+            qx = root_quat_w[i, 1]
+            qy = root_quat_w[i, 2]
+            qz = root_quat_w[i, 3]
+            rpx = root_pos_w[i, 0]
+            rpy = root_pos_w[i, 1]
+            rpz = root_pos_w[i, 2]
+            ox = env_origins[i, 0]
+            oy = env_origins[i, 1]
+            oz = env_origins[i, 2]
+            # [0:15] target_pos_b_obs
+            cpx = rpx - ox
+            cpy = rpy - oy
+            cpz = rpz - oz
+            for s in range(S):
+                vx = motion_root_pos_w[i, s, 0] - cpx
+                vy = motion_root_pos_w[i, s, 1] - cpy
+                vz = motion_root_pos_w[i, s, 2] - cpz
+                tx, ty, tz = _qinv_apply(qw, qx, qy, qz, vx, vy, vz)
+                priv[i, s * 3 + 0] = tx
+                priv[i, s * 3 + 1] = ty
+                priv[i, s * 3 + 2] = tz
+            pb = S * 3
+            # [15:30] target_linvel_b_obs
+            for s in range(S):
+                tx, ty, tz = _qinv_apply(
+                    qw, qx, qy, qz,
+                    motion_root_lin_vel_w[i, s, 0], motion_root_lin_vel_w[i, s, 1],
+                    motion_root_lin_vel_w[i, s, 2],
+                )
+                priv[i, pb + s * 3 + 0] = tx
+                priv[i, pb + s * 3 + 1] = ty
+                priv[i, pb + s * 3 + 2] = tz
+            pb += S * 3
+            # [30:45] relative_quat_obs (axis-angle of mquat * conj(root_quat))
+            for s in range(S):
+                mw = motion_root_quat_w[i, s, 0]
+                mx = motion_root_quat_w[i, s, 1]
+                my = motion_root_quat_w[i, s, 2]
+                mz = motion_root_quat_w[i, s, 3]
+                c_w = qw
+                c_x = -qx
+                c_y = -qy
+                c_z = -qz
+                rw = mw * c_w - mx * c_x - my * c_y - mz * c_z
+                rx = mw * c_x + mx * c_w + my * c_z - mz * c_y
+                ry = mw * c_y - mx * c_z + my * c_w + mz * c_x
+                rz = mw * c_z + mx * c_y - my * c_x + mz * c_w
+                ax, ay, az = _axis_angle(rw, rx, ry, rz)
+                priv[i, pb + s * 3 + 0] = ax
+                priv[i, pb + s * 3 + 1] = ay
+                priv[i, pb + s * 3 + 2] = az
+            pb += S * 3
+            # [45:100] force_priv_obs (keypoint 18, applied 18, expected 18, timer 1)
+            for k in range(nf):
+                for d in range(3):
+                    priv[i, pb + k * 3 + d] = force_keypoint_b[i, k, d]
+            pb += nf * 3
+            for k in range(nf):
+                for d in range(3):
+                    priv[i, pb + k * 3 + d] = force_applied_b[i, k, d]
+            pb += nf * 3
+            for k in range(nf):
+                for d in range(3):
+                    priv[i, pb + k * 3 + d] = force_expected_b[i, k, d]
+            pb += nf * 3
+            priv[i, pb] = force_sample_timer[i, 0]
+            pb += 1
+            # [100:104] body_height (z of selected bodies)
+            for k in range(nh):
+                priv[i, pb + k] = body_pos_w_height[i, k, 2]
+            pb += nh
+            # [104:110] contact force history mean / denom, clipped [-10, 10]
+            for bd in range(nfe):
+                for d in range(3):
+                    acc = 0.0
+                    for t in range(hlen):
+                        acc += contact_hist[i, t, bd, d]
+                    v = (acc / hlen) / contact_denom
+                    if v > 10.0:
+                        v = 10.0
+                    elif v < -10.0:
+                        v = -10.0
+                    priv[i, pb + bd * 3 + d] = v
+            pb += nfe * 3
+            # [110:113] root_ema (world EMA rotated into root frame)
+            tx, ty, tz = _qinv_apply(
+                qw, qx, qy, qz,
+                root_ema_linvel[i, 0], root_ema_linvel[i, 1], root_ema_linvel[i, 2],
+            )
+            priv[i, pb + 0] = tx
+            priv[i, pb + 1] = ty
+            priv[i, pb + 2] = tz
+            pb += 3
+            # [113:140] priv_angvel (gathered history steps)
+            for hi in range(nps):
+                h = priv_steps[hi]
+                for d in range(3):
+                    priv[i, pb + hi * 3 + d] = priv_angvel_buf[i, h, d]
+            pb += nps * 3
+            # [140:167] priv_grav
+            for hi in range(nps):
+                h = priv_steps[hi]
+                for d in range(3):
+                    priv[i, pb + hi * 3 + d] = priv_grav_buf[i, h, d]
+            pb += nps * 3
+            # [167:428] priv_joint (buffer - actuator offset)
+            for hi in range(nps):
+                h = priv_steps[hi]
+                for j in range(NJ):
+                    priv[i, pb + hi * NJ + j] = priv_joint_buf[i, h, j] - offset[i, j]
+            pb += nps * NJ
+            # [428:461] current_keypoint_b
+            for k in range(nkp):
+                vx = body_pos_w_kp[i, k, 0] - rpx
+                vy = body_pos_w_kp[i, k, 1] - rpy
+                vz = body_pos_w_kp[i, k, 2] - rpz
+                tx, ty, tz = _qinv_apply(qw, qx, qy, qz, vx, vy, vz)
+                priv[i, pb + k * 3 + 0] = tx
+                priv[i, pb + k * 3 + 1] = ty
+                priv[i, pb + k * 3 + 2] = tz
+            pb += nkp * 3
+            # [461:494] current_keypoint_vel_b
+            for k in range(nkp):
+                tx, ty, tz = _qinv_apply(
+                    qw, qx, qy, qz,
+                    body_lin_vel_w_kp[i, k, 0], body_lin_vel_w_kp[i, k, 1],
+                    body_lin_vel_w_kp[i, k, 2],
+                )
+                priv[i, pb + k * 3 + 0] = tx
+                priv[i, pb + k * 3 + 1] = ty
+                priv[i, pb + k * 3 + 2] = tz
+            pb += nkp * 3
+            # [494:659] target_keypoints_diff_b_obs
+            for s in range(S):
+                for k in range(nkp):
+                    aw_x = body_pos_w_kp[i, k, 0] - ox
+                    aw_y = body_pos_w_kp[i, k, 1] - oy
+                    aw_z = body_pos_w_kp[i, k, 2] - oz
+                    vx = motion_body_pos_w_kp[i, s, k, 0] - aw_x
+                    vy = motion_body_pos_w_kp[i, s, k, 1] - aw_y
+                    vz = motion_body_pos_w_kp[i, s, k, 2] - aw_z
+                    tx, ty, tz = _qinv_apply(qw, qx, qy, qz, vx, vy, vz)
+                    priv[i, pb + s * nkp * 3 + k * 3 + 0] = tx
+                    priv[i, pb + s * nkp * 3 + k * 3 + 1] = ty
+                    priv[i, pb + s * nkp * 3 + k * 3 + 2] = tz
+            pb += S * nkp * 3
+            # [659:688] applied_action_obs
+            for j in range(NJ):
+                priv[i, pb + j] = joint_pos_target[i, j]
+            pb += NJ
+            # [688:717] applied_torque (priv noise = 0)
+            for j in range(NJ):
+                priv[i, pb + j] = applied_torque[i, j]
+
+            # ================== PRIV_CRITIC (3) ==================== #
+            priv_critic[i, 0] = cum_error[i, 0]
+            priv_critic[i, 1] = cum_error[i, 1]
+            priv_critic[i, 2] = cum_error[i, 2]
+
 
 class GHTrackingNumbaAccelerator:
     def __init__(self, num_threads: int | None) -> None:
@@ -341,9 +652,15 @@ class GHTrackingNumbaAccelerator:
         # invoked, so it proves the kernel ran rather than just that numba is
         # importable.
         self._reward_from_kernel = False
+        # Task 3: obs proof-of-execution flag (mirror _reward_from_kernel); only
+        # set True inside _compute_obs_dict where the obs kernel actually runs.
+        self._obs_from_kernel = False
         # float32 sigma constants (built once; reused every step)
         self._sig = {k: np.asarray(v, dtype=np.float32) for k, v in _SIGMA.items()}
         self._kp_force_map: np.ndarray | None = None
+        # obs history-step index arrays (built once from obs_manager config)
+        self._pol_joint_steps: np.ndarray | None = None
+        self._priv_steps: np.ndarray | None = None
 
     @classmethod
     def from_env(cls, env, num_threads: int | None) -> "GHTrackingNumbaAccelerator":
@@ -412,12 +729,62 @@ class GHTrackingNumbaAccelerator:
         self._reward_from_kernel = True
         return reward_vec
 
+    def _compute_obs_dict(self, env) -> dict[str, np.ndarray]:
+        """Build float32 inputs and run the fused prange obs kernel.
+
+        The stateful telemetry roll + rng noise (obs_manager.update) runs in
+        numpy exactly once here — same call-site as the numpy _compute_obs path —
+        so the injected noise stream matches. The kernel only does per-env
+        stateless assembly from the already-rolled buffers + ObsState fields.
+        """
+        state = env._build_obs_state()
+        env.obs_manager.update(state)  # numpy roll + rng noise, unchanged, once
+        om = env.obs_manager
+        f32 = self._f32
+
+        if self._pol_joint_steps is None:
+            self._pol_joint_steps = np.asarray(om.pol_joint.history_steps, dtype=np.int64)
+        if self._priv_steps is None:
+            # priv_angvel / priv_grav / priv_joint share history_steps == range(9)
+            self._priv_steps = np.asarray(om.priv_joint.history_steps, dtype=np.int64)
+
+        n = int(state.root_pos_w.shape[0])
+        policy = np.empty((n, 450), dtype=np.float32)
+        priv = np.empty((n, 717), dtype=np.float32)
+        priv_critic = np.empty((n, 3), dtype=np.float32)
+
+        _obs_kernel(
+            f32(state.boot_indicator), np.float32(om.boot_max),
+            f32(state.motion_root_pos_w), f32(state.motion_root_quat_w),
+            f32(state.force_safe_limit), f32(state.motion_joint_pos),
+            f32(om.pol_angvel.buffer), f32(om.pol_grav.buffer),
+            f32(om.pol_joint.buffer), self._pol_joint_steps,
+            f32(om.pol_joint.offset), f32(state.action_buf),
+            f32(state.root_pos_w), f32(state.root_quat_w), f32(state.env_origins),
+            f32(state.motion_root_lin_vel_w),
+            f32(state.force_keypoint_b), f32(state.force_applied_b),
+            f32(state.force_expected_b), f32(state.force_sample_timer),
+            f32(state.body_pos_w_height),
+            f32(om.contact.history), np.float32(om.contact.denom),
+            f32(om.root_ema.linvel_w),
+            f32(om.priv_angvel.buffer), f32(om.priv_grav.buffer),
+            f32(om.priv_joint.buffer), self._priv_steps,
+            f32(state.body_pos_w_kp), f32(state.body_lin_vel_w_kp),
+            f32(state.motion_body_pos_w_kp),
+            f32(state.joint_pos_target), f32(state.applied_torque),
+            f32(state.cum_error),
+            policy, priv, priv_critic,
+        )
+        self._obs_from_kernel = True
+        return {"policy": policy, "priv": priv, "priv_critic": priv_critic}
+
     def compute_update_state(self, env) -> GHNumbaResult:
-        # Task 2: reward via fused kernel; obs/termination still delegate to numpy.
+        # Task 2: reward via fused kernel. Task 3: obs via fused kernel.
+        # Termination still delegates to numpy.
         if self.num_threads is not None and _NUMBA:
             set_num_threads(self.num_threads)
         reward_vec = self._compute_reward_vec(env)   # (N,3) fp32; writes _cum_error via numpy
-        obs = env._compute_obs()                      # dict of 3 groups
+        obs = self._compute_obs_dict(env)             # dict of 3 groups (fused kernel)
         from unilab.envs.gh_tracking.terminations import apply_terminate_gate
         terminated = apply_terminate_gate(
             env.termination.terminated(), env._episode_length)[:, 0]
