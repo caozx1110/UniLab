@@ -676,6 +676,21 @@ class GHTrackingNumbaAccelerator:
                 raise RuntimeError(
                     f"reward sigma drift for '{name}': env={vals} kernel={_SIGMA[name]}"
                 )
+        # the reward kernel bakes step_dt but not current_factor; it assumes
+        # current_factor==1.0 (true today, never mutated) -- guard against a
+        # future reward curriculum silently breaking numpy/numba parity.
+        assert env._reward_manager.current_factor == 1.0, (
+            "numba reward kernel assumes current_factor==1.0"
+        )
+        # the obs kernel's _priv_steps reuses one history_steps array for all
+        # three priv_* buffers (and reads pol_angvel/pol_grav at slot 0) --
+        # guard against them ever being configured with different histories.
+        om = env.obs_manager
+        assert (
+            om.priv_angvel.history_steps
+            == om.priv_grav.history_steps
+            == om.priv_joint.history_steps
+        ), "numba obs kernel assumes priv_* share history_steps"
         return cls(num_threads=num_threads)
 
     @staticmethod

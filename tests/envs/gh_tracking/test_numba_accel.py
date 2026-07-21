@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
-from unilab.envs.gh_tracking.config import GHTrackingCfg
+
 from unilab.envs.gh_tracking import gh_tracking_numba as NB
+from unilab.envs.gh_tracking.config import GHTrackingCfg
 from unilab.envs.gh_tracking.motion_dataset import write_synthetic_dataset
 
 
