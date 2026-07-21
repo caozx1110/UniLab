@@ -337,6 +337,15 @@ class GHTrackingEnv(NpEnv):
         self._post_substep = 0
         backend.set_post_step_callback(self._post_step_telemetry)
 
+        self._numba_accelerator = None
+        if getattr(cfg, "numba_acceleration", False):
+            from unilab.envs.gh_tracking.gh_tracking_numba import (
+                GHTrackingNumbaAccelerator,
+            )
+            self._numba_accelerator = GHTrackingNumbaAccelerator.from_env(
+                self, num_threads=getattr(cfg, "numba_num_threads", None)
+            )
+
         # Domain-randomization provider drives the reset lifecycle (D2 order) and
         # materializes the backend pool (NpEnv._init_domain_randomization).
         from unilab.envs.gh_tracking.dr_provider import GHTrackingDRProvider
@@ -452,11 +461,17 @@ class GHTrackingEnv(NpEnv):
         self._before_update()
         # termination counter uses the PREVIOUS step's _cum_error (1-step lag)
         self.termination.update(self._cum_error)
-        reward_vec = self._compute_reward()  # writes THIS step's _cum_error
+        acc = getattr(self, "_numba_accelerator", None)
+        if acc is not None:
+            res = acc.compute_update_state(self)
+            reward_vec, obs, terminated = res.reward_vec, res.obs, res.terminated
+        else:
+            reward_vec = self._compute_reward()  # writes THIS step's _cum_error
+            obs = self._compute_obs()  # priv_critic == _cum_error (consumer)
+            terminated = apply_terminate_gate(
+                self.termination.terminated(), self._episode_length
+            )[:, 0]
         reward = reward_vec.sum(axis=-1)  # scalar for NpEnv; 3-vector stashed for GAE (Phase 10)
-        obs = self._compute_obs()  # priv_critic == _cum_error (consumer)
-
-        terminated = apply_terminate_gate(self.termination.terminated(), self._episode_length)[:, 0]
         truncated = compute_truncation(
             self._episode_length, self._cfg.termination.max_episode_length, self._motion_finished()
         )[:, 0]

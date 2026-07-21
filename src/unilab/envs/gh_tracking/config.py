@@ -160,3 +160,5 @@ class GHTrackingCfg(EnvCfg):
     domain_rand: GHDRCfg = field(default_factory=GHDRCfg)
     sim_dt: float = 0.02 / 4.0  # 200 Hz sim (4 substeps × 50 Hz ctrl)
     ctrl_dt: float = 0.02  # 50 Hz control
+    numba_acceleration: bool = False
+    numba_num_threads: int | None = None
