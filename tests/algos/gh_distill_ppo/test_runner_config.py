@@ -66,6 +66,33 @@ def test_runner_smoke_train_iteration_and_checkpoint(tmp_path):
     runner.close()
 
 
+def test_learn_respects_max_iterations_and_logs(tmp_path, capsys):
+    """Training is budgeted in outer iterations: learn() with no num_iterations runs exactly
+    algo.max_iterations iterations and prints a per-iteration progress line (the loop used to be
+    silent, so a healthy long run was indistinguishable from a hang)."""
+    from unilab.algos.gh_distill_ppo.runner import GHDistillRunner
+
+    write_synthetic_dataset(str(tmp_path / "interx"), clip_lengths=[120, 200], seed=2)
+    override = {"motion": {"dirs": [str(tmp_path / "interx")], "weights": [1.0]}}
+    cfg = _cfg("train", 4, tmp_path)
+    cfg.algo.max_iterations = 3               # short run bounded in iterations
+
+    runner = GHDistillRunner(cfg, device="cpu", env_cfg_override=override)
+    calls = {"n": 0}
+    orig = runner.trainer.train_op
+
+    def _counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    runner.trainer.train_op = _counting
+    runner.learn()                            # no num_iterations -> uses algo.max_iterations
+    assert calls["n"] == 3                     # ran exactly max_iterations outer iterations
+    out = capsys.readouterr().out
+    assert "iter 0/3" in out and "reward" in out   # per-iteration progress is visible on stdout
+    runner.close()
+
+
 def test_adapt_runner_loads_train_ckpt_and_freezes_vecnorm(tmp_path):
     from unilab.algos.gh_distill_ppo.runner import GHDistillRunner
 

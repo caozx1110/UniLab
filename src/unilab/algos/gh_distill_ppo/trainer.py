@@ -158,7 +158,9 @@ class GHDistillTrainer:
         action_old, logp_old = mb["action"], mb["sample_log_prob"]
 
         # symmetry augmentation -> 2B (GH ppo.py:341-353)
-        obs2 = {g: torch.cat([mb[g], self.sym[g](mb[g])], dim=0) for g in _OBS_GROUPS}
+        # Move sym transforms to same device as obs (trainer is not nn.Module, sym dict won't auto-follow .to())
+        device = mb[_OBS_GROUPS[0]].device
+        obs2 = {g: torch.cat([mb[g], self.sym[g].to(device)(mb[g])], dim=0) for g in _OBS_GROUPS}
         adv2 = torch.cat([mb["adv"], mb["adv"]], dim=0)
         ret2 = torch.cat([mb["ret"], mb["ret"]], dim=0)
         valid2 = ~torch.cat([mb["is_init"], mb["is_init"]], dim=0)
@@ -188,8 +190,8 @@ class GHDistillTrainer:
             reg = torch.zeros((), device=loc.device)
 
         # symmetry loss: [:B] vs act_transform(mirror [B:]) (GH ppo.py:388-389)
-        loc_sym = self.act_transform(loc[b:])
-        scale_sym = self.act_transform(scale[b:], sign=False)
+        loc_sym = self.act_transform.to(loc.device)(loc[b:])
+        scale_sym = self.act_transform.to(scale.device)(scale[b:], sign=False)
         sym = symmetry_loss(loc[:b], scale[:b], loc_sym, scale_sym)
 
         loss = policy_loss + entropy_loss + value_loss + reg + sym
@@ -230,7 +232,8 @@ class GHDistillTrainer:
 
     def _update2(self, mb: dict) -> torch.Tensor:
         """Estimator: no_grad encoder_priv, train adapt_module, 2B masked MSE, no grad-clip."""
-        obs2 = {g: torch.cat([mb[g], self.sym[g](mb[g])], dim=0) for g in _OBS_GROUPS}
+        device = mb[_OBS_GROUPS[0]].device
+        obs2 = {g: torch.cat([mb[g], self.sym[g].to(device)(mb[g])], dim=0) for g in _OBS_GROUPS}
         valid2 = ~torch.cat([mb["is_init"], mb["is_init"]], dim=0)
         with torch.no_grad():
             priv_feature = self.policy.encoder_priv(obs2["priv"])

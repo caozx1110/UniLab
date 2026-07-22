@@ -24,6 +24,8 @@ algo:
     priv_critic:
       - priv_critic
 env:
+  sim_dt: 0.005                # 200 Hz sim (4 substeps × 50 Hz ctrl)
+  ctrl_dt: 0.02                # 50 Hz control
   sampling_mode: sample_once   # DENYLIST
   control_config:
     action_scale:               # DENYLIST — GH per-joint regex (G1_gentle.yaml:13-22)
@@ -39,6 +41,8 @@ env:
   scene:
     model_file: src/unilab/assets/robots/g1_gh/scene_flat.xml
   motion:
-    # real interx/lafan/amass memmap dirs + weights set at train time (DP2: none yet)
-    dirs: []
-    weights: []
+    # real GMR-retargeted memmaps (AMASS/ACCAD + LAFAN1); InterX deferred.
+    dirs:
+      - /home/a/ws/lemon/GH/datasets/memmap/amass
+      - /home/a/ws/lemon/GH/datasets/memmap/lafan
+    weights: [0.5, 0.5]

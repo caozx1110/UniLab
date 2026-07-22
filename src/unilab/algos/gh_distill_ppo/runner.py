@@ -10,6 +10,7 @@ path (which persists optimizer state).
 """
 from __future__ import annotations
 
+import time
 from pathlib import Path
 from typing import Any
 
@@ -61,7 +62,10 @@ class GHDistillRunner:
         algo = _algo(cfg)
         self.phase = str(algo.phase)
 
-        override = {"student_train": bool(algo.student_train)}
+        # Merge Hydra cfg.env into override (registry.make uses dataclass defaults otherwise)
+        from omegaconf import OmegaConf
+        override = OmegaConf.to_container(cfg.env, resolve=True)  # Hydra cfg.env → dict
+        override["student_train"] = bool(algo.student_train)
         if env_cfg_override:
             override.update(env_cfg_override)
         self.env = create_env(
@@ -106,7 +110,7 @@ class GHDistillRunner:
 
     def collect_rollout(self, state, horizon: int) -> tuple[dict, Any]:
         pol, pri, prc, act, loc, scl, logp, rew, done, is_init = ([] for _ in range(10))
-        prev_done = torch.ones(self.env.num_envs, dtype=torch.bool)  # t=0 is an episode start
+        prev_done = torch.ones(self.env.num_envs, dtype=torch.bool, device=self.device)  # t=0 is episode start
         for _ in range(horizon):
             obs = self._to_torch(state.obs)
             if self.vecnorm.training:
@@ -120,7 +124,7 @@ class GHDistillRunner:
             state = self.env.step(action.cpu().numpy())
             # scalar reward = 3-group reward_vec.sum(-1) (env sums it into state.reward) = GH GAE input
             rew.append(torch.as_tensor(state.reward, dtype=torch.float32, device=self.device))
-            d = torch.as_tensor(state.terminated | state.truncated, dtype=torch.bool)
+            d = torch.as_tensor(state.terminated | state.truncated, dtype=torch.bool, device=self.device)
             done.append(d); prev_done = d
         stack = lambda xs: torch.stack(xs, dim=0)
         rollout = {
@@ -134,21 +138,50 @@ class GHDistillRunner:
     # --- main loop --- #
     def learn(self, num_iterations: int | None = None) -> dict:
         algo = _algo(self.cfg)
+        # Training budget is counted in outer iterations: `max_iterations` (config) is authoritative;
+        # an explicit `num_iterations` (tests / programmatic callers) overrides it. Short validation
+        # runs bound the loop via `algo.max_iterations=N`.
         total = int(num_iterations if num_iterations is not None else algo.max_iterations)
         horizon = int(getattr(algo, "train_every", getattr(algo, "rollout_length", 32)))
         save_interval = int(getattr(algo, "save_interval", max(1, total)))
+        log_interval = max(1, int(getattr(algo, "log_interval", 1)))
         state = self.env.init_state()
         info: dict = {}
         for it in range(total):
             progress = it / max(total, 1)
+            t_iter = time.perf_counter()
             rollout, state = self.collect_rollout(state, horizon)
             self.trainer.step_schedule(progress)
             info = self.trainer.train_op(rollout, self.phase, progress)
+            if it % log_interval == 0 or it == total - 1:
+                self._log_iteration(it, total, rollout, info, time.perf_counter() - t_iter)
             if self.log_dir is not None and (it + 1) % save_interval == 0:
                 self.save(self.log_dir / f"model_{it + 1}.pt")
         if self.log_dir is not None:
             self.save(self.log_dir / "checkpoint_final.pt")
         return info
+
+    def _log_iteration(self, it: int, total: int, rollout: dict, info: dict, elapsed: float) -> None:
+        """Per-iteration progress (GH train.py:180-202): mean reward + trainer scalars + fps to
+        stdout, and best-effort to the ExperimentTracker's W&B run when one is active. Without
+        this the outer loop is silent, so a healthy long run is indistinguishable from a hang."""
+        frames = int(rollout["reward"].numel())
+        metrics = {
+            "train/mean_reward": float(rollout["reward"].mean()),
+            "train/iter_time_s": float(elapsed),
+            "train/fps": float(frames / elapsed) if elapsed > 0 else 0.0,
+        }
+        metrics.update(
+            {f"train/{k}": float(v) for k, v in info.items() if isinstance(v, (int, float))}
+        )
+        compact = " ".join(f"{k.split('/')[-1]}={v:.4g}" for k, v in metrics.items())
+        print(f"[gh_distill:{self.phase}] iter {it}/{total} | {compact}", flush=True)
+        run = self._tracker.run if self._tracker is not None else None
+        if run is not None:
+            try:
+                run.log(metrics, step=it)
+            except Exception:  # logging must never crash a multi-hour training run
+                pass
 
     def save(self, path) -> None:
         save_gh_checkpoint(
