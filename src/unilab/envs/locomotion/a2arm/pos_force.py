@@ -1291,7 +1291,13 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         if commands is not None and dr.velocity_push_standing_scale != 1.0:
             standing = ~self._command_is_moving(commands)
             vel[standing] *= float(dr.velocity_push_standing_scale)
-        self._backend.get_base_lin_vel()[:, 0:2] = vel
+        # Overwrite the base horizontal velocity through the declared setter. We do
+        # NOT write through get_base_lin_vel()'s return value: the SimBackend
+        # contract does not promise it is a live view, and a backend returning a
+        # copy would drop the push silently. Read (copy) -> patch x/y -> set.
+        lin_vel = self._backend.get_base_lin_vel().copy()
+        lin_vel[:, 0:2] = vel
+        self._backend.set_base_lin_vel(lin_vel)
 
     def _reset_force_schedules(self, env_ids: np.ndarray) -> None:
         for sched in (

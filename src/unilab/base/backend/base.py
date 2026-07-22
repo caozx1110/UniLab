@@ -522,6 +522,26 @@ class SimBackend(abc.ABC):
             (num_envs, 3)
         """
 
+    def set_base_lin_vel(self, lin_vel: np.ndarray) -> None:
+        """Overwrite the base world-frame linear velocity in the pending state.
+
+        The counterpart write path to :meth:`get_base_lin_vel`. Callers must not
+        rely on ``get_base_lin_vel()`` returning a mutable view — that is a
+        backend implementation detail, not part of this contract — and must go
+        through this method to push a base-velocity impulse into the simulation.
+
+        Args:
+            lin_vel: World-frame linear velocity with shape ``(num_envs, 3)``.
+
+        Returns:
+            None. Backends that support this mutate their pending simulation
+            state; backends without a free-floating base raise instead of
+            silently dropping the write.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support base linear-velocity override"
+        )
+
     @abc.abstractmethod
     def get_base_ang_vel(self) -> np.ndarray:
         """Return base angular velocity in the world frame.

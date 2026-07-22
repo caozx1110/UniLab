@@ -1186,6 +1186,22 @@ class MuJoCoBackend(SimBackend):
     def get_base_lin_vel(self) -> np.ndarray:
         return self._base_lin_vel_view
 
+    def set_base_lin_vel(self, lin_vel: np.ndarray) -> None:
+        # Free-floating base only: _base_lin_vel_view aliases the pending qvel
+        # block, so writing it lands in the state the next mj_step consumes. For a
+        # fixed/non-free base that view is a standalone zeros buffer, so a write
+        # would be silently dropped -- raise instead of losing the impulse.
+        if self._root_qpos_dim != 7:
+            raise NotImplementedError(
+                "set_base_lin_vel requires a free-floating base (root_qpos_dim == 7)"
+            )
+        lin_vel = np.asarray(lin_vel, dtype=self._np_dtype)
+        if lin_vel.shape != self._base_lin_vel_view.shape:
+            raise ValueError(
+                f"lin_vel must have shape {self._base_lin_vel_view.shape}, got {lin_vel.shape}"
+            )
+        self._base_lin_vel_view[:] = lin_vel
+
     def get_base_ang_vel(self) -> np.ndarray:
         return self._base_ang_vel_view
 

@@ -110,7 +110,9 @@ def test_a2arm_config_geometry():
     # Arm arrays are length-5, indexed in tree order joint1,2,4,6,7.
     assert list(cfg.control_config.arm_torque_limit) == [30.0, 30.0, 30.0, 10.0, 10.0]
     assert list(cfg.control_config.arm_kp) == [90.0, 120.0, 70.0, 30.0, 30.0]
-    assert list(cfg.control_config.arm_kd) == [3.0, 4.0, 2.0, 1.0, 1.0]
+    # arm_kd retuned to zeta~0.7 (2026-07-12) for j1/j2/j4; j6/j7 left at 1.0.
+    # DEPLOYMENT CONTRACT: keep in sync with PosForceControlConfig.arm_kd.
+    assert list(cfg.control_config.arm_kd) == [5.5, 10.5, 5.5, 1.0, 1.0]
 
 
 def test_a2arm_mjcf_joint_set():
@@ -213,3 +215,23 @@ def test_a2arm_init_step_runs_and_torque_within_limits():
     assert np.isfinite(state.obs["obs"]).all()
     assert np.isfinite(state.obs["critic"]).all()
     assert np.all(np.abs(env._last_torque) <= env._torque_limits + 1e-6)
+
+
+@pytest.mark.slow
+def test_a2arm_set_base_lin_vel_write_through():
+    """The velocity-push DR routes through ``backend.set_base_lin_vel`` (not a
+    write through ``get_base_lin_vel()``'s return value). Prove the setter's write
+    actually reaches the state read back by the getter, and that a shape mismatch
+    is rejected rather than silently mis-applied."""
+    _skip_if_no_mujoco()
+    env = _make_a2arm_env(num_envs=2)
+    env.init_state()
+
+    target = np.zeros((2, 3), dtype=np.float64)
+    target[:, 0] = 0.7
+    target[:, 1] = -0.4
+    env._backend.set_base_lin_vel(target)
+    assert np.allclose(env._backend.get_base_lin_vel(), target)
+
+    with pytest.raises(ValueError):
+        env._backend.set_base_lin_vel(np.zeros((2, 2), dtype=np.float64))
