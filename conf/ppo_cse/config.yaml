@@ -27,10 +27,10 @@ algo:
     enc_hidden_dims: [256, 128]
     latent_dim: 19
     dec_hidden_dims: [64]
-    learning_rate: 1.0e-5      # UniFP adaptation_module_learning_rate
+    learning_rate: 1.0e-5      # adaptation-module learning rate
     max_grad_norm: 10.0
     target_start: 0            # target block sits at the front of the critic obs
-    # UniFP per-GROUP weights [base_lin_vel, ee_pos, force_ee, force_base], applied
+    # Per-GROUP weights [base_lin_vel, ee_pos, force_ee, force_base], applied
     # as sum_g mse(pred_g*w_g, tgt_g*w_g) (force groups dominate).
     target_group_sizes: [3, 3, 3, 3]
     target_weights: [0.2, 0.2, 1.0, 1.0]
@@ -38,10 +38,9 @@ algo:
     value_loss_coef: 1.0
     use_clipped_value_loss: true
     clip_param: 0.2
-    # Lowered 0.01 -> 0.003: at 1024 envs the advantage "precision pull" on the
-    # global std is weaker than UniFP's 4096-env signal, so the constant entropy
-    # up-push wins in the post-force regime and std runs away. Less entropy keeps
-    # the std equilibrium low. Re-raise toward 0.01 if env count is increased.
+    # At 1024 envs the advantage "precision pull" on the global std is weak, so a
+    # larger entropy coef lets the up-push win in the post-force regime and std
+    # runs away. Keep entropy low here; raise it if the env count is increased.
     entropy_coef: 0.003
     num_learning_epochs: 5
     num_mini_batches: 4
@@ -59,8 +58,8 @@ algo:
     # The 32-frame encoder's matmuls dominate the update — bf16 ~halves it.
     # Disabled: rollout runs fp32 but the update ran bf16, so old_log_prob/value
     # (fp32) vs new_log_prob/value (bf16) disagree by ~0.1x desired_kl every step
-    # — an on-policy precision mismatch UniFP never had. fp32 removes that noise
-    # floor (~1.7x slower update). Re-enable only with fp32 rollout consistency.
+    # — an on-policy precision mismatch. fp32 removes that noise floor (~1.7x
+    # slower update). Re-enable only with fp32 rollout consistency.
     use_amp: false
     amp_dtype: bfloat16
 

@@ -2,7 +2,7 @@
 #
 # Concurrent State Estimator (CSE) for UniLab, after Ji et al. 2022
 # ("Concurrent Training of a Control Policy and a State Estimator"), extended to
-# estimate end-effector position and external forces as in UniFP (CoRL 2025).
+# estimate end-effector position and external forces.
 #
 # Unlike the HIM estimator, this is a plain supervised encoder->latent->decoder:
 # the encoder compresses the proprioceptive history into a latent that feeds the
@@ -79,9 +79,9 @@ class CSEEstimator(nn.Module):
         self.max_grad_norm = float(max_grad_norm)
         self.target_start = int(target_start)
 
-        # When ``target_group_sizes`` is given, the estimator loss follows UniFP's
+        # When ``target_group_sizes`` is given, the estimator loss uses the
         # per-group form (``target_weights`` are per-GROUP); otherwise it is the
-        # legacy per-dim weighted mean (``target_weights`` are per-dim).
+        # per-dim weighted mean (``target_weights`` are per-dim).
         if target_group_sizes is not None:
             group_sizes = tuple(int(s) for s in target_group_sizes)
             if sum(group_sizes) != self.num_pred:
@@ -143,12 +143,11 @@ class CSEEstimator(nn.Module):
         """Weighted supervised regression loss for the estimated targets."""
         weights = cast(torch.Tensor, self.target_weights).to(pred.device)
         if self.target_group_sizes is None:
-            # Legacy per-dim weighted mean over all target dims.
+            # Per-dim weighted mean over all target dims.
             return (weights * F.mse_loss(pred, target, reduction="none")).mean()
-        # UniFP form (ppo_cse_pf/ppo.py:187-196): sum over target groups of
-        # mse(pred_g * w_g, target_g * w_g). Per-group weights enter the MSE (so
-        # they are effectively squared), and per-group means are SUMMED, not
-        # averaged across groups.
+        # Per-group form: sum over target groups of mse(pred_g * w_g, target_g *
+        # w_g). Per-group weights enter the MSE (so they are effectively squared),
+        # and per-group means are SUMMED, not averaged across groups.
         loss = pred.new_zeros(())
         offset = 0
         for size, weight in zip(self.target_group_sizes, weights):
@@ -165,10 +164,10 @@ class CSEEstimator(nn.Module):
         autocast_enabled: bool = False,
         autocast_dtype: torch.dtype | None = None,
     ) -> float:
-        # Same-step state estimation (Ji et al. 2022 / UniFP obs_pred): the target
-        # is the privileged block of the CURRENT critic obs, not the next step.
-        # When ``lr`` is None the estimator keeps its own fixed learning rate
-        # (decoupled from the adaptive policy LR, matching UniFP's 1e-5).
+        # Same-step state estimation (Ji et al. 2022): the target is the
+        # privileged block of the CURRENT critic obs, not the next step. When
+        # ``lr`` is None the estimator keeps its own fixed learning rate
+        # (decoupled from the adaptive policy LR).
         if lr is not None:
             self.learning_rate = float(lr)
             for param_group in self.optimizer.param_groups:

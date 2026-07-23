@@ -1,26 +1,25 @@
 """A2 quadruped + P7v3 (5-DOF) arm + UMI gripper position-force control task.
 
-Faithful port of the UniFP (CoRL 2025) ``go2arm_pos_force`` task into UniLab's
-NpEnv contract, on the Unitree A2 quadruped carrying a P7v3 arm (joint3 upper-arm
-ROLL and joint5 wrist ROLL frozen -> 5 active arm joints joint1,2,4,6,7) with a
-UMI gripper. The legs plus arm joints (12 legs + 5 arm = 17 actuators; the arm
-count is cfg-derived from ``asset.arm_joint_names``) are controlled by the RL
-policy through a Python PD law fed to ``<motor>`` actuators, and the policy
-jointly tracks end-effector position and commanded forces. Locomotion, the full
-observation/command layout, the external-force push controller, the UniFP reward
-set, and the CSE estimator targets are all implemented here.
+Runs on the Unitree A2 quadruped carrying a P7v3 arm (joint3 upper-arm ROLL and
+joint5 wrist ROLL frozen -> 5 active arm joints joint1,2,4,6,7) with a UMI
+gripper. The legs plus arm joints (12 legs + 5 arm = 17 actuators; the arm count
+is cfg-derived from ``asset.arm_joint_names``) are controlled by the RL policy
+through a Python PD law fed to ``<motor>`` actuators, and the policy jointly
+tracks end-effector position and commanded forces. Locomotion, the full
+observation/command layout, the external-force push controller, the reward set,
+and the CSE estimator targets are all implemented here.
 
 Known gaps (deferred): rough-flat terrain randomization — this task runs on the
 flat MJCF floor only.
 
-Control law (UniFP ``_compute_torques``), recomputed every physics substep:
+Control law, recomputed every physics substep:
 
     target  = default_dof_pos + action * motor_strength * action_scale
     torque  = kp * (target - q) - kd * qd
     torque  = clip(torque, -torque_limit, torque_limit)
 
-The end-effector goal is expressed in UniFP's yaw-aligned, gravity-referenced
-sphere frame (terrain-relative z).
+The end-effector goal is expressed in a yaw-aligned, gravity-referenced sphere
+frame (terrain-relative z).
 """
 
 from __future__ import annotations
@@ -53,7 +52,7 @@ from unilab.utils.rotation import (
     np_yaw_quat,
 )
 
-# Command vector layout (15 dims), matching UniFP INDEX_* constants.
+# Command vector layout (15 dims).
 CMD_VEL = slice(0, 3)  # base lin_vel_x, lin_vel_y, ang_vel_yaw
 CMD_EE_POS = slice(3, 6)  # EE goal in sphere coords [radius, pitch, yaw]
 CMD_EE_ORN = slice(6, 9)  # EE goal orientation [roll, pitch, yaw]
@@ -73,7 +72,7 @@ def _default_scene() -> SceneCfg:
 
 
 def sphere2cart(sphere: np.ndarray) -> np.ndarray:
-    """UniFP convention: sphere [l, pitch, yaw] -> cart [x, y, z]."""
+    """Sphere [l, pitch, yaw] -> cart [x, y, z]."""
     l = sphere[..., 0]
     pitch = sphere[..., 1]
     yaw = sphere[..., 2]
@@ -84,7 +83,7 @@ def sphere2cart(sphere: np.ndarray) -> np.ndarray:
 
 
 def cart2sphere(cart: np.ndarray) -> np.ndarray:
-    """UniFP convention: cart [x, y, z] -> sphere [l, pitch, yaw]."""
+    """Cart [x, y, z] -> sphere [l, pitch, yaw]."""
     cart = np.asarray(cart)
     xy_len = np.linalg.norm(cart[..., :2], axis=-1)
     l = np.linalg.norm(cart, axis=-1)
@@ -102,8 +101,8 @@ def _roll_pitch_from_quat(quat: np.ndarray) -> np.ndarray:
 
 
 def _soft_dof_pos_limits(hard: np.ndarray, soft: float) -> np.ndarray:
-    """Shrink hard joint limits to the middle ``soft`` fraction about each midpoint
-    (UniFP ``_process_dof_props``): ``[m - 0.5*r*soft, m + 0.5*r*soft]``."""
+    """Shrink hard joint limits to the middle ``soft`` fraction about each
+    midpoint: ``[m - 0.5*r*soft, m + 0.5*r*soft]``."""
     lower = hard[:, 0]
     upper = hard[:, 1]
     mid = (lower + upper) / 2.0
@@ -130,15 +129,13 @@ def _expand_leg_torque_limit(value: float | list[float]) -> np.ndarray:
 class _ForceSchedule:
     """Per-env trapezoidal force episodes (ramp up -> hold -> ramp down).
 
-    Faithful in spirit to UniFP's ``_push_gripper`` / ``_push_robot_base``
-    state machines: each env idles for a random interval, then runs one force
-    episode toward a random target. The episode ramps up over ``push_duration``
-    (sampled from ``duration_range``), HOLDS at the target for a FIXED
-    ``settling`` window (UniFP's ``settling_time_force_*``, gripper 0.5 s /
-    base 1.0 s), then ramps down over ``push_duration`` again; total length is
-    ``2 * push_duration + settling``. ``prob`` is the probability that any given
-    episode actually fires; otherwise the force stays zero for that interval
-    (UniFP's ``freed_envs``). The returned force is per-env ``(N, 3)`` in newtons.
+    Each env idles for a random interval, then runs one force episode toward a
+    random target. The episode ramps up over ``push_duration`` (sampled from
+    ``duration_range``), HOLDS at the target for a FIXED ``settling`` window
+    (gripper 0.5 s / base 1.0 s), then ramps down over ``push_duration`` again;
+    total length is ``2 * push_duration + settling``. ``prob`` is the probability
+    that any given episode actually fires; otherwise the force stays zero for
+    that interval. The returned force is per-env ``(N, 3)`` in newtons.
     """
 
     def __init__(
@@ -158,10 +155,10 @@ class _ForceSchedule:
         self._duration = duration_range
         self._prob = float(prob)
         self._dtype = dtype
-        # Fixed peak-hold window in control steps (UniFP settling_time_force_*).
+        # Fixed peak-hold window in control steps.
         self._settling = max(0, int(settling))
-        # UniFP attenuates / zeros the z-component for base forces:
-        # base-ext z is scaled by force_z_base_ext_scale (0.05); base-cmd z is 0.
+        # Attenuate / zero the z-component for base forces: base-ext z is scaled
+        # by force_z_base_ext_scale (0.05); base-cmd z is 0.
         self._z_scale = float(z_scale)
         self.current = np.zeros((num_envs, 3), dtype=dtype)
         self._target = np.zeros((num_envs, 3), dtype=dtype)
@@ -190,8 +187,8 @@ class _ForceSchedule:
             mags = np.random.uniform(self._mag[0], self._mag[1], size=(len(fire_ids), 3))
             mags[:, 2] *= self._z_scale
             self._target[fire_ids] = mags.astype(self._dtype)
-            # ``push_duration`` is the ramp length (UniFP push_duration_s); the
-            # hold is a FIXED settling window, independent of the sampled ramp.
+            # ``push_duration`` is the ramp length; the hold is a FIXED settling
+            # window, independent of the sampled ramp.
             push_duration = np.random.randint(
                 self._duration[0], self._duration[1] + 1, size=len(fire_ids)
             )
@@ -263,10 +260,10 @@ class ObsScales:
 @dataclass
 class PosForceNoiseConfig:
     # Noise is added to the ALREADY-SCALED observation, so each scale below is
-    # UniFP's noise_scales[x] * obs_scales[x] (with noise_level=1):
+    # noise_scales[x] * obs_scales[x] (with noise_level=1):
     #   dof_pos: 0.01 * 1.0  = 0.01   dof_vel: 1.5 * 0.05 = 0.075
     #   gravity/orn: 0.05    ang_vel: 0.2 * 0.25(applied later) -> 0.2 here
-    level: float = 1.0  # UniFP add_noise=True, noise_level=1.0 (was 0.0 -> perfect obs)
+    level: float = 1.0
     scale_joint_angle: float = 0.01
     scale_joint_vel: float = 0.075
     scale_gyro: float = 0.2
@@ -287,7 +284,7 @@ class GoalEEConfig:
     command_mode: str = "sphere"
     arm_induced_pitch: float = 0.38
     sphere_center: SphereCenter = field(default_factory=SphereCenter)
-    # Sphere sampling ranges [radius, pitch, yaw] (UniFP pos_l / pos_p / pos_y).
+    # Sphere sampling ranges [radius, pitch, yaw].
     pos_l: list[float] = field(default_factory=lambda: [0.25, 0.60])
     pos_p: list[float] = field(default_factory=lambda: [-2.0 * np.pi / 5.0, 2.0 * np.pi / 5.0])
     pos_y: list[float] = field(default_factory=lambda: [-3.0 * np.pi / 5.0, 3.0 * np.pi / 5.0])
@@ -323,8 +320,8 @@ class PosForceCommandsConfig:
     max_push_force_xyz_gripper_ext: list[float] = field(default_factory=lambda: [-15.0, 15.0])
     max_push_force_xyz_base_cmd: list[float] = field(default_factory=lambda: [-25.0, 25.0])
     max_push_force_xyz_base_ext: list[float] = field(default_factory=lambda: [-20.0, 20.0])
-    # Force-episode timing in seconds [min, max]. UniFP uses DISTINCT cmd vs ext
-    # idle intervals per body; ``*_duration_s`` is the ramp (push_duration) and
+    # Force-episode timing in seconds [min, max]. DISTINCT cmd vs ext idle
+    # intervals per body; ``*_duration_s`` is the ramp (push_duration) and
     # ``settling_time_force_*_s`` is the fixed peak-hold window.
     push_gripper_interval_s_cmd: list[float] = field(default_factory=lambda: [5.0, 10.0])
     push_gripper_interval_s_ext: list[float] = field(default_factory=lambda: [6.0, 12.0])
@@ -332,7 +329,7 @@ class PosForceCommandsConfig:
     push_base_interval_s_cmd: list[float] = field(default_factory=lambda: [5.0, 10.0])
     push_base_interval_s_ext: list[float] = field(default_factory=lambda: [8.0, 14.0])
     push_base_duration_s: list[float] = field(default_factory=lambda: [0.5, 1.5])
-    # Fixed peak-hold ("settling") time per body (UniFP settling_time_force_*_s).
+    # Fixed peak-hold ("settling") time per body.
     settling_time_force_gripper_s: float = 0.5
     settling_time_force_base_s: float = 1.0
     gripper_forced_prob_cmd: float = 0.8
@@ -343,7 +340,7 @@ class PosForceCommandsConfig:
     # setpoint: ee_goal += F/gripper_force_kp, base_vel_cmd += F/base_force_kd.
     gripper_force_kp: float = 300.0
     base_force_kd: float = 200.0
-    # UniFP attenuates the external base force's vertical component to 5%.
+    # Attenuate the external base force's vertical component to 5%.
     force_z_base_ext_scale: float = 0.05
     # Gripper force vertical (z) attenuation. The arm's vertical wrench capacity at
     # extended reach is ~19 N (shoulder-pitch torque saturates: long moment arm +
@@ -353,17 +350,17 @@ class PosForceCommandsConfig:
     # stays consistent with the reduced physical force. 1.0 = no change (default).
     force_z_gripper_cmd_scale: float = 1.0
     force_z_gripper_ext_scale: float = 1.0
-    # Force curriculum: external forces start after this many CONTROL steps.
-    # UniFP starts at iteration 6000 = 6000 * num_steps_per_env(24) = 144000.
+    # Force curriculum: external forces start after this many CONTROL steps
+    # (144000 = iteration 6000 * num_steps_per_env 24).
     force_start_step: int = 144000
     # Force-MAGNITUDE curriculum (staircase). After force_start_step, all four
     # force channels (gripper/base × cmd/ext) are multiplied by a stage factor so
     # the magnitude grows in gears instead of jumping to full. ``scales`` is the
     # per-gear factor (e.g. [0.33, 0.66, 1.0]); ``stage_steps`` is how many CONTROL
-    # steps each gear lasts. EMPTY scales = DISABLED = full force from force_start
-    # (byte-identical to no curriculum). Applying the SAME factor to cmd and ext
-    # keeps the reward/obs setpoint offset (ext+cmd)/kp consistent with the applied
-    # physical force, so early gears are a weaker version of the SAME task.
+    # steps each gear lasts. EMPTY scales = DISABLED = full force from force_start.
+    # Applying the SAME factor to cmd and ext keeps the reward/obs setpoint offset
+    # (ext+cmd)/kp consistent with the applied physical force, so early gears are a
+    # weaker version of the SAME task.
     force_curriculum_scales: list[float] = field(default_factory=list)
     force_curriculum_stage_steps: int = 1
 
@@ -373,9 +370,9 @@ class PosForceControlConfig:
     action_scale: float = 0.25
     arm_action_scale: float = 0.25
     simulate_action_latency: bool = False
-    # UniFP applies a 3-control-step action delay (sim2real latency model).
+    # 3-control-step action delay (sim2real latency model).
     action_delay_steps: int = 3
-    # PD gains (UniFP go2arm); reused via build_a2arm_position_gains.
+    # PD gains; reused via build_a2arm_position_gains.
     Kp: float = 35.0
     Kd: float = 0.5
     leg_kp: float | list[float] = 60.0
@@ -390,14 +387,14 @@ class PosForceControlConfig:
 @dataclass
 class PosForceDomainRandConfig:
     # Field names MUST match the shared DR applier contract in unilab.dr.dr_utils
-    # (it reads them via getattr; UniFP-style names silently no-op).
+    # (it reads them via getattr; unrecognized names silently no-op).
     randomize_ground_friction: bool = True
     # Multiplier on the model's default ground friction (default ~1.0 => ~[0.5, 1.8]).
     ground_friction_multiplier_range: list[float] = field(default_factory=lambda: [0.5, 1.8])
     # The foot geom has priority=1 in the MJCF, so it OVERRIDES the floor friction
     # at the contact -> randomizing the ground (above) never reaches the feet.
-    # Randomize the FOOT friction directly (absolute range, matching UniFP's
-    # per-env foot-shape friction_range) so contact friction actually varies.
+    # Randomize the FOOT friction directly (absolute per-env range) so contact
+    # friction actually varies.
     randomize_foot_friction: bool = True
     foot_friction_range: list[float] = field(default_factory=lambda: [0.5, 1.8])
     randomize_base_mass: bool = True
@@ -409,12 +406,11 @@ class PosForceDomainRandConfig:
     randomize_motor_strength: bool = True
     leg_motor_strength_range: list[float] = field(default_factory=lambda: [0.85, 1.15])
     arm_motor_strength_range: list[float] = field(default_factory=lambda: [0.85, 1.15])
-    # Gripper payload mass (UniFP adds 0-0.12 kg to the wrist/gripper link).
+    # Gripper payload mass (0-0.12 kg added to the wrist/gripper link).
     randomize_gripper_mass: bool = True
     gripper_added_mass_range: list[float] = field(default_factory=lambda: [0.0, 0.12])
-    # Base-velocity impulse push (UniFP _push_robots): every ``push_interval``
-    # control steps, overwrite the base x/y linear velocity with U(-vmax, vmax),
-    # amplified 2.5x for envs commanded to stand still. Applied in-env by
+    # Base-velocity impulse push: every ``push_interval`` control steps, overwrite
+    # the base x/y linear velocity with U(-vmax, vmax). Applied in-env by
     # ``A2ArmPosForceEnv._maybe_apply_velocity_push``. The shared force-based
     # interval push (build_interval_push_plan) is left OFF because a small xfrc
     # force on a ~15 kg base is a near-no-op; ``push_robots`` gates only that path.
@@ -422,9 +418,7 @@ class PosForceDomainRandConfig:
     velocity_push: bool = True
     push_interval: int = 400
     max_push_vel_xy: float = 0.3
-    # Standing-env push amplification. UniFP's _push_robots multiplies by 2.5 when
-    # commands.sum()==0, but that condition never holds (EE radius is always
-    # nonzero), so UniFP's actual behavior is 1x. Default 1.0 = UniFP-faithful.
+    # Standing-env push amplification; 1.0 = no amplification (default).
     velocity_push_standing_scale: float = 1.0
     push_body_name: str = "base"
 
@@ -445,9 +439,9 @@ class RewardConfig:
     soft_dof_pos_limit: float = 0.8
     soft_torque_limit: float = 0.9
     max_contact_force: float = 200.0
-    # Leg gait-reference tracking: exp(-L1_err * ref_dof_scale) (UniFP uses 0.1).
+    # Leg gait-reference tracking: exp(-L1_err * ref_dof_scale).
     ref_dof_scale: float = 0.1
-    # stand_still: exp(-L1_err * stand_still_scale) at zero command (UniFP 0.05).
+    # stand_still: exp(-L1_err * stand_still_scale) at zero command.
     stand_still_scale: float = 0.05
     feet_air_time_threshold: float = 0.5
     feet_height_target: float = 0.10
@@ -456,7 +450,7 @@ class RewardConfig:
 
 @dataclass
 class HistoryConfig:
-    # Actor sees a long proprioceptive history (UniFP frame_stack=32); the CSE
+    # Actor sees a long proprioceptive history (frame_stack=32); the CSE
     # estimator compresses it. The critic sees the current privileged step, so
     # the estimator target is critic_obs[:, :12] (estimator.target_start=0).
     num_actor_history: int = 32
@@ -475,12 +469,10 @@ class ResetConfig:
 class A2ArmPosForceCfg(A2ArmBaseCfg):
     """A2 + P7v3 (joint3+joint5-frozen, 5-DOF) + UMI gripper v3 pos-force task.
 
-    Self-contained flattened config: the values below are the fully resolved
-    defaults of the historical Go2ArmPosForce -> A2 -> P7v3 -> joint3+joint5-frozen
-    inheritance chain, folded into one class (byte-identical training semantics).
-    Active arm joints, in tree/qpos/actuator order, are joint1,2,4,6,7 (joint3 and
-    joint5 dropped); every length-5 arm array below is indexed in that order.
-    Reward weights + the force curriculum live in the task YAML.
+    Self-contained flattened config. Active arm joints, in tree/qpos/actuator
+    order, are joint1,2,4,6,7 (joint3 and joint5 dropped); every length-5 arm
+    array below is indexed in that order. Reward weights + the force curriculum
+    live in the task YAML.
     """
 
     scene: SceneCfg = field(default_factory=_default_scene)
@@ -488,9 +480,9 @@ class A2ArmPosForceCfg(A2ArmBaseCfg):
     max_episode_seconds: float = 20.0
     sim_dt: float = 0.005
     ctrl_dt: float = 0.02
-    # UniFP normalization clamps: cap the raw action and the final observation,
+    # Normalization clamps: cap the raw action and the final observation,
     # preventing the action_rate / obs feedback runaway when a policy update
-    # overshoots (the divergence that crashed early A2 training). None disables.
+    # overshoots. None disables.
     clip_actions: float | None = 100.0
     clip_observations: float | None = 100.0
     obs_scales: ObsScales = field(default_factory=ObsScales)
@@ -507,30 +499,23 @@ class A2ArmPosForceCfg(A2ArmBaseCfg):
     )
     control_config: PosForceControlConfig = field(  # type: ignore[assignment]
         default_factory=lambda: PosForceControlConfig(
-            # A2 legs are far stronger than Go2's (hip/thigh 120, calf 180 Nm).
+            # A2 leg torque capacity: hip/thigh 120, calf 180 Nm.
             leg_kp=[100.0, 100.0, 150.0],
             leg_kd=[4.0, 4.0, 6.0],
             leg_torque_limit=[120.0, 120.0, 180.0],
             # P7v3 arm, order joint1,2,4,6,7 (j1/j2/j4 positioning, j6/j7 wrist).
-            # forcerange contract: MUST equal the a2arm.xml motor forceranges
-            # (j1/j2/j4=30, j6/j7=10) or MuJoCo re-clamps the env-PD torque.
+            # forcerange contract: arm_torque_limit MUST equal the a2arm.xml motor
+            # forceranges (j1/j2/j4=30, j6/j7=10) or MuJoCo re-clamps the env-PD
+            # torque.
             arm_kp=[90.0, 120.0, 70.0, 30.0, 30.0],
-            # Retuned to zeta~0.7 (2026-07-12): the big joints j1/j2/j4 were badly
-            # underdamped (zeta 0.29-0.41 incl. XML damping 0.5), causing the arm to
-            # ring at 2-3 Hz (visible sway standing + amplified while walking). Kd
-            # only — Kp is fine (torque headroom OK below ~15deg error). Critical Kd
-            # (from mj_fullM inertia at home): j1~5.9 j2~15.8 j4~8.4; 0.7x minus the
-            # XML 0.5 gives these. j6/j7 already at zeta~1, left at 1.0. DEPLOYMENT
-            # CONTRACT: real-robot PD must match these exactly (retrain after any
-            # change). Retrain required — the action->torque map changed.
             arm_kd=[5.5, 10.5, 5.5, 1.0, 1.0],
             arm_torque_limit=[30.0, 30.0, 30.0, 10.0, 10.0],
         )
     )
     commands: PosForceCommandsConfig = field(
         default_factory=lambda: PosForceCommandsConfig(
-            # Force curriculum aligned with UniFP ground truth (base force OFF by
-            # default here; the task YAML re-enables it with its own magnitudes).
+            # Base force OFF by default here; the task YAML re-enables it with its
+            # own magnitudes.
             force_start_step=192000,  # 8000 iter x 24 steps
             max_push_force_xyz_gripper_cmd=[-30.0, 30.0],
             max_push_force_xyz_gripper_ext=[-30.0, 30.0],
@@ -542,11 +527,9 @@ class A2ArmPosForceCfg(A2ArmBaseCfg):
     )
     goal_ee: GoalEEConfig = field(
         default_factory=lambda: GoalEEConfig(
-            # Terrain-relative sphere center at shoulder height (UniFP contract).
-            # Lowered 0.75->0.71 (2026-07-12) by the SAME 0.04 delta as the wide
-            # keyframe base z (0.465->0.425): the EE and the sphere center drop
-            # together, so the EE-to-center vector — and thus init_pos_start/end
-            # and the arm keyframe — are UNCHANGED and stay FK self-consistent.
+            # Terrain-relative sphere center at shoulder height. Must stay in sync
+            # with the keyframe base z so the EE-to-center vector (and thus
+            # init_pos_start/end and the arm keyframe) stays FK self-consistent.
             sphere_center=SphereCenter(x_offset=0.2, y_offset=0.0, z_invariant_offset=0.735),
             # P7v3 (5-DOF) reach: sampling range IK-verified safe.
             pos_l=[0.28, 0.55],
@@ -698,7 +681,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         dtype = get_global_dtype()
         self._np_dtype = dtype
         self._gravity_sensor = "upvector"
-        # UniFP ±100 action/observation clamps (None disables either).
+        # ±100 action/observation clamps (None disables either).
         self._clip_actions = None if cfg.clip_actions is None else float(cfg.clip_actions)
         self._clip_obs = None if cfg.clip_observations is None else float(cfg.clip_observations)
         self._reward_cfg = cfg.reward_config
@@ -721,7 +704,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
             ]
         )
         self._motor_strength = np.ones((num_envs, self._num_action), dtype=dtype)
-        # Action-delay ring buffer (UniFP action_delay control steps).
+        # Action-delay ring buffer (action_delay control steps).
         self._action_delay_steps = max(0, int(cfg.control_config.action_delay_steps))
         self._action_history = np.zeros(
             (num_envs, self._action_delay_steps + 1, self._num_action), dtype=dtype
@@ -770,9 +753,9 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         joint_range = self._backend.get_joint_range()
         if joint_range is None:
             raise ValueError("backend.get_joint_range() returned None; required for dof_pos_limits")
-        # UniFP penalizes dof_pos against SOFT limits (middle soft_dof_pos_limit
-        # of each range), not the hard joint limits, so the -10 penalty bites
-        # earlier. _reward_dof_pos_limits reads these.
+        # Penalize dof_pos against SOFT limits (middle soft_dof_pos_limit of each
+        # range), not the hard joint limits, so the -10 penalty bites earlier.
+        # _reward_dof_pos_limits reads these.
         hard_dof_pos_limits = np.asarray(joint_range, dtype=dtype)[: self._num_action]
         self._dof_pos_limits = _soft_dof_pos_limits(
             hard_dof_pos_limits, self._reward_cfg.soft_dof_pos_limit
@@ -801,7 +784,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         def _steps(seconds: list[float]) -> tuple[int, int]:
             return (max(1, int(seconds[0] / ctrl_dt)), max(1, int(seconds[1] / ctrl_dt)))
 
-        # Distinct cmd vs ext idle intervals per body (UniFP); shared ramp
+        # Distinct cmd vs ext idle intervals per body; shared ramp
         # (push_duration) and a fixed settling-time hold per body.
         g_int_cmd = _steps(cmds.push_gripper_interval_s_cmd)
         g_int_ext = _steps(cmds.push_gripper_interval_s_ext)
@@ -838,7 +821,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
             b_dur,
             cmds.base_forced_prob_cmd,
             dtype,
-            z_scale=0.0,  # UniFP zeroes the commanded base force z-component.
+            z_scale=0.0,  # commanded base force z-component is zeroed.
             settling=b_settle,
         )
         self._sched_base_ext = _ForceSchedule(
@@ -918,13 +901,11 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         # then: leg_ref_diff(12) + dr_block(6) + motor_strength(num_action) + stance(4)
         #   + contact_mask(4) + proj_gravity(3) + ee_goal_offset_sphere(3)
         #   + actor_core(...)
-        # The original UniFP block also carried 17 legacy leg/base mass slots
-        # (inert zeros); they are intentionally omitted here.
         cse = 12
         privileged = NUM_LEG + 6 + self._num_action + 4 + 4 + 3 + 3
         return int(cse + privileged + self._actor_single_obs_dim())
 
-    # ── EE goal sampling (UniFP yaw + gravity frame) ──────────────────────
+    # ── EE goal sampling (yaw + gravity frame) ────────────────────────────
 
     def _init_ee_goal_buffers(self, num_envs: int) -> None:
         dtype = get_global_dtype()
@@ -1077,7 +1058,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         commands[:, 0] = np.random.uniform(*cfg.lin_vel_x, size=num_reset)
         commands[:, 1] = np.random.uniform(*cfg.lin_vel_y, size=num_reset)
         commands[:, 2] = np.random.uniform(*cfg.ang_vel_yaw, size=num_reset)
-        # Raise the zero-velocity probability once forces are active (UniFP).
+        # Raise the zero-velocity probability once forces are active.
         zero_prob = (
             cfg.zero_vel_cmd_prob_after_force
             if self.step_counter >= self._force_start_step
@@ -1114,7 +1095,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
     # ── reset DOFs / motor strength ───────────────────────────────────────
 
     def _apply_reset_dofs(self, qpos: np.ndarray, env_ids: np.ndarray) -> None:
-        """UniFP-style reset: scale leg dofs, jitter arm dofs around default."""
+        """Reset: scale leg dofs, jitter arm dofs around default."""
         cfg = self._cfg.reset
         n = len(env_ids)
         base = 7  # floating base (pos3 + quat4) precedes the joint dofs
@@ -1161,13 +1142,13 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         randomization.body_mass = table
 
     def _apply_foot_friction_dr(self, randomization: Any, env_ids: np.ndarray) -> None:
-        """Randomize per-env FOOT friction in the reset payload (UniFP-style).
+        """Randomize per-env FOOT friction in the reset payload.
 
         The foot geom has priority=1, so it overrides the floor at the contact and
         ``randomize_ground_friction`` never reaches the feet. Set the foot geoms'
         tangential friction to one absolute ``U(foot_friction_range)`` bucket per
-        env (all 4 feet share it, like UniFP's per-env friction bucket); the
-        priority-1 foot then imposes that friction on the foot-floor contact.
+        env (all 4 feet share it); the priority-1 foot then imposes that friction
+        on the foot-floor contact.
         """
         cfg = self._cfg.domain_rand
         if randomization is None or not cfg.randomize_foot_friction:
@@ -1271,15 +1252,14 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
             self._backend.apply_body_force(self._force_body_ids, applied.astype(np.float64))
 
     def _maybe_apply_velocity_push(self, commands: np.ndarray | None) -> None:
-        """UniFP ``_push_robots``: a base-velocity impulse domain randomization.
+        """Base-velocity impulse domain randomization.
 
         Every ``push_interval`` control steps, overwrite the base horizontal
         linear velocity with ``U(-max_push_vel_xy, max_push_vel_xy)`` (world
-        frame, matching Isaac ``root_states[:, 7:9]``), scaled by
-        ``velocity_push_standing_scale`` for envs whose velocity command is ~zero
-        (1.0 = UniFP-faithful). The write lands in the authoritative physics
-        state and is consumed by the next physics substep, so it acts as a
-        one-shot velocity impulse.
+        frame), scaled by ``velocity_push_standing_scale`` for envs whose velocity
+        command is ~zero (1.0 = no amplification). The write lands in the
+        authoritative physics state and is consumed by the next physics substep,
+        so it acts as a one-shot velocity impulse.
         """
         dr = self._cfg.domain_rand
         if not dr.velocity_push or dr.push_interval <= 0:
@@ -1320,7 +1300,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         self._last_torque = torque.astype(self._np_dtype)
         return torque
 
-    # ── gait (UniFP humanoid-gym trot reference) ──────────────────────────
+    # ── gait (trot reference) ─────────────────────────────────────────────
 
     def _update_gait(self, info: dict) -> None:
         cfg = self._cfg.gait
@@ -1383,7 +1363,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         )
 
     def _update_contact_timers(self, contact: np.ndarray) -> None:
-        """UniFP feet_air_time bookkeeping (PhysX-style contact filtering)."""
+        """feet_air_time bookkeeping (contact filtering)."""
         contact_filt = contact | self._last_contacts
         self._last_contacts = contact
         self._first_contact = (self._feet_air_time > 0.0) & contact_filt
@@ -1420,9 +1400,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         return state.replace(obs=obs, reward=reward, terminated=terminated)
 
     def _compute_terminated(self, base_quat: np.ndarray) -> np.ndarray:
-        # UniFP check_termination: fall when |pitch| > 1.0 rad or |roll| > 0.8 rad
-        # (legged_robot_go2arm_pos_force.py:205). This is much earlier and roll-
-        # asymmetric vs the old gravity_z<=0 (~90 deg) test.
+        # Termination: fall when |pitch| > 1.0 rad or |roll| > 0.8 rad.
         roll_pitch = _roll_pitch_from_quat(base_quat)
         roll = roll_pitch[:, 0]
         pitch = roll_pitch[:, 1]
@@ -1514,7 +1492,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         motor_strength = self._motor_strength[env_ids] - 1.0
         contact_mask = self.get_foot_contact()[env_ids].astype(dtype)
 
-        # Force-offset EE goal expressed in the sphere frame (UniFP privileged).
+        # Force-offset EE goal expressed in the sphere frame (privileged).
         base_yaw_quat = np_yaw_quat(base_quat)
         force_cmd_world = np_quat_apply(base_yaw_quat, self._force_ee_cmd[env_ids])
         forces_offset = self._force_ee_world[env_ids] + force_cmd_world
@@ -1559,10 +1537,10 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         return actor_raw, critic_raw
 
     def _clip_obs_dict(self, buf_a: np.ndarray, buf_c: np.ndarray) -> dict[str, np.ndarray]:
-        """Return the obs/critic dict with UniFP's ±clip_observations clamp applied.
+        """Return the obs/critic dict with the ±clip_observations clamp applied.
 
         Clamps the OUTPUT only; the stored history buffers keep raw values and are
-        re-clamped on the next read, matching UniFP's per-step ``clip(obs_buf)``.
+        re-clamped on the next read.
         """
         if self._clip_obs is not None:
             lo, hi = -self._clip_obs, self._clip_obs
@@ -1740,12 +1718,12 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         return np.ones((ctx.num_envs,), dtype=self._np_dtype)
 
     def _reward_ref_dof_leg(self, ctx: RewardContext) -> np.ndarray:
-        # UniFP _reward_ref_dof_leg: L1 joint error, exp(-err * 0.1) (not L2-squared).
+        # L1 joint error, exp(-err * 0.1) (not L2-squared).
         err = np.sum(np.abs(ctx.dof_pos[:, :NUM_LEG] - self._ref_dof_pos), axis=1)
         return np.exp(-err * self._reward_cfg.ref_dof_scale)
 
     def _reward_action_rate(self, ctx: RewardContext) -> np.ndarray:
-        # Legs only (UniFP); arm has its own action_rate_arm term.
+        # Legs only; arm has its own action_rate_arm term.
         cur = ctx.info.get("current_actions")
         last = ctx.info.get("last_actions")
         if cur is None or last is None:
@@ -1760,11 +1738,11 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         return np.sum(np.square(cur[:, NUM_LEG:] - last[:, NUM_LEG:]), axis=1)
 
     def _reward_torques(self, ctx: RewardContext) -> np.ndarray:
-        # Legs only (UniFP _reward_torques slices [:, :12]).
+        # Legs only (slices [:, :12]).
         return np.sum(np.square(self._last_torque[:, :NUM_LEG]), axis=1)
 
     def _reward_dof_vel(self, ctx: RewardContext) -> np.ndarray:
-        # Legs only (UniFP _reward_dof_vel slices [:, :12]).
+        # Legs only (slices [:, :12]).
         dof_vel = np.asarray(ctx.dof_vel)
         return np.sum(np.square(dof_vel[:, :NUM_LEG]), axis=1)
 
@@ -1817,7 +1795,7 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         return np.sum((contacts > 0.5).astype(self._np_dtype), axis=1)
 
     def _reward_feet_contact_number(self, ctx: RewardContext) -> np.ndarray:
-        # Reward foot contact matching the gait stance phase (UniFP: +1 / -0.3).
+        # Reward foot contact matching the gait stance phase (+1 / -0.3).
         contact = self._foot_contact
         stance = self._stance_mask > 0.5
         reward = np.where(contact == stance, 1.0, -0.3)
@@ -1830,14 +1808,14 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         return rew.astype(self._np_dtype)
 
     def _reward_feet_height(self, ctx: RewardContext) -> np.ndarray:
-        # Front feet only: encourage clearance up to the target (UniFP clamp max=0).
+        # Front feet only: encourage clearance up to the target (clamp max=0).
         feet_z = self.get_foot_pos()[:, :2, 2]
         rew = np.clip(np.max(feet_z, axis=1) - self._reward_cfg.feet_height_target, None, 0.0)
         rew[~self._command_is_moving(ctx.info["commands"])] = 0.0
         return rew.astype(self._np_dtype)
 
     def _reward_feet_height_high(self, ctx: RewardContext) -> np.ndarray:
-        # Penalize lifting any foot above the high threshold (UniFP clamp min=0).
+        # Penalize lifting any foot above the high threshold (clamp min=0).
         feet_z = self.get_foot_pos()[:, :, 2]
         rew = np.clip(np.max(feet_z, axis=1) - self._reward_cfg.feet_height_high_target, 0.0, None)
         rew[~self._command_is_moving(ctx.info["commands"])] = 0.0

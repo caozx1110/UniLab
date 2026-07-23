@@ -81,7 +81,7 @@ class A2ArmSensor(Sensor):
     )
     feet_pos: list[str] = field(default_factory=lambda: ["FL_pos", "FR_pos", "RL_pos", "RR_pos"])
     # Foot contact-force vectors (3-dim each), foot world velocities, and thigh
-    # world positions — used by the UniFP pos-force feet rewards.
+    # world positions — used by the pos-force feet rewards.
     feet_force_vec: list[str] = field(
         default_factory=lambda: ["FL_foot_force", "FR_foot_force", "RL_foot_force", "RR_foot_force"]
     )

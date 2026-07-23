@@ -110,8 +110,6 @@ def test_a2arm_config_geometry():
     # Arm arrays are length-5, indexed in tree order joint1,2,4,6,7.
     assert list(cfg.control_config.arm_torque_limit) == [30.0, 30.0, 30.0, 10.0, 10.0]
     assert list(cfg.control_config.arm_kp) == [90.0, 120.0, 70.0, 30.0, 30.0]
-    # arm_kd retuned to zeta~0.7 (2026-07-12) for j1/j2/j4; j6/j7 left at 1.0.
-    # DEPLOYMENT CONTRACT: keep in sync with PosForceControlConfig.arm_kd.
     assert list(cfg.control_config.arm_kd) == [5.5, 10.5, 5.5, 1.0, 1.0]
 
 

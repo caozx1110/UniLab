@@ -384,17 +384,17 @@ def _patch_env_for_teleop(env: Any, teleop: TeleopState) -> None:
 
     env._update_forces = _teleop_forces
 
-    # (4) Disable the random base-velocity impulse DR (UniFP _push_robots, applied
-    #     in apply_action independently of _update_forces). During interactive
-    #     validation every disturbance must be user-driven; otherwise the base
-    #     gets uncommanded ~0.3-0.75 m/s kicks every push_interval steps.
+    # (4) Disable the random base-velocity impulse DR (applied in apply_action
+    #     independently of _update_forces). During interactive validation every
+    #     disturbance must be user-driven; otherwise the base gets uncommanded
+    #     ~0.3-0.75 m/s kicks every push_interval steps.
     env._maybe_apply_velocity_push = lambda commands: None  # noqa: ARG005
 
-    # (5) Clean deploy, matching UniFP's strict sim2sim. The policy is TRAINED
-    #     with observation noise + domain randomization for robustness, but it
-    #     must be EVALUATED on a clean, deterministic world — otherwise per-step
-    #     obs noise makes the arm visibly jitter, and random mass/COM/motor draws
-    #     skew the feel (a weak motor draw looks like a weak policy).
+    # (5) Clean deploy. The policy is TRAINED with observation noise + domain
+    #     randomization for robustness, but it must be EVALUATED on a clean,
+    #     deterministic world — otherwise per-step obs noise makes the arm visibly
+    #     jitter, and random mass/COM/motor draws skew the feel (a weak motor draw
+    #     looks like a weak policy).
     env._cfg.noise_config.level = 0.0
     dr = env._cfg.domain_rand
     dr.randomize_base_mass = False
