@@ -19,9 +19,9 @@ import pytest
 def _skip_if_no_mujoco():
     pytest.importorskip("mujoco", reason="mujoco not installed")
     try:
-        from mujoco.batch_env import BatchEnvPool  # noqa: F401
+        from mujoco_uni.batch_env import BatchEnvPool  # noqa: F401
     except Exception:
-        pytest.skip("mujoco.batch_env not available")
+        pytest.skip("mujoco_uni.batch_env not available")
 
 
 def _ensure_registered() -> None:
