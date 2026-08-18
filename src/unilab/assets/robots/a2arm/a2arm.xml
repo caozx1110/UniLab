@@ -66,24 +66,24 @@
     <material name="dark_gray" rgba="0.2 0.2 0.2 1"/>
     <material name="light_gray" rgba="0.6 0.6 0.6 1"/>
 
-    <!-- A2 leg meshes (same STL files as a2_arm, flat under meshes/). -->
-    <mesh name="base_link" file="base_link.STL"/>
-    <mesh name="left_front_Link1" file="left_front_Link1.STL"/>
-    <mesh name="left_front_Link2" file="left_front_Link2.STL"/>
-    <mesh name="left_front_Link3" file="left_front_Link3.STL"/>
-    <mesh name="left_front_Link4" file="left_front_Link4.STL"/>
-    <mesh name="left_hind_Link1" file="left_hind_Link1.STL"/>
-    <mesh name="left_hind_Link2" file="left_hind_Link2.STL"/>
-    <mesh name="left_hind_Link3" file="left_hind_Link3.STL"/>
-    <mesh name="left_hind_Link4" file="left_hind_Link4.STL"/>
-    <mesh name="right_front_Link1" file="right_front_Link1.STL"/>
-    <mesh name="right_front_Link2" file="right_front_Link2.STL"/>
-    <mesh name="right_front_Link3" file="right_front_Link3.STL"/>
-    <mesh name="right_front_Link4" file="right_front_Link4.STL"/>
-    <mesh name="right_hind_Link1" file="right_hind_Link1.STL"/>
-    <mesh name="right_hind_Link2" file="right_hind_Link2.STL"/>
-    <mesh name="right_hind_Link3" file="right_hind_Link3.STL"/>
-    <mesh name="right_hind_Link4" file="right_hind_Link4.STL"/>
+    <!-- A2 leg meshes reuse the canonical byte-identical A2 assets. -->
+    <mesh name="base_link" file="../../a2/assets/a2/base_link.STL"/>
+    <mesh name="left_front_Link1" file="../../a2/assets/a2/left_front_Link1.STL"/>
+    <mesh name="left_front_Link2" file="../../a2/assets/a2/left_front_Link2.STL"/>
+    <mesh name="left_front_Link3" file="../../a2/assets/a2/left_front_Link3.STL"/>
+    <mesh name="left_front_Link4" file="../../a2/assets/a2/left_front_Link4.STL"/>
+    <mesh name="left_hind_Link1" file="../../a2/assets/a2/left_hind_Link1.STL"/>
+    <mesh name="left_hind_Link2" file="../../a2/assets/a2/left_hind_Link2.STL"/>
+    <mesh name="left_hind_Link3" file="../../a2/assets/a2/left_hind_Link3.STL"/>
+    <mesh name="left_hind_Link4" file="../../a2/assets/a2/left_hind_Link4.STL"/>
+    <mesh name="right_front_Link1" file="../../a2/assets/a2/right_front_Link1.STL"/>
+    <mesh name="right_front_Link2" file="../../a2/assets/a2/right_front_Link2.STL"/>
+    <mesh name="right_front_Link3" file="../../a2/assets/a2/right_front_Link3.STL"/>
+    <mesh name="right_front_Link4" file="../../a2/assets/a2/right_front_Link4.STL"/>
+    <mesh name="right_hind_Link1" file="../../a2/assets/a2/right_hind_Link1.STL"/>
+    <mesh name="right_hind_Link2" file="../../a2/assets/a2/right_hind_Link2.STL"/>
+    <mesh name="right_hind_Link3" file="../../a2/assets/a2/right_hind_Link3.STL"/>
+    <mesh name="right_hind_Link4" file="../../a2/assets/a2/right_hind_Link4.STL"/>
 
     <!-- P7v3 arm meshes. -->
     <mesh name="arm_base" file="p7_v3/base_link.STL"/>
@@ -96,23 +96,6 @@
     <mesh name="link7" file="p7_v3/link7.STL"/>
     <mesh name="adapter_plate" file="adapter_plate.STL"/>
 
-    <!-- UMI gripper v3 meshes (welded, no joints). -->
-    <mesh name="umi_base" file="umi_gripper_v3/base_link.STL"/>
-    <mesh name="umi_claw" file="umi_gripper_v3/claw.STL"/>
-    <mesh name="umi_l11" file="umi_gripper_v3/L11.STL"/>
-    <mesh name="umi_l12" file="umi_gripper_v3/L12.STL"/>
-    <mesh name="umi_l21" file="umi_gripper_v3/L21.STL"/>
-    <mesh name="umi_l22" file="umi_gripper_v3/L22.STL"/>
-    <mesh name="umi_l23" file="umi_gripper_v3/L23.STL"/>
-    <mesh name="umi_l31" file="umi_gripper_v3/L31.STL"/>
-    <mesh name="umi_l32" file="umi_gripper_v3/L32.STL"/>
-    <mesh name="umi_l41" file="umi_gripper_v3/L41.STL"/>
-    <mesh name="umi_l42" file="umi_gripper_v3/L42.STL"/>
-    <mesh name="umi_l51" file="umi_gripper_v3/L51.STL"/>
-    <mesh name="umi_l52" file="umi_gripper_v3/L52.STL"/>
-    <mesh name="umi_l53" file="umi_gripper_v3/L53.STL"/>
-    <mesh name="umi_l61" file="umi_gripper_v3/L61.STL"/>
-    <mesh name="umi_l62" file="umi_gripper_v3/L62.STL"/>
   </asset>
 
   <worldbody>
@@ -293,54 +276,52 @@
                           <inertial pos="0 0 0" mass="0.001" diaginertia="1e-6 1e-6 1e-6"/>
                           <site name="endpoint" pos="0 0 0" euler="0 0 0" size="0.01" type="sphere" rgba="0 1 0 1"/>
                         </body>
-                        <!-- UMI gripper v3 (welded, no joints; mass modeled for payload). -->
+                        <!-- UMI gripper v3 (welded, no joints; physical payload only). -->
                         <body name="umi_base_link">
                           <inertial pos="0.03 0 0" mass="0.3" diaginertia="0.0005 0.0005 0.0003"/>
-                          <geom type="mesh" mesh="umi_base" class="obj_visual" material="dark_gray"/>
                           <geom name="gripper_collision" type="box" pos="0.0355 -0.013 0" size="0.043 0.06 0.028" class="obj_collision" rgba="1 0 0 0.5"/>
                           <body name="umi_claw" pos="0.051 0 -6.849e-05" quat="0.499998 0.5 0.500002 0.5">
                             <inertial pos="0.02 0 0" mass="0.05" diaginertia="0.0001 0.0001 0.00005"/>
-                            <geom type="mesh" mesh="umi_claw" class="obj_visual" material="dark_gray"/>
                             <body name="umi_l11" pos="-0.035 0 -0.014">
-                              <geom type="mesh" mesh="umi_l11" class="obj_visual" material="dark_gray"/>
+                              <inertial pos="-0.00583150494676 -0.00291116450237 0.000518584070633" quat="0.405717816317 0.334891458983 0.541370339906 0.655865016062" mass="0.00345240407379" diaginertia="2.52480415854e-07 1.74319583304e-07 1.04392067079e-07"/>
                               <body name="umi_l12" pos="-0.014 -0.007 0">
-                                <geom type="mesh" mesh="umi_l12" class="obj_visual" material="dark_gray"/>
+                                <inertial pos="5.25496994132e-13 9.06574328829e-13 -6.52795064703e-11" quat="1 0 0 0" mass="0.000715117305232" diaginertia="6.94901677993e-08 6.94901678049e-08 1.95212333336e-09"/>
                               </body>
                             </body>
                             <body name="umi_l61" pos="0.035 0 -0.014">
-                              <geom type="mesh" mesh="umi_l61" class="obj_visual" material="dark_gray"/>
+                              <inertial pos="-0.00585068311414 0.00291651827029 0.000497472155813" quat="0.654225941292 0.543536661921 0.336061117831 0.404498751506" mass="0.00344047304672" diaginertia="2.51597358948e-07 1.73704754389e-07 1.04059194404e-07"/>
                               <body name="umi_l62" pos="-0.014 0.007 0">
-                                <geom type="mesh" mesh="umi_l62" class="obj_visual" material="dark_gray"/>
+                                <inertial pos="1.46306404068e-12 5.05414290572e-12 -8.19405784892e-11" quat="1 0 0 0" mass="0.000715117306018" diaginertia="6.94901678227e-08 6.94901678126e-08 1.95212333985e-09"/>
                               </body>
                             </body>
                           </body>
                           <body name="umi_l21" pos="0.0565 -0.017 0">
-                            <geom type="mesh" mesh="umi_l21" class="obj_visual" material="dark_gray"/>
+                            <inertial pos="0.00641294386402 0.0147027083814 0.000409494927632" quat="0.852234635694 0.481481242447 -0.0987695952816 -0.179210786349" mass="0.0147463489411" diaginertia="2.69801117698e-06 1.66862715925e-06 1.20889032764e-06"/>
                             <body name="umi_l22" pos="0.013 0.027 0">
-                              <geom type="mesh" mesh="umi_l22" class="obj_visual" material="dark_gray"/>
+                              <inertial pos="-0.0110761305016 0.00964140010145 0.000333366240242" quat="0.645878655544 0.661302696461 0.235062784219 0.300441331113" mass="0.00700795571837" diaginertia="9.61515971943e-07 9.14833145453e-07 1.46743282719e-07"/>
                               <body name="umi_l23" pos="-0.025 0.024 0">
-                                <geom type="mesh" mesh="umi_l23" class="obj_visual" material="dark_gray"/>
+                                <inertial pos="-0.013319669117 -0.0104559526352 1.4331589913e-07" quat="-0.139153718043 0.693279339628 0.139153718043 0.693279339628" mass="0.00729875471258" diaginertia="1.00082300494e-06 9.57560822503e-07 1.45997692567e-07"/>
                               </body>
                             </body>
                           </body>
                           <body name="umi_l31" pos="0.0615 -0.007 0">
-                            <geom type="mesh" mesh="umi_l31" class="obj_visual" material="dark_gray"/>
+                            <inertial pos="-0.00132254484311 0.0224328800762 -8.05303721846e-05" quat="0.712356307855 0.69296176095 0.0782574794988 0.0789192968962" mass="0.0260958308202" diaginertia="1.06521732972e-05 6.96691739679e-06 4.53326807371e-06"/>
                             <body name="umi_l32" pos="-0.012 0.051 0">
-                              <geom type="mesh" mesh="umi_l32" class="obj_visual" material="dark_gray"/>
+                              <inertial pos="-1.64111993297e-07 7.78737353654e-07 -6.41917566906e-12" quat="1 0 0 0" mass="0.000374000719444" diaginertia="5.48289818431e-09 5.48289816326e-09 2.46805234141e-09"/>
                             </body>
                           </body>
                           <body name="umi_l41" pos="0.0615 0.007 0">
-                            <geom type="mesh" mesh="umi_l41" class="obj_visual" material="dark_gray"/>
+                            <inertial pos="-0.00141177446369 -0.0225457467483 0.000118848717454" quat="0.717031351026 0.687954547683 -0.0790589366699 -0.0795881052671" mass="0.026453838311" diaginertia="1.07491027999e-05 7.04154666284e-06 4.56339740886e-06"/>
                             <body name="umi_l42" pos="-0.012 -0.051 0">
-                              <geom type="mesh" mesh="umi_l42" class="obj_visual" material="dark_gray"/>
+                              <inertial pos="1.80441197018e-07 7.76339649651e-07 1.76538677744e-11" quat="1 0 0 0" mass="0.000374000719451" diaginertia="5.48289817269e-09 5.48289818129e-09 2.46805233922e-09"/>
                             </body>
                           </body>
                           <body name="umi_l51" pos="0.0565 0.017 0">
-                            <geom type="mesh" mesh="umi_l51" class="obj_visual" material="dark_gray"/>
+                            <inertial pos="0.00604923013461 -0.0138743701916 0.000369548967141" quat="0.775456679878 0.597474440577 0.123225079679 0.162809122065" mass="0.0163350119838" diaginertia="3.00062680968e-06 1.74538721904e-06 1.44441735665e-06"/>
                             <body name="umi_l52" pos="0.013 -0.027 0">
-                              <geom type="mesh" mesh="umi_l52" class="obj_visual" material="dark_gray"/>
+                              <inertial pos="-0.0102697321101 -0.0089962887709 -0.000178657442506" quat="0.652172316945 0.653480073876 -0.245914987147 -0.29523021721" mass="0.00781376401197" diaginertia="1.0960727466e-06 1.02652136839e-06 1.73614376273e-07"/>
                               <body name="umi_l53" pos="-0.025 -0.024 0">
-                                <geom type="mesh" mesh="umi_l53" class="obj_visual" material="dark_gray"/>
+                                <inertial pos="-0.0104566365797 -0.0133188917117 -1.26166560189e-07" quat="0.588626663858 0.39181456149 -0.588626663858 0.39181456149" mass="0.00729871772133" diaginertia="1.00081657724e-06 9.57564474677e-07 1.45989355708e-07"/>
                               </body>
                             </body>
                           </body>

@@ -10,10 +10,233 @@ and the FK-verified home pose.
 
 from __future__ import annotations
 
+import hashlib
 import importlib
+import json
+import struct
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
 import numpy as np
 import pytest
+
+_A2ARM_TRAINING_CONTRACT_SHA256 = "5327b8883e690ce7e39b96f7b9315d5125fb84528c81c86778ae2ae99a474e08"
+
+_A2_SHARED_MESH_NAMES = (
+    "base_link",
+    "left_front_Link1",
+    "left_front_Link2",
+    "left_front_Link3",
+    "left_front_Link4",
+    "left_hind_Link1",
+    "left_hind_Link2",
+    "left_hind_Link3",
+    "left_hind_Link4",
+    "right_front_Link1",
+    "right_front_Link2",
+    "right_front_Link3",
+    "right_front_Link4",
+    "right_hind_Link1",
+    "right_hind_Link2",
+    "right_hind_Link3",
+    "right_hind_Link4",
+)
+
+_UMI_MESH_DERIVED_BODY_NAMES = (
+    "umi_l11",
+    "umi_l12",
+    "umi_l61",
+    "umi_l62",
+    "umi_l21",
+    "umi_l22",
+    "umi_l23",
+    "umi_l31",
+    "umi_l32",
+    "umi_l41",
+    "umi_l42",
+    "umi_l51",
+    "umi_l52",
+    "umi_l53",
+)
+
+_P7_VISUAL_MESH_FACE_BUDGETS = {
+    "adapter_plate.STL": 10_000,
+    "p7_v3/base_link.STL": 10_000,
+    "p7_v3/link1.STL": 10_000,
+    "p7_v3/link2.STL": 30_000,
+    "p7_v3/link3.STL": 10_000,
+    "p7_v3/link4.STL": 10_000,
+    "p7_v3/link5.STL": 10_000,
+    "p7_v3/link6.STL": 10_000,
+    "p7_v3/link7.STL": 10_000,
+}
+
+
+def _rounded(values):
+    return np.round(np.asarray(values, dtype=np.float64), 12).tolist()
+
+
+def _object_names(mujoco, model, object_type, count):
+    return [mujoco.mj_id2name(model, object_type, i) for i in range(count)]
+
+
+def _a2arm_xml_root():
+    from unilab.assets import ASSETS_ROOT_PATH
+
+    robot_dir = ASSETS_ROOT_PATH / "robots" / "a2arm"
+    return ET.parse(robot_dir / "a2arm.xml").getroot(), robot_dir
+
+
+def _local_stl_bytes(robot_dir: Path) -> int:
+    return sum(path.stat().st_size for path in (robot_dir / "meshes").rglob("*.STL"))
+
+
+def _binary_stl_face_count(path: Path) -> int:
+    with path.open("rb") as stl:
+        stl.seek(80)
+        count = struct.unpack("<I", stl.read(4))[0]
+    assert path.stat().st_size == 84 + 50 * count, f"expected binary STL: {path}"
+    return count
+
+
+def _a2arm_training_contract_sha256() -> str:
+    import mujoco
+
+    from unilab.assets import ASSETS_ROOT_PATH
+
+    model = mujoco.MjModel.from_xml_path(
+        str(ASSETS_ROOT_PATH / "robots" / "a2arm" / "scene_pos_force.xml")
+    )
+    physical_geom_ids = np.flatnonzero((model.geom_contype != 0) | (model.geom_conaffinity != 0))
+    home = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_KEY, "home")
+    snapshot = {
+        "dimensions": [
+            model.nq,
+            model.nv,
+            model.nu,
+            model.nbody,
+            model.njnt,
+            model.nsite,
+            model.nsensor,
+        ],
+        "names": {
+            "body": _object_names(mujoco, model, mujoco.mjtObj.mjOBJ_BODY, model.nbody),
+            "joint": _object_names(mujoco, model, mujoco.mjtObj.mjOBJ_JOINT, model.njnt),
+            "actuator": _object_names(mujoco, model, mujoco.mjtObj.mjOBJ_ACTUATOR, model.nu),
+            "site": _object_names(mujoco, model, mujoco.mjtObj.mjOBJ_SITE, model.nsite),
+            "sensor": _object_names(mujoco, model, mujoco.mjtObj.mjOBJ_SENSOR, model.nsensor),
+        },
+        "option": {
+            "timestep": model.opt.timestep,
+            "gravity": _rounded(model.opt.gravity),
+            "integrator": int(model.opt.integrator),
+            "solver": int(model.opt.solver),
+            "iterations": model.opt.iterations,
+            "ls_iterations": model.opt.ls_iterations,
+        },
+        "body": {
+            "parentid": model.body_parentid.tolist(),
+            "mass": _rounded(model.body_mass),
+            "ipos": _rounded(model.body_ipos),
+            "iquat": _rounded(model.body_iquat),
+            "inertia": _rounded(model.body_inertia),
+        },
+        "joint": {
+            "type": model.jnt_type.tolist(),
+            "bodyid": model.jnt_bodyid.tolist(),
+            "qposadr": model.jnt_qposadr.tolist(),
+            "dofadr": model.jnt_dofadr.tolist(),
+            "pos": _rounded(model.jnt_pos),
+            "axis": _rounded(model.jnt_axis),
+            "range": _rounded(model.jnt_range),
+        },
+        "dof": {
+            "damping": _rounded(model.dof_damping),
+            "frictionloss": _rounded(model.dof_frictionloss),
+            "armature": _rounded(model.dof_armature),
+        },
+        "actuator": {
+            "trntype": model.actuator_trntype.tolist(),
+            "trnid": model.actuator_trnid.tolist(),
+            "gear": _rounded(model.actuator_gear),
+            "ctrlrange": _rounded(model.actuator_ctrlrange),
+            "forcerange": _rounded(model.actuator_forcerange),
+            "gainprm": _rounded(model.actuator_gainprm),
+            "biasprm": _rounded(model.actuator_biasprm),
+        },
+        "site": {
+            "bodyid": model.site_bodyid.tolist(),
+            "pos": _rounded(model.site_pos),
+            "quat": _rounded(model.site_quat),
+        },
+        "sensor": {
+            "type": model.sensor_type.tolist(),
+            "objtype": model.sensor_objtype.tolist(),
+            "objid": model.sensor_objid.tolist(),
+            "reftype": model.sensor_reftype.tolist(),
+            "refid": model.sensor_refid.tolist(),
+            "adr": model.sensor_adr.tolist(),
+            "dim": model.sensor_dim.tolist(),
+        },
+        "physical_geom": {
+            "names": [
+                mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_GEOM, int(i))
+                for i in physical_geom_ids
+            ],
+            "type": model.geom_type[physical_geom_ids].tolist(),
+            "bodyid": model.geom_bodyid[physical_geom_ids].tolist(),
+            "pos": _rounded(model.geom_pos[physical_geom_ids]),
+            "quat": _rounded(model.geom_quat[physical_geom_ids]),
+            "size": _rounded(model.geom_size[physical_geom_ids]),
+            "contype": model.geom_contype[physical_geom_ids].tolist(),
+            "conaffinity": model.geom_conaffinity[physical_geom_ids].tolist(),
+            "condim": model.geom_condim[physical_geom_ids].tolist(),
+            "priority": model.geom_priority[physical_geom_ids].tolist(),
+            "friction": _rounded(model.geom_friction[physical_geom_ids]),
+            "solref": _rounded(model.geom_solref[physical_geom_ids]),
+            "solimp": _rounded(model.geom_solimp[physical_geom_ids]),
+            "margin": _rounded(model.geom_margin[physical_geom_ids]),
+            "gap": _rounded(model.geom_gap[physical_geom_ids]),
+        },
+        "state": {
+            "qpos0": _rounded(model.qpos0),
+            "key_qpos": _rounded(model.key_qpos[home]),
+            "key_ctrl": _rounded(model.key_ctrl[home]),
+        },
+    }
+    payload = json.dumps(snapshot, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
+def test_a2arm_training_contract_signature():
+    pytest.importorskip("mujoco", reason="mujoco not installed")
+    assert _a2arm_training_contract_sha256() == _A2ARM_TRAINING_CONTRACT_SHA256
+
+
+def test_a2arm_visual_assets_are_reduced_without_runtime_download():
+    root, robot_dir = _a2arm_xml_root()
+    meshes = {mesh.get("name"): mesh.get("file") for mesh in root.findall("./asset/mesh")}
+
+    assert all(meshes[name] == f"../../a2/assets/a2/{name}.STL" for name in _A2_SHARED_MESH_NAMES)
+    assert not any(name.startswith("umi_") for name in meshes)
+    assert not (robot_dir / "meshes" / "umi_gripper_v3").exists()
+    assert _local_stl_bytes(robot_dir) <= 5_600_000
+
+
+def test_a2arm_umi_mesh_derived_inertials_are_explicit():
+    root, _ = _a2arm_xml_root()
+    bodies = {body.get("name"): body for body in root.findall(".//body")}
+
+    assert all(bodies[name].find("inertial") is not None for name in _UMI_MESH_DERIVED_BODY_NAMES)
+
+
+def test_a2arm_visual_mesh_face_budgets():
+    _, robot_dir = _a2arm_xml_root()
+    meshes_dir = robot_dir / "meshes"
+
+    for relative_path, budget in _P7_VISUAL_MESH_FACE_BUDGETS.items():
+        face_count = _binary_stl_face_count(meshes_dir / relative_path)
+        assert face_count <= budget
 
 
 def _skip_if_no_mujoco():
