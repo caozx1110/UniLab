@@ -1,0 +1,54 @@
+# @package _global_
+training:
+  task_name: T800WalkFlat
+  sim_backend: mujoco
+algo:
+  num_envs: 2048
+  max_iterations: 5000
+  empirical_normalization: false
+  obs_groups:
+    actor:
+      - actor
+    critic:
+      - critic
+  policy:
+    actor_hidden_dims: [512, 256, 128]
+    critic_hidden_dims: [512, 256, 128]
+env:
+  scene:
+    model_file: src/unilab/assets/robots/t800/scene_flat.xml
+  sim_dt: 0.002
+  ctrl_dt: 0.01
+  control_config:
+    action_scale: [0.5, 0.2, 0.2, 0.5, 0.5, 0.2, 0.5, 0.2, 0.2, 0.5, 0.5, 0.2, 0.2, 0.2, 0.05, 0.2, 0.05, 0.2, 0.2, 0.05, 0.2, 0.05]
+  curriculum:
+    enabled: false
+  noise_config:
+    level: 1.0
+    scale_joint_angle: 0.01
+    scale_joint_vel: 1.5
+    scale_gyro: 0.2
+reward:
+  scales:
+    tracking_lin_vel: 2.0
+    tracking_ang_vel: 0.2
+    feet_phase: 1.5
+    lin_vel_z: -1.0
+    ang_vel_xy: -0.25
+    base_height: -500.0
+    orientation: -5.0
+    penalty_feet_ori: -10.0
+    action_rate: -0.01
+    pose: -0.1
+  tracking_sigma: 0.25
+  gait_frequency: 1.5
+  feet_phase_swing_height: 0.13
+  feet_phase_tracking_sigma: 0.014
+  base_height_target: 1.0165
+  min_base_height: 0.7165
+  max_tilt_deg: 25.0
+  pose_weights: [0.01, 1.0, 5.0, 0.01, 5.0, 5.0, 0.01, 1.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]
+play_profile:
+  enabled: true
+  env:
+    render_spacing: 2.5

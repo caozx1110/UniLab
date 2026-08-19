@@ -82,7 +82,7 @@ training:
   play_render_mode: auto
   play_env_num: 16
   render_spacing: 1.0
-  play_steps: 200
+  play_steps: 2000
   cam_distance: 6.0
   cam_elevation: -20.0
   cam_azimuth: 90.0
