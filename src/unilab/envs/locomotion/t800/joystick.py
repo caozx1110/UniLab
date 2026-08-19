@@ -17,7 +17,9 @@ from unilab.envs.locomotion.g1.joystick import (
     G1WalkControlConfig,
     G1WalkEnv,
     G1WalkFlatCfg,
+    G1WalkRewardConfig,
 )
+from unilab.utils.rotation import np_quat_apply_inverse, np_yaw_quat
 
 T800_ACTIVE_JOINT_NAMES = (
     "J00_HIP_PITCH_L",
@@ -68,6 +70,21 @@ T800_ACTION_SCALE = (
     0.2,
     0.05,
 )
+
+
+def compute_lateral_feet_penalty(
+    left_foot: np.ndarray,
+    right_foot: np.ndarray,
+    base_quat: np.ndarray,
+    *,
+    min_width: float,
+    sigma: float,
+) -> np.ndarray:
+    """Return a soft lower-bound penalty for signed foot width in the heading frame."""
+    foot_delta_world = np.asarray(left_foot) - np.asarray(right_foot)
+    foot_delta_heading = np_quat_apply_inverse(np_yaw_quat(base_quat), foot_delta_world)
+    width_deficit = np.maximum(float(min_width) - foot_delta_heading[:, 1], 0.0)
+    return np.asarray(1.0 - np.exp(-np.square(width_deficit / float(sigma))))
 
 
 def resolve_required_indices(available: tuple[str, ...], required: tuple[str, ...]) -> np.ndarray:
@@ -124,6 +141,12 @@ class T800WalkControlConfig(G1WalkControlConfig):
     action_scale: list[float] = field(default_factory=lambda: list(T800_ACTION_SCALE))  # type: ignore[assignment]
 
 
+@dataclass
+class T800WalkRewardConfig(G1WalkRewardConfig):
+    close_feet_lateral_threshold: float = 0.20
+    close_feet_lateral_sigma: float = 0.04
+
+
 class T800WalkEnv(G1WalkEnv):
     """Expose 22 policy joints over the complete 25-actuator T800 model."""
 
@@ -145,6 +168,22 @@ class T800WalkEnv(G1WalkEnv):
         resolve_robot_asset_dir("robots/t800/assets", marker="LINK_BASE.obj")
         resolve_robot_asset_dir("robots/t800/textures", marker="LINK_BASE.png")
         super().__init__(cfg, num_envs=num_envs, backend_type=backend_type)
+
+    def _init_reward_functions(self) -> None:
+        super()._init_reward_functions()
+        self._reward_fns["penalty_close_feet_lateral"] = self._reward_close_feet_lateral
+
+    def _reward_close_feet_lateral(self, ctx: object) -> np.ndarray:
+        del ctx
+        left_foot = self._backend.get_sensor_data("left_foot_pos")
+        right_foot = self._backend.get_sensor_data("right_foot_pos")
+        return compute_lateral_feet_penalty(
+            left_foot,
+            right_foot,
+            self._backend.get_base_quat(),
+            min_width=self._reward_cfg.close_feet_lateral_threshold,
+            sigma=self._reward_cfg.close_feet_lateral_sigma,
+        )
 
     def _init_action_space(self) -> None:
         self._active_actuator_indices = resolve_required_indices(
@@ -233,6 +272,7 @@ class T800WalkEnv(G1WalkEnv):
 @registry.envcfg("T800WalkFlat")
 @dataclass
 class T800WalkFlatCfg(G1WalkFlatCfg):
+    reward_config: T800WalkRewardConfig | None = None
     scene: SceneCfg = field(
         default_factory=lambda: SceneCfg(
             model_file=str(ASSETS_ROOT_PATH / "robots" / "t800" / "scene_flat.xml")
@@ -243,6 +283,15 @@ class T800WalkFlatCfg(G1WalkFlatCfg):
     control_config: T800WalkControlConfig = field(default_factory=T800WalkControlConfig)  # type: ignore[assignment]
     sim_dt: float = 0.002
     ctrl_dt: float = 0.01
+
+    def validate(self) -> None:
+        super().validate()
+        if self.reward_config is None:
+            return
+        if self.reward_config.close_feet_lateral_threshold < 0.0:
+            raise ValueError("close_feet_lateral_threshold must be non-negative")
+        if self.reward_config.close_feet_lateral_sigma <= 0.0:
+            raise ValueError("close_feet_lateral_sigma must be positive")
 
 
 registry.register_env("T800WalkFlat", T800WalkEnv, sim_backend="mujoco")

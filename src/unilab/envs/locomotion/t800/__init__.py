@@ -5,6 +5,7 @@ from .joystick import (
     T800WalkControlConfig,
     T800WalkEnv,
     T800WalkFlatCfg,
+    T800WalkRewardConfig,
 )
 
 __all__ = [
@@ -12,4 +13,5 @@ __all__ = [
     "T800WalkControlConfig",
     "T800WalkEnv",
     "T800WalkFlatCfg",
+    "T800WalkRewardConfig",
 ]
