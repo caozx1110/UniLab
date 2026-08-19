@@ -82,33 +82,45 @@ Alternatively, pre-download into the in-repo directory with `--local-dir`
 
 3. Reference the new file path in the env config.
 
-## Robot Mesh Assets
+## Robot Binary Assets
 
-Robot binary meshes (`.STL`) are externalized the same way, on the Hugging Face
-dataset repo
+Robot binary meshes and textures (for example `.STL`, `.obj`, and `.png`) are
+externalized the same way, on the Hugging Face dataset repo
 [unilabsim/unilab-robots](https://huggingface.co/datasets/unilabsim/unilab-robots).
 X2 meshes download lazily on first use and land under their original path
-`src/unilab/assets/robots/x2/meshes/`, so the XML `meshdir` references resolve
-unchanged. Pre-fetch them without running a task:
+`src/unilab/assets/robots/x2/meshes/`. T800 OBJ files and textures land under
+`robots/t800/assets/` and `robots/t800/textures/`, respectively, so the original
+relative XML paths remain valid. Pre-fetch them without running a task:
 
 ```bash
 uv run unilab-pull-assets --robot x2
+uv run unilab-pull-assets --robot t800
 ```
 
-To add a new robot's meshes:
+To add a new robot's binary assets:
 
-1. Upload to the HF repo, keeping the directory layout identical:
+1. Upload each directory to the HF repo while keeping the directory layout
+   identical. A robot with multiple asset directories requires one upload per
+   directory. For example, T800 uses:
 
    ```bash
-   huggingface-cli upload unilabsim/unilab-robots \
-     src/unilab/assets/robots/<robot>/meshes robots/<robot>/meshes \
+   uv run hf upload unilabsim/unilab-robots \
+     src/unilab/assets/robots/t800/assets robots/t800/assets \
+     --repo-type dataset
+   uv run hf upload unilabsim/unilab-robots \
+     src/unilab/assets/robots/t800/textures robots/t800/textures \
      --repo-type dataset
    ```
 
-2. Ignore the local `*.STL` in `.gitignore` (keep a `.gitkeep` so the directory
-   persists).
-3. Resolve the directory once on a cold path from the env, e.g.
-   `resolve_robot_asset_dir("robots/<robot>/meshes", marker="<some>.STL")`.
+2. Ignore the downloaded directory contents in `.gitignore` and keep a
+   `.gitkeep` so each directory persists.
+3. Resolve each directory from the env's `__init__` cold path before the backend
+   parses the XML. The current API resolves one directory per call, so T800 uses:
+
+   ```python
+   resolve_robot_asset_dir("robots/t800/assets", marker="LINK_BASE.obj")
+   resolve_robot_asset_dir("robots/t800/textures", marker="LINK_BASE.png")
+   ```
 
 ## Architecture Notes
 
@@ -120,7 +132,9 @@ To add a new robot's meshes:
 - Hot paths (`step` / `reset`) never trigger any file download or parsing.
 - `ASSETS_ROOT_PATH` is unchanged, so the download target matches the
   original local path exactly.
-- Robot meshes use the same directory resolver (`resolve_robot_asset_dir`),
-  integrated at `X2WallFlipTrackingEnv.__init__` in
-  `src/unilab/envs/motion_tracking/x2/flip_tracking.py`, and exposed as the
-  `unilab-pull-assets` CLI.
+- Robot binary assets use the same directory resolver
+  (`resolve_robot_asset_dir`). X2 integrates it at
+  `X2WallFlipTrackingEnv.__init__` in
+  `src/unilab/envs/motion_tracking/x2/flip_tracking.py`; T800 integrates it at
+  `T800WalkEnv.__init__` in `src/unilab/envs/locomotion/t800/joystick.py`.
+  Both are exposed through the `unilab-pull-assets` CLI.

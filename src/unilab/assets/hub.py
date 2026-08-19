@@ -270,18 +270,18 @@ def resolve_scene_dir(directory: str, *, marker: str = "teaser.xml") -> Path:
 
 
 def resolve_robot_asset_dir(directory: str, *, marker: str) -> Path:
-    """Ensure a robot asset directory (e.g. meshes) exists locally.
+    """Ensure a robot binary-asset directory exists locally.
 
-    Robot binary assets (STL meshes) are hosted on Hugging Face rather than
-    committed to git. They are downloaded on first use and placed under their
-    original path beneath ``ASSETS_ROOT_PATH`` so that XML ``meshdir``
-    references resolve unchanged — no files need to be moved by hand.
+    Robot binary assets (meshes and textures) are hosted on Hugging Face rather
+    than committed to git. They are downloaded on first use and placed under
+    their original path beneath ``ASSETS_ROOT_PATH`` so that XML file references
+    resolve unchanged — no files need to be moved by hand.
 
     Args:
         directory: ``ASSETS_ROOT_PATH``-relative directory path
-            (e.g. ``"robots/x2/meshes"``).
+            (e.g. ``"robots/x2/meshes"`` or ``"robots/t800/textures"``).
         marker: A file inside the directory used to check completeness
-            (e.g. ``"pelvis.STL"``).
+            (e.g. ``"pelvis.STL"`` or ``"LINK_BASE.png"``).
 
     Returns:
         Absolute ``Path`` to the resolved directory.
