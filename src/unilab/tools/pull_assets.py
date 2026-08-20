@@ -22,6 +22,7 @@ from unilab.assets.hub import resolve_robot_asset_dir
 # robot name -> (ASSETS_ROOT_PATH-relative dir, completeness marker file)
 _ROBOT_ASSETS: dict[str, tuple[str, str]] = {
     "x2": ("robots/x2/meshes", "pelvis.STL"),
+    "a2arm": ("robots/a2arm/meshes", "adapter_plate.STL"),
 }
 
 
@@ -42,7 +43,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     directory, marker = _ROBOT_ASSETS[args.robot]
     target = resolve_robot_asset_dir(directory, marker=marker)
-    count = len(list(target.glob("*.STL")))
+    count = len(list(target.rglob("*.STL")))
     print(f"{args.robot} meshes ready at {target} ({count} STL files)")
     return 0
 

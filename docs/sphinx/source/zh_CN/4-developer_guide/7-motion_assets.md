@@ -86,6 +86,16 @@ X2 网格在首次使用时按需下载，落盘到原始路径 `src/unilab/asse
 uv run unilab-pull-assets --robot x2
 ```
 
+A2Arm 的 P7v3 机械臂和 adapter 网格也采用同一机制，落盘到
+`src/unilab/assets/robots/a2arm/meshes/`，可以提前下载：
+
+```bash
+uv run unilab-pull-assets --robot a2arm
+```
+
+A2Arm XML 通过 `../../a2/assets/a2/` 复用的 A2 底盘网格已经在 Git 中，
+不会重复上传；只有本 PR 新增的 P7v3/adapter 网格托管在 HF。
+
 新增某个机器人的网格：
 
 1. 上传到 HF 仓库，保持目录结构一致：
@@ -100,6 +110,15 @@ uv run unilab-pull-assets --robot x2
 3. 在 env 的冷路径上调用一次目录 resolver，例如
    `resolve_robot_asset_dir("robots/<robot>/meshes", marker="<某>.STL")`。
 
+A2Arm 的上传示例：
+
+```bash
+uv run hf upload unilabsim/unilab-robots \
+  src/unilab/assets/robots/a2arm/meshes \
+  robots/a2arm/meshes \
+  --repo-type dataset
+```
+
 ## 架构说明
 
 - 资产解析模块：`src/unilab/assets/hub.py`（`resolve_motion_files`）。
@@ -109,4 +128,6 @@ uv run unilab-pull-assets --robot x2
 - `ASSETS_ROOT_PATH` 定义不变，下载落盘位置与原始本地路径完全一致。
 - 机器人网格使用同一目录 resolver（`resolve_robot_asset_dir`），集成点为
   `src/unilab/envs/motion_tracking/x2/flip_tracking.py` 中的
-  `X2WallFlipTrackingEnv.__init__`，并通过 `unilab-pull-assets` CLI 暴露。
+  `X2WallFlipTrackingEnv.__init__`，A2Arm 集成点为
+  `src/unilab/envs/locomotion/a2arm/pos_force.py` 中的
+  `A2ArmPosForceEnv.__init__`，并通过 `unilab-pull-assets` CLI 暴露。

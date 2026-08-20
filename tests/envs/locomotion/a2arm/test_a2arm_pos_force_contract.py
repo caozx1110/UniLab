@@ -16,9 +16,12 @@ import json
 import struct
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
+
+from unilab.envs.locomotion.a2arm import pos_force as a2arm_pos_force
 
 _A2ARM_TRAINING_CONTRACT_SHA256 = "5327b8883e690ce7e39b96f7b9315d5125fb84528c81c86778ae2ae99a474e08"
 
@@ -85,6 +88,13 @@ def _a2arm_xml_root():
 
     robot_dir = ASSETS_ROOT_PATH / "robots" / "a2arm"
     return ET.parse(robot_dir / "a2arm.xml").getroot(), robot_dir
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _resolve_a2arm_binary_assets() -> None:
+    from unilab.assets.hub import resolve_robot_asset_dir
+
+    resolve_robot_asset_dir("robots/a2arm/meshes", marker="adapter_plate.STL")
 
 
 def _local_stl_bytes(robot_dir: Path) -> int:
@@ -456,3 +466,37 @@ def test_a2arm_set_base_lin_vel_write_through():
 
     with pytest.raises(ValueError):
         env._backend.set_base_lin_vel(np.zeros((2, 2), dtype=np.float64))
+
+
+def test_a2arm_env_resolves_meshes_before_backend_init(monkeypatch: pytest.MonkeyPatch):
+    events: list[tuple[object, ...]] = []
+
+    def fake_resolver(directory: str, *, marker: str) -> None:
+        events.append(("resolve", directory, marker))
+
+    def fake_backend(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        events.append(("backend",))
+        raise RuntimeError("stop after backend ownership check")
+
+    monkeypatch.setattr("unilab.assets.hub.resolve_robot_asset_dir", fake_resolver)
+    monkeypatch.setattr(a2arm_pos_force, "create_backend", fake_backend)
+
+    cfg = SimpleNamespace(
+        reward_config=object(),
+        scene=None,
+        model_file="scene_pos_force.xml",
+        sim_dt=0.005,
+        asset=SimpleNamespace(base_name="base_link"),
+        domain_rand=SimpleNamespace(push_body_name=None),
+        post_step_forward_sensor=False,
+        chunk_size=1,
+        adaptive_chunk_size=False,
+    )
+    with pytest.raises(RuntimeError, match="backend ownership check"):
+        a2arm_pos_force.A2ArmPosForceEnv(cfg, num_envs=1, backend_type="mujoco")
+
+    assert events == [
+        ("resolve", "robots/a2arm/meshes", "adapter_plate.STL"),
+        ("backend",),
+    ]

@@ -95,6 +95,17 @@ unchanged. Pre-fetch them without running a task:
 uv run unilab-pull-assets --robot x2
 ```
 
+A2Arm P7v3 and adapter meshes use the same mechanism and land under
+`src/unilab/assets/robots/a2arm/meshes/`:
+
+```bash
+uv run unilab-pull-assets --robot a2arm
+```
+
+The A2 chassis meshes referenced through `../../a2/assets/a2/` are existing
+Git-managed shared assets and are not uploaded again; only the P7v3/adapter
+meshes introduced by this PR are hosted on HF.
+
 To add a new robot's meshes:
 
 1. Upload to the HF repo, keeping the directory layout identical:
@@ -110,6 +121,15 @@ To add a new robot's meshes:
 3. Resolve the directory once on a cold path from the env, e.g.
    `resolve_robot_asset_dir("robots/<robot>/meshes", marker="<some>.STL")`.
 
+A2Arm upload example:
+
+```bash
+uv run hf upload unilabsim/unilab-robots \
+  src/unilab/assets/robots/a2arm/meshes \
+  robots/a2arm/meshes \
+  --repo-type dataset
+```
+
 ## Architecture Notes
 
 - Asset resolver module: `src/unilab/assets/hub.py`
@@ -122,5 +142,7 @@ To add a new robot's meshes:
   original local path exactly.
 - Robot meshes use the same directory resolver (`resolve_robot_asset_dir`),
   integrated at `X2WallFlipTrackingEnv.__init__` in
-  `src/unilab/envs/motion_tracking/x2/flip_tracking.py`, and exposed as the
-  `unilab-pull-assets` CLI.
+  `src/unilab/envs/motion_tracking/x2/flip_tracking.py`; A2Arm integrates it at
+  `A2ArmPosForceEnv.__init__` in
+  `src/unilab/envs/locomotion/a2arm/pos_force.py`. Both are exposed through
+  the `unilab-pull-assets` CLI.

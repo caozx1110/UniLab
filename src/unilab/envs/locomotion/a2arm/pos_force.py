@@ -650,6 +650,12 @@ class A2ArmPosForceEnv(A2ArmBaseEnv):
         if backend_type != "mujoco":
             raise ValueError(f"A2ArmPosForce currently supports only mujoco, got {backend_type!r}")
 
+        # A2Arm P7v3/adapter meshes are hosted on Hugging Face. Resolve them on
+        # this cold initialization path before MuJoCo parses the scene XML.
+        from unilab.assets.hub import resolve_robot_asset_dir
+
+        resolve_robot_asset_dir("robots/a2arm/meshes", marker="adapter_plate.STL")
+
         scene = cfg.scene if cfg.scene is not None else SceneCfg(model_file=cfg.model_file)
         backend = create_backend(
             backend_type,
