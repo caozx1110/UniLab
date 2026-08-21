@@ -45,8 +45,8 @@ reward:
     penalty_ang_vel_xy: -1.0
     penalty_orientation: -10.0
     penalty_action_rate: -4.0
-    pose: -0.8
-    penalty_feet_ori: -25.0
+    pose: -0.5
+    penalty_feet_ori: -20.0
     penalty_close_feet_lateral: -5.0
     feet_phase: 5.0
     alive: 10.0
@@ -59,4 +59,4 @@ reward:
   feet_phase_tracking_sigma: 0.014
   close_feet_lateral_threshold: 0.18
   close_feet_lateral_sigma: 0.04
-  pose_weights: [0.01, 1.0, 5.0, 0.01, 5.0, 5.0, 0.01, 1.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]
+  pose_weights: [0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 0.01, 2.0, 5.0, 0.01, 5.0, 5.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0, 50.0]
