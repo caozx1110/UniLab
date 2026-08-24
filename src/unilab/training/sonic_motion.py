@@ -302,32 +302,31 @@ def _validate_frame_axis(array: Any, name: str, frames: int | None) -> int:
     return count
 
 
-def _target_frame_count(num_frames: int, source_fps: float, target_fps: float) -> int:
-    if num_frames <= 1:
-        return num_frames
-    import math
+def _upstream_target_times(num_frames: int, source_fps: float, target_fps: float) -> Any:
+    import torch
 
-    duration = (num_frames - 1) / source_fps
-    # Match SONIC's exclusive-end ``torch.arange`` grid when interpolation is
-    # needed; equal-rate sources keep their original samples in the callers.
-    scaled_duration = duration * target_fps
-    tolerance = 1.0e-12 * max(1.0, abs(scaled_duration))
-    return max(1, int(math.ceil(scaled_duration - tolerance)))
+    duration = (num_frames - 1) * (1 / source_fps)
+    return torch.arange(0, duration, 1 / target_fps, dtype=torch.float32)
 
 
 def _resample_linear(array: Any, source_fps: float, target_fps: float) -> Any:
     import numpy as np
+    import torch
 
     if array.shape[0] <= 1 or abs(source_fps - target_fps) < 1e-9:
         return np.asarray(array, dtype=np.float32).copy()
-    target_count = _target_frame_count(array.shape[0], source_fps, target_fps)
-    source_times = np.arange(array.shape[0], dtype=np.float64) / source_fps
-    target_times = np.arange(target_count, dtype=np.float64) / target_fps
-    flat = np.asarray(array, dtype=np.float64).reshape(array.shape[0], -1)
-    result = np.empty((target_count, flat.shape[1]), dtype=np.float64)
-    for column in range(flat.shape[1]):
-        result[:, column] = np.interp(target_times, source_times, flat[:, column])
-    return result.reshape((target_count, *array.shape[1:])).astype(np.float32)
+    values = torch.as_tensor(np.asarray(array, dtype=np.float32), dtype=torch.float32)
+    times = _upstream_target_times(array.shape[0], source_fps, target_fps)
+    duration = (array.shape[0] - 1) * (1 / source_fps)
+    phase = times / duration
+    frame_position = phase * (array.shape[0] - 1)
+    index_0 = frame_position.floor().long()
+    index_1 = torch.minimum(index_0 + 1, torch.tensor(array.shape[0] - 1, dtype=torch.long))
+    blend = frame_position - index_0.float()
+    blend_shape = (blend.shape[0],) + (1,) * (values.ndim - 1)
+    blend = blend.reshape(blend_shape)
+    result = (1 - blend) * values[index_0] + blend * values[index_1]
+    return result.numpy().astype(np.float32, copy=True)
 
 
 def _normalize_quaternions(array: Any) -> Any:
@@ -342,47 +341,35 @@ def _normalize_quaternions(array: Any) -> Any:
 
 def _resample_quaternion(array: Any, source_fps: float, target_fps: float) -> Any:
     import numpy as np
+    import torch
 
-    values = _normalize_quaternions(array).astype(np.float64)
+    values = torch.as_tensor(np.asarray(array, dtype=np.float32), dtype=torch.float32)
+    norm = torch.linalg.vector_norm(values, dim=-1, keepdim=True)
+    if bool(torch.any(norm <= 1e-8)):
+        raise MotionManifestError("quaternion field contains a zero-norm quaternion")
+    values = values / norm
     if values.shape[0] <= 1 or abs(source_fps - target_fps) < 1e-9:
-        return values.astype(np.float32)
-    target_count = _target_frame_count(values.shape[0], source_fps, target_fps)
-    source_times = np.arange(values.shape[0], dtype=np.float64) / source_fps
-    target_times = np.arange(target_count, dtype=np.float64) / target_fps
+        return values.numpy().astype(np.float32, copy=True)
+    times = _upstream_target_times(values.shape[0], source_fps, target_fps)
+    duration = (values.shape[0] - 1) * (1 / source_fps)
+    phase = times / duration
+    frame_position = phase * (values.shape[0] - 1)
+    index_0 = frame_position.floor().long()
+    index_1 = torch.minimum(index_0 + 1, torch.tensor(values.shape[0] - 1, dtype=torch.long))
+    blend = frame_position - index_0.float()
     flat = values.reshape(values.shape[0], -1, 4)
-    # Unwrap cumulatively: comparing with the original predecessor leaves
-    # alternating antipodal inputs discontinuous.
-    flat = flat.copy()
-    for source_index in range(1, flat.shape[0]):
-        dots = np.sum(flat[source_index] * flat[source_index - 1], axis=-1)
-        flat[source_index] = np.where(
-            dots[..., None] < 0.0,
-            -flat[source_index],
-            flat[source_index],
-        )
-    result = np.empty((target_count, flat.shape[1], 4), dtype=np.float64)
-    for target_index, time_value in enumerate(target_times):
-        right = int(np.searchsorted(source_times, time_value, side="right"))
-        if right <= 0:
-            result[target_index] = flat[0]
-            continue
-        if right >= len(source_times):
-            result[target_index] = flat[-1]
-            continue
-        left = right - 1
-        span = source_times[right] - source_times[left]
-        blend = 0.0 if span <= 0 else float((time_value - source_times[left]) / span)
-        qa, qb = flat[left], flat[right]
-        dot = np.clip(np.sum(qa * qb, axis=-1, keepdims=True), -1.0, 1.0)
-        theta = np.arccos(dot)
-        sin_theta = np.sin(theta)
-        linear = np.abs(sin_theta) < 1e-7
-        w0 = np.sin((1.0 - blend) * theta) / np.where(linear, 1.0, sin_theta)
-        w1 = np.sin(blend * theta) / np.where(linear, 1.0, sin_theta)
-        interpolated = w0 * qa + w1 * qb
-        interpolated = np.where(linear, (1.0 - blend) * qa + blend * qb, interpolated)
-        result[target_index] = interpolated
-    return _normalize_quaternions(result.reshape((target_count, *array.shape[1:])))
+    qa, qb = flat[index_0], flat[index_1]
+    dot = (qa * qb).sum(dim=-1)
+    qb = torch.where((dot < 0).unsqueeze(-1), -qb, qb)
+    cosine = dot.abs().unsqueeze(-1)
+    sine = torch.sqrt(1.0 - cosine * cosine)
+    blend = blend[:, None, None]
+    result = torch.sin((1 - blend) * torch.acos(cosine)) / sine * qa
+    result += torch.sin(blend * torch.acos(cosine)) / sine * qb
+    result = torch.where(sine.abs() < 0.001, 0.5 * qa + 0.5 * qb, result)
+    result = torch.where(cosine.abs() >= 1, qa, result)
+    result = result / torch.linalg.vector_norm(result, dim=-1, keepdim=True)
+    return result.numpy().reshape((len(times), *array.shape[1:])).astype(np.float32, copy=True)
 
 
 def _finite_difference(array: Any, dt: float) -> Any:
@@ -466,18 +453,6 @@ def _axis_angle_to_quaternion_wxyz(axis_angle: Any) -> Any:
     )
     quat = np.concatenate((np.cos(half), values * scale), axis=-1)
     return _normalize_quaternions(quat)
-
-
-def _quaternion_to_axis_angle_wxyz(quaternion: Any) -> Any:
-    import numpy as np
-
-    values = _normalize_quaternions(quaternion).astype(np.float64)
-    values = np.where(values[..., :1] < 0.0, -values, values)
-    vector = values[..., 1:]
-    vector_norm = np.linalg.norm(vector, axis=-1, keepdims=True)
-    angle = 2.0 * np.arctan2(vector_norm, np.clip(values[..., :1], 0.0, None))
-    scale = np.divide(angle, vector_norm, out=np.full_like(angle, 2.0), where=vector_norm > 1e-8)
-    return np.asarray(vector * scale, dtype=np.float32)
 
 
 def _derive_smpl_root_quaternion(
@@ -897,9 +872,8 @@ def normalize_sonic_motion(
     # Optional SMPL signals are preserved under canonical names.  Flattened
     # ``(T,72)`` joints are expanded to ``(T,24,3)`` for the SONIC encoder.
     smpl_root_pair = resolved.get("smpl_root_quat_w")
-    smpl_pose_pair = resolved.get("smpl_pose")
     smpl_root_quat = None
-    if smpl_root_pair is not None:
+    if smpl_root_pair is not None and resolved.get("smpl_pose") is None:
         smpl_root_quat = np.asarray(smpl_root_pair[0], dtype=np.float32)
         if smpl_root_quat.ndim != 2 or smpl_root_quat.shape[1] != 4:
             raise MotionManifestError("smpl_root_quat_w must have shape (T,4)")
@@ -907,13 +881,8 @@ def normalize_sonic_motion(
         if str(raw_smpl_order).lower() == "xyzw":
             smpl_root_quat = smpl_root_quat[..., [3, 0, 1, 2]]
         smpl_root_quat = _normalize_quaternions(smpl_root_quat)
-    elif smpl_pose_pair is not None:
-        smpl_root_quat = _derive_smpl_root_quaternion(
-            smpl_pose_pair[0],
-            smpl_y_up=smpl_y_up,
-        )
-    if smpl_root_quat is not None and abs(source_rate - target_rate) > 1e-9:
-        smpl_root_quat = _resample_quaternion(smpl_root_quat, source_rate, target_rate)
+        if abs(source_rate - target_rate) > 1e-9:
+            smpl_root_quat = _resample_quaternion(smpl_root_quat, source_rate, target_rate)
 
     for canonical in ("smpl_joints", "smpl_pose", "smpl_transl"):
         pair = resolved.get(canonical)
@@ -922,6 +891,11 @@ def normalize_sonic_motion(
         value = np.asarray(pair[0], dtype=np.float32)
         if value.shape[0] != frame_count:
             raise MotionManifestError(f"{canonical} frame count does not match robot fields")
+        if canonical == "smpl_pose":
+            if value.ndim != 2 or value.shape[1] % 3 != 0:
+                raise MotionManifestError("smpl_pose must have shape (T,J*3)")
+            value = value.copy()
+            value[:, -6:] = 0.0
         if canonical == "smpl_joints" and value.ndim == 2:
             if value.shape[1] % 3 != 0:
                 raise MotionManifestError("flattened smpl_joints must have a multiple-of-3 width")
@@ -929,6 +903,10 @@ def normalize_sonic_motion(
         if abs(source_rate - target_rate) > 1e-9:
             value = _resample_linear(value, source_rate, target_rate)
         output[canonical] = value
+    # SONIC derives root orientation from the target-grid pose.  Keep an
+    # explicit quaternion only as the fallback for sources without pose_aa.
+    if "smpl_pose" in output:
+        smpl_root_quat = _derive_smpl_root_quaternion(output["smpl_pose"], smpl_y_up=smpl_y_up)
     if smpl_root_quat is not None:
         output["smpl_root_quat_w"] = np.asarray(smpl_root_quat, dtype=np.float32)
 
@@ -1738,17 +1716,14 @@ def _normalize_paired_smpl_fields(
     import numpy as np
 
     result: dict[str, Any] = {}
-    smpl_pose = fields.get("smpl_pose")
     smpl_root_quat = fields.get("smpl_root_quat_w")
-    if smpl_root_quat is not None:
+    if smpl_root_quat is not None and fields.get("smpl_pose") is None:
         smpl_root_quat = np.asarray(smpl_root_quat, dtype=np.float32)
         if smpl_root_quat.ndim != 2 or smpl_root_quat.shape[1] != 4:
             raise MotionManifestError("smpl_root_quat_w must have shape (T,4)")
         smpl_root_quat = _normalize_quaternions(smpl_root_quat)
-    elif smpl_pose is not None:
-        smpl_root_quat = _derive_smpl_root_quaternion(smpl_pose, smpl_y_up=smpl_y_up)
-    if smpl_root_quat is not None and abs(source_fps - target_fps) > 1.0e-9:
-        smpl_root_quat = _resample_quaternion(smpl_root_quat, source_fps, target_fps)
+        if abs(source_fps - target_fps) > 1.0e-9:
+            smpl_root_quat = _resample_quaternion(smpl_root_quat, source_fps, target_fps)
 
     for canonical in ("smpl_joints", "smpl_pose", "smpl_transl"):
         value = fields.get(canonical)
@@ -1757,22 +1732,22 @@ def _normalize_paired_smpl_fields(
         value = np.asarray(value, dtype=np.float32)
         if canonical == "smpl_pose" and (value.ndim != 2 or value.shape[1] % 3 != 0):
             raise MotionManifestError("smpl_pose must have shape (T,J*3)")
+        if canonical == "smpl_pose":
+            value = value.copy()
+            value[:, -6:] = 0.0
         if canonical == "smpl_joints" and value.ndim == 2:
             if value.shape[1] % 3 != 0:
                 raise MotionManifestError("flattened smpl_joints must have a multiple-of-3 width")
             value = value.reshape(value.shape[0], value.shape[1] // 3, 3)
         if abs(source_fps - target_fps) > 1.0e-9:
-            if canonical == "smpl_pose":
-                pose_shape = value.shape
-                pose_quat = _axis_angle_to_quaternion_wxyz(value.reshape(value.shape[0], -1, 3))
-                value = _quaternion_to_axis_angle_wxyz(
-                    _resample_quaternion(pose_quat, source_fps, target_fps)
-                ).reshape((-1, *pose_shape[1:]))
-            else:
-                value = _resample_linear(value, source_fps, target_fps)
+            value = _resample_linear(value, source_fps, target_fps)
         else:
             value = value.copy()
         result[canonical] = value
+    # The upstream policy observes the root derived from its resampled pose,
+    # even if a source happens to carry a separate quaternion field.
+    if "smpl_pose" in result:
+        smpl_root_quat = _derive_smpl_root_quaternion(result["smpl_pose"], smpl_y_up=smpl_y_up)
     if smpl_root_quat is not None:
         result["smpl_root_quat_w"] = np.asarray(smpl_root_quat, dtype=np.float32)
     return result
