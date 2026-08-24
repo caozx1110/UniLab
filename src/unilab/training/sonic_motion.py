@@ -13,6 +13,8 @@ import os
 import pickle
 import re
 import shutil
+import tempfile
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path, PureWindowsPath
 from typing import Any, Mapping, Sequence
@@ -152,6 +154,7 @@ _MOTION_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 _FPS_ALIASES = ("fps", "frame_rate", "sample_rate", "sampling_rate", "motion_fps")
+_PAIR_SOURCE_SUFFIXES = frozenset({".pkl", ".pickle", ".joblib"})
 
 
 def _scalar_number(value: Any, location: str) -> float:
@@ -1612,6 +1615,342 @@ def materialize_motion_store(
     )
 
 
+def _index_paired_source_root(root: str | Path, *, label: str) -> dict[str, Path]:
+    source_root = Path(root).expanduser().resolve()
+    if not source_root.is_dir():
+        raise MotionManifestError(f"{label} source root is not a directory: {source_root}")
+    paths_by_key: dict[str, list[Path]] = {}
+    for path in source_root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in _PAIR_SOURCE_SUFFIXES:
+            continue
+        if path.stem == "metadata":
+            continue
+        paths_by_key.setdefault(path.stem, []).append(path.resolve())
+    duplicates = {key: sorted(paths) for key, paths in paths_by_key.items() if len(paths) > 1}
+    if duplicates:
+        summary = "; ".join(
+            f"{key}={','.join(str(path) for path in paths)}"
+            for key, paths in sorted(duplicates.items())
+        )
+        raise MotionManifestError(f"duplicate {label} basename(s): {summary}")
+    if not paths_by_key:
+        suffixes = ", ".join(sorted(_PAIR_SOURCE_SUFFIXES))
+        raise MotionManifestError(
+            f"{label} source root has no supported motion files ({suffixes}): {source_root}"
+        )
+    return {key: paths[0] for key, paths in paths_by_key.items()}
+
+
+def _summarize_keys(keys: Sequence[str], *, limit: int = 8) -> str:
+    ordered = sorted(keys)
+    suffix = f", ... (+{len(ordered) - limit})" if len(ordered) > limit else ""
+    return ", ".join(ordered[:limit]) + suffix
+
+
+def _paired_source_fps(
+    source: Mapping[str, Any],
+    *,
+    pair_key: str,
+    label: str,
+    fallback: int | float | None,
+) -> float:
+    values = [
+        (name, _scalar_number(source[name], f"pair {pair_key!r} {label}.{name}"))
+        for name in _FPS_ALIASES
+        if name in source and source[name] is not None
+    ]
+    if not values:
+        if fallback is None:
+            raise MotionManifestError(
+                f"pair {pair_key!r} {label} source has no fps metadata; pass source_fps"
+            )
+        return _scalar_number(fallback, "source_fps")
+    first_name, first_value = values[0]
+    for name, value in values[1:]:
+        if abs(value - first_value) > 1.0e-9:
+            raise MotionManifestError(
+                f"pair {pair_key!r} {label} fps aliases disagree: "
+                f"{first_name}={first_value:g}, {name}={value:g}"
+            )
+    return first_value
+
+
+def _unique_paired_field(
+    source: Mapping[str, Any],
+    *,
+    pair_key: str,
+    canonical: str,
+    aliases: Sequence[str],
+) -> Any | None:
+    names = tuple(dict.fromkeys((canonical, *aliases)))
+    present = [name for name in names if name in source and source[name] is not None]
+    if len(present) > 1:
+        raise MotionManifestError(
+            f"pair {pair_key!r} SMPL field {canonical!r} is ambiguous: {present}"
+        )
+    if not present:
+        return None
+    return _as_array(source[present[0]], f"pair {pair_key!r} SMPL.{present[0]}")
+
+
+def _merge_paired_motion_source(
+    robot_path: Path,
+    smpl_path: Path,
+    *,
+    pair_key: str,
+    source_fps: int | float | None,
+) -> tuple[dict[str, Any], float]:
+    try:
+        robot = _unwrap_motion_sequence(_load_motion_source(robot_path))
+    except MotionManifestError as exc:
+        raise MotionManifestError(f"pair {pair_key!r} robot source is invalid: {exc}") from exc
+    try:
+        smpl = _unwrap_motion_sequence(_load_motion_source(smpl_path))
+    except MotionManifestError as exc:
+        raise MotionManifestError(f"pair {pair_key!r} SMPL source is invalid: {exc}") from exc
+
+    robot_rate = _paired_source_fps(robot, pair_key=pair_key, label="robot", fallback=source_fps)
+    smpl_rate = _paired_source_fps(smpl, pair_key=pair_key, label="SMPL", fallback=source_fps)
+    if abs(robot_rate - smpl_rate) > 1.0e-9:
+        raise MotionManifestError(
+            f"pair {pair_key!r} fps mismatch: robot={robot_rate:g}, SMPL={smpl_rate:g}"
+        )
+
+    robot_joint_pos, robot_joint_name = _resolve_motion_field(robot, "joint_pos", None)
+    if robot_joint_pos is None or robot_joint_name is None:
+        raise MotionManifestError(f"pair {pair_key!r} robot source has no joint_pos/dof field")
+    robot_frames = _validate_frame_axis(
+        _as_array(robot_joint_pos, robot_joint_name), robot_joint_name, None
+    )
+    smpl_aliases = {
+        "smpl_joints": _MOTION_FIELD_ALIASES["smpl_joints"],
+        "smpl_pose": (*_MOTION_FIELD_ALIASES["smpl_pose"], "pose_aa"),
+        "smpl_transl": (*_MOTION_FIELD_ALIASES["smpl_transl"], "transl"),
+        "smpl_root_quat_w": _MOTION_FIELD_ALIASES["smpl_root_quat_w"],
+    }
+    smpl_fields = {
+        name: value
+        for name, aliases in smpl_aliases.items()
+        if (value := _unique_paired_field(smpl, pair_key=pair_key, canonical=name, aliases=aliases))
+        is not None
+    }
+    if "smpl_joints" not in smpl_fields:
+        raise MotionManifestError(f"pair {pair_key!r} SMPL source has no smpl_joints field")
+    if "smpl_pose" not in smpl_fields and "smpl_root_quat_w" not in smpl_fields:
+        raise MotionManifestError(
+            f"pair {pair_key!r} SMPL source needs pose_aa/smpl_pose or smpl_root_quat_w"
+        )
+    smpl_frames: int | None = None
+    for name, value in smpl_fields.items():
+        smpl_frames = _validate_frame_axis(value, name, smpl_frames)
+    if smpl_frames != robot_frames:
+        raise MotionManifestError(
+            f"pair {pair_key!r} length mismatch: robot={robot_frames}, SMPL={smpl_frames}"
+        )
+
+    merged = dict(robot)
+    for canonical in smpl_aliases:
+        for alias in (canonical, *_MOTION_FIELD_ALIASES.get(canonical, ())):
+            merged.pop(alias, None)
+    merged.update(smpl_fields)
+    return merged, robot_rate
+
+
+def _publish_staged_motion_store(staging: Path, destination: Path, *, overwrite: bool) -> None:
+    if not destination.exists():
+        os.replace(staging, destination)
+        return
+    if destination.is_symlink() or not destination.is_dir():
+        raise MotionManifestError(
+            f"materialization output is not a regular directory: {destination}"
+        )
+    if any(destination.iterdir()) and not overwrite:
+        raise MotionManifestError(
+            f"materialization output directory is not empty: {destination}; "
+            "pass overwrite=True to rebuild it"
+        )
+    if not any(destination.iterdir()):
+        destination.rmdir()
+        os.replace(staging, destination)
+        return
+
+    backup = Path(tempfile.mkdtemp(prefix=f".{destination.name}.backup-", dir=destination.parent))
+    backup.rmdir()
+    os.replace(destination, backup)
+    try:
+        os.replace(staging, destination)
+    except BaseException:
+        os.replace(backup, destination)
+        raise
+    try:
+        shutil.rmtree(backup)
+    except OSError as exc:
+        warnings.warn(
+            f"could not remove replaced motion-store backup {backup}: {exc}", stacklevel=2
+        )
+
+
+def _normalized_npz_field_specs(path: Path) -> dict[str, MotionFieldSpec]:
+    import numpy as np
+
+    specs: dict[str, MotionFieldSpec] = {}
+    with np.load(path, allow_pickle=False) as archive:
+        for name in archive.files:
+            if name == "fps":
+                continue
+            array = archive[name]
+            specs[name] = MotionFieldSpec(
+                name=name,
+                shape=("num_frames", *tuple(int(size) for size in array.shape[1:])),
+                dtype=str(array.dtype),
+            )
+    return specs
+
+
+def materialize_paired_sonic_motion(
+    robot_root: str | Path,
+    smpl_root: str | Path,
+    output_dir: str | Path,
+    *,
+    fps: int,
+    joint_order: Sequence[str],
+    body_order: Sequence[str],
+    source_fps: int | float | None = None,
+    quaternion_order: str = "wxyz",
+    fk_model_path: str | Path | None = None,
+    derive_velocities: bool = True,
+    smpl_y_up: bool = False,
+    allow_unmatched: bool = False,
+    overwrite: bool = False,
+    compressed: bool = True,
+) -> MotionMaterializationReport:
+    """Stream a basename-paired robot/SMPL corpus into an atomic motion store."""
+
+    if isinstance(fps, bool) or not isinstance(fps, int) or fps <= 0:
+        raise MotionManifestError("fps must be a positive integer")
+    joint_names = _order(list(joint_order), "joint_order")
+    body_names = _order(list(body_order), "body_order")
+    robot_index = _index_paired_source_root(robot_root, label="robot")
+    smpl_index = _index_paired_source_root(smpl_root, label="SMPL")
+    missing_smpl = sorted(set(robot_index).difference(smpl_index))
+    missing_robot = sorted(set(smpl_index).difference(robot_index))
+    if missing_smpl or missing_robot:
+        summary = (
+            f"missing SMPL=[{_summarize_keys(missing_smpl)}], "
+            f"missing robot=[{_summarize_keys(missing_robot)}]"
+        )
+        if not allow_unmatched:
+            raise MotionManifestError(f"unmatched paired motion keys: {summary}")
+        warnings.warn(f"skipping unmatched paired motion keys: {summary}", stacklevel=2)
+    pair_keys = sorted(set(robot_index).intersection(smpl_index))
+    if not pair_keys:
+        raise MotionManifestError("robot and SMPL source roots have no matched basenames")
+
+    raw_destination = Path(output_dir).expanduser().absolute()
+    if raw_destination.is_symlink():
+        raise MotionManifestError(
+            f"materialization output must not be a symbolic link: {raw_destination}"
+        )
+    destination = raw_destination.resolve()
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.exists() and (destination.is_symlink() or not destination.is_dir()):
+        raise MotionManifestError(
+            f"materialization output is not a regular directory: {destination}"
+        )
+    if destination.exists() and any(destination.iterdir()) and not overwrite:
+        raise MotionManifestError(
+            f"materialization output directory is not empty: {destination}; "
+            "pass overwrite=True to rebuild it"
+        )
+
+    staging = Path(tempfile.mkdtemp(prefix=f".{destination.name}.staging-", dir=destination.parent))
+    try:
+        clips_dir = staging / "clips"
+        clips_dir.mkdir()
+        field_specs: dict[str, MotionFieldSpec] | None = None
+        clips: list[MotionClip] = []
+        total_frames = 0
+        total_bytes = 0
+        for index, pair_key in enumerate(pair_keys):
+            merged, pair_fps = _merge_paired_motion_source(
+                robot_index[pair_key],
+                smpl_index[pair_key],
+                pair_key=pair_key,
+                source_fps=source_fps,
+            )
+            safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", pair_key).strip("._") or "clip"
+            target = clips_dir / f"{index:06d}_{safe_key}.npz"
+            report = convert_sonic_motion(
+                merged,
+                target,
+                source_fps=pair_fps,
+                target_fps=fps,
+                joint_order=joint_names,
+                body_order=body_names,
+                quaternion_order=quaternion_order,
+                fk_model_path=fk_model_path,
+                derive_velocities=derive_velocities,
+                smpl_y_up=smpl_y_up,
+                compressed=compressed,
+            )
+            current_specs = _normalized_npz_field_specs(target)
+            if field_specs is None:
+                field_specs = current_specs
+            elif current_specs != field_specs:
+                raise MotionManifestError(
+                    f"pair {pair_key!r} normalized fields/shapes/dtypes disagree with first pair"
+                )
+            clips.append(
+                MotionClip(
+                    id=pair_key,
+                    path=str(target.relative_to(staging)),
+                    checksum=report.checksum,
+                    fps=report.fps,
+                    num_frames=report.num_frames,
+                    joint_order=joint_names,
+                    body_order=body_names,
+                )
+            )
+            total_frames += report.num_frames
+            total_bytes += target.stat().st_size
+            # Do not retain one pair's decoded arrays while opening the next
+            # pair. The manifest accumulator above contains metadata only.
+            del merged, pair_fps, report, current_specs
+
+        assert field_specs is not None
+        manifest = MotionManifest(
+            version=MANIFEST_VERSION,
+            schema=MANIFEST_SCHEMA,
+            joint_order=joint_names,
+            body_order=body_names,
+            fields=tuple(field_specs.values()),
+            clips=tuple(clips),
+            metadata={"materializer": "unilab.sonic_motion.paired", "source_count": len(clips)},
+            manifest_path=staging / "manifest.json",
+        )
+        staged_manifest = staging / "manifest.json"
+        staged_manifest.write_text(
+            json.dumps(manifest.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        preflight_motion_manifest(
+            staged_manifest,
+            verify_checksums=True,
+            verify_shapes=True,
+            expected_joint_order=joint_names,
+            expected_body_order=body_names,
+        )
+        _publish_staged_motion_store(staging, destination, overwrite=overwrite)
+        return MotionMaterializationReport(
+            manifest_path=destination / "manifest.json",
+            clip_count=len(clips),
+            total_frames=total_frames,
+            total_bytes=total_bytes,
+        )
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+
 materialize_motion_manifest = materialize_motion_store
 
 
@@ -1633,6 +1972,7 @@ __all__ = [
     "convert_sonic_motion",
     "load_motion_manifest",
     "materialize_motion_manifest",
+    "materialize_paired_sonic_motion",
     "materialize_motion_store",
     "normalize_motion_clip",
     "normalize_sonic_motion",
