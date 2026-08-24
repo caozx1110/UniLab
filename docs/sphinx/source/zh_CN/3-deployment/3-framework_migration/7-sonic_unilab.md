@@ -86,8 +86,22 @@ UV_CACHE_DIR=/tmp/unilab-uv-cache uv run scripts/materialize_sonic_motion.py \
   --joint-order j0 j1 --body-order pelvis
 ```
 
-原始 SONIC PKL/SMPL 数据仍需先经过 FK、坐标系和 joint/body reorder 转换；
-step/reset 热路径不能读取 PKL、XML 或重新解析 manifest。训练前将生成的
+release 的 robot 与 SMPL 单 clip 目录可以按唯一 basename 流式配对转换：
+
+```bash
+UV_CACHE_DIR=/tmp/unilab-uv-cache uv run scripts/materialize_sonic_motion.py \
+  --robot-root /abs/path/to/robot_filtered \
+  --smpl-root /abs/path/to/bones_seed_smpl \
+  --output data/sonic_store --fps 50 \
+  --joint-order j0 j1 --body-order pelvis \
+  --fk-model /abs/path/to/g1.xml --smpl-y-up
+```
+
+converter 默认对 duplicate basename、缺失配对、原始 fps 或帧数不一致
+fail-closed；只有显式传入 `--allow-unmatched` 才会跳过未配对 key。每次只规范化
+一个 pair，并在所有 clip 通过 checksum/shape preflight 后原子发布 store。这里的
+命令是小样本用法，不代表全量 corpus 已验证。step/reset 热路径不能读取 PKL、XML
+或重新解析 manifest。训练前将生成的
 `manifest.json` 设置到 `sonic.motion_manifest`，并保持 checksum/shape 校验
 开启。多卡默认 `sonic.motion_shard_clips=true`，每个 rank 只 materialize
 round-robin 的 clip 子集，避免 8 个进程各自复制完整 corpus。rank-local store

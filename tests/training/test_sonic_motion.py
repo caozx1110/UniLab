@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import gc
 import hashlib
+import importlib.util
 import pickle
+import sys
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +16,7 @@ from unilab.training.sonic_motion import (
     convert_sonic_motion,
     load_motion_manifest,
     materialize_motion_store,
+    materialize_paired_sonic_motion,
     normalize_sonic_motion,
     preflight_motion_manifest,
 )
@@ -262,3 +267,218 @@ def test_materializer_does_not_overwrite_nonempty_output_by_default(tmp_path: Pa
             joint_order=["j0", "j1"],
             body_order=["pelvis"],
         )
+
+
+def _write_paired_source(root: Path, key: str, *, frames: int = 3, fps: int = 50) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{key}.pkl"
+    payload = {
+        "fps": fps,
+        "root_trans_offset": np.zeros((frames, 3), dtype=np.float32),
+        "root_rot": np.tile(np.asarray([0, 0, 0, 1], dtype=np.float32), (frames, 1)),
+        "dof": np.zeros((frames, 2), dtype=np.float32),
+        "joint_order": ["j0", "j1"],
+        "body_order": ["pelvis"],
+    }
+    with path.open("wb") as stream:
+        pickle.dump(payload, stream)
+    return path
+
+
+def _write_smpl_source(root: Path, key: str, *, frames: int = 3, fps: int = 50) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / f"{key}.pkl"
+    payload = {
+        "fps": fps,
+        "pose_aa": np.zeros((frames, 72), dtype=np.float32),
+        "smpl_joints": np.zeros((frames, 24, 3), dtype=np.float32),
+        "transl": np.zeros((frames, 3), dtype=np.float32),
+    }
+    with path.open("wb") as stream:
+        pickle.dump(payload, stream)
+    return path
+
+
+def _paired_kwargs(robot: Path, smpl: Path, output: Path) -> dict[str, object]:
+    return {
+        "robot_root": robot,
+        "smpl_root": smpl,
+        "output_dir": output,
+        "fps": 50,
+        "joint_order": ["j0", "j1"],
+        "body_order": ["pelvis"],
+    }
+
+
+def test_paired_materializer_is_sorted_and_manifest_loadable(tmp_path: Path):
+    robot = tmp_path / "robot"
+    smpl = tmp_path / "smpl"
+    _write_paired_source(robot, "b")
+    _write_paired_source(robot, "a")
+    _write_smpl_source(smpl, "a")
+    _write_smpl_source(smpl, "b")
+
+    report = materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "store"))
+    manifest = load_motion_manifest(report.manifest_path)
+    assert [clip.id for clip in manifest.clips] == ["a", "b"]
+    assert {field.name for field in manifest.fields} >= {
+        "joint_pos",
+        "smpl_joints",
+        "smpl_pose",
+        "smpl_root_quat_w",
+    }
+    preflight_motion_manifest(report.manifest_path)
+    store = load_sonic_motion_store(report.manifest_path)
+    assert store.num_frames == 6
+    assert store.arrays["smpl_joints"].shape == (6, 24, 3)
+
+    second = materialize_paired_sonic_motion(
+        **_paired_kwargs(robot, smpl, tmp_path / "second_store")
+    )
+    assert load_motion_manifest(second.manifest_path).to_dict() == manifest.to_dict()
+
+
+def test_paired_materializer_rejects_missing_and_duplicate_keys(tmp_path: Path):
+    robot = tmp_path / "robot"
+    smpl = tmp_path / "smpl"
+    _write_paired_source(robot, "matched")
+    _write_paired_source(robot, "missing")
+    _write_smpl_source(smpl, "matched")
+    _write_smpl_source(smpl, "extra")
+    with pytest.raises(MotionManifestError, match="unmatched.*missing.*extra"):
+        materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "missing_store"))
+    with pytest.warns(UserWarning, match="skipping unmatched"):
+        allowed = materialize_paired_sonic_motion(
+            **_paired_kwargs(robot, smpl, tmp_path / "allowed_store"), allow_unmatched=True
+        )
+    assert [clip.id for clip in load_motion_manifest(allowed.manifest_path).clips] == ["matched"]
+
+    duplicate = robot / "nested"
+    duplicate.mkdir()
+    _write_paired_source(duplicate, "matched").rename(duplicate / "matched.joblib")
+    with pytest.raises(MotionManifestError, match="duplicate robot basename.*matched"):
+        materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "duplicate_store"))
+
+
+def test_paired_materializer_fails_atomically_on_length_or_fps_mismatch(tmp_path: Path):
+    robot = tmp_path / "robot"
+    smpl = tmp_path / "smpl"
+    _write_paired_source(robot, "a")
+    _write_smpl_source(smpl, "a")
+    _write_paired_source(robot, "bad", frames=3, fps=50)
+    _write_smpl_source(smpl, "bad", frames=4, fps=50)
+    output = tmp_path / "store"
+    with pytest.raises(MotionManifestError, match="length mismatch"):
+        materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, output))
+    assert not output.exists()
+    assert not list(tmp_path.glob(".store.staging-*"))
+
+    _write_smpl_source(smpl, "bad", frames=3, fps=60)
+    with pytest.raises(MotionManifestError, match="fps mismatch"):
+        materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, output))
+    assert not output.exists()
+    assert not list(tmp_path.glob(".store.staging-*"))
+
+
+def test_paired_materializer_restores_old_store_when_atomic_swap_fails(tmp_path: Path, monkeypatch):
+    import unilab.training.sonic_motion as sonic_motion
+
+    robot = tmp_path / "robot"
+    smpl = tmp_path / "smpl"
+    _write_paired_source(robot, "a")
+    _write_smpl_source(smpl, "a")
+    output = tmp_path / "store"
+    output.mkdir()
+    (output / "old").write_text("keep", encoding="utf-8")
+    original_replace = sonic_motion.os.replace
+
+    def fail_staging_publish(source, destination):
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if source_path.name.startswith(".store.staging-") and destination_path == output:
+            raise OSError("synthetic publish failure")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr(sonic_motion.os, "replace", fail_staging_publish)
+    with pytest.raises(OSError, match="synthetic publish failure"):
+        materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, output), overwrite=True)
+    assert (output / "old").read_text(encoding="utf-8") == "keep"
+    assert not (output / "manifest.json").exists()
+    assert not list(tmp_path.glob(".store.staging-*"))
+    assert not list(tmp_path.glob(".store.backup-*"))
+
+
+def test_paired_materializer_releases_previous_pair_before_loading_next(
+    tmp_path: Path, monkeypatch
+):
+    import unilab.training.sonic_motion as sonic_motion
+
+    robot = tmp_path / "robot"
+    smpl = tmp_path / "smpl"
+    for key in ("a", "b", "c"):
+        _write_paired_source(robot, key)
+        _write_smpl_source(smpl, key)
+    original = sonic_motion._load_motion_source
+    references: list[weakref.ReferenceType[np.ndarray]] = []
+
+    def wrapped(source):
+        if not isinstance(source, (str, Path)):
+            return original(source)
+        source_path = Path(source)
+        if source_path.parent == robot and references:
+            gc.collect()
+            assert references[-1]() is None
+        loaded = original(source)
+        if source_path.parent == robot:
+            references.append(weakref.ref(loaded["dof"]))
+        return loaded
+
+    monkeypatch.setattr(sonic_motion, "_load_motion_source", wrapped)
+    materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "store"))
+    gc.collect()
+    assert references[-1]() is None
+
+
+def test_paired_materializer_accepts_singleton_wrapper_with_different_inner_key(tmp_path: Path):
+    robot = tmp_path / "robot"
+    smpl = tmp_path / "smpl"
+    robot_path = _write_paired_source(robot, "pair_key")
+    with robot_path.open("rb") as stream:
+        payload = pickle.load(stream)
+    with robot_path.open("wb") as stream:
+        pickle.dump({"different_inner_key": payload}, stream)
+    _write_smpl_source(smpl, "pair_key")
+
+    report = materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "store"))
+    assert [clip.id for clip in load_motion_manifest(report.manifest_path).clips] == ["pair_key"]
+
+
+@pytest.mark.parametrize("extra", [["--hardlink"], ["--clip-id", "nested"]])
+def test_paired_cli_rejects_single_source_only_options(
+    tmp_path: Path, monkeypatch, extra: list[str]
+):
+    script = Path(__file__).parents[2] / "scripts" / "materialize_sonic_motion.py"
+    spec = importlib.util.spec_from_file_location("materialize_sonic_motion_cli", script)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            str(script),
+            "--robot-root",
+            str(tmp_path / "robot"),
+            "--smpl-root",
+            str(tmp_path / "smpl"),
+            "--output",
+            str(tmp_path / "store"),
+            "--joint-order",
+            "j0",
+            "--body-order",
+            "pelvis",
+            *extra,
+        ],
+    )
+    with pytest.raises(SystemExit, match="2"):
+        module.main()

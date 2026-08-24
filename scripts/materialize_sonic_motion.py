@@ -23,6 +23,7 @@ if str(SRC_DIR) not in sys.path:
 from unilab.training.sonic_motion import (  # noqa: E402
     convert_sonic_motion,
     materialize_motion_store,
+    materialize_paired_sonic_motion,
 )
 
 
@@ -37,6 +38,14 @@ def main() -> None:
         "--normalize-source",
         action="append",
         help="Raw NPZ/PKL/joblib source to normalize before materialization (repeatable)",
+    )
+    parser.add_argument(
+        "--robot-root",
+        help="Robot PKL/joblib tree for basename-paired corpus materialization",
+    )
+    parser.add_argument(
+        "--smpl-root",
+        help="SMPL PKL/joblib tree paired to --robot-root by unique basename",
     )
     parser.add_argument("--output", required=True, help="Output motion-store directory")
     parser.add_argument("--fps", type=int, default=50)
@@ -76,12 +85,45 @@ def main() -> None:
         action="store_true",
         help="Keep supplied velocity fields instead of finite-difference derivation",
     )
+    parser.add_argument(
+        "--allow-unmatched",
+        action="store_true",
+        help="Explicitly skip robot/SMPL basenames without a counterpart (paired mode only)",
+    )
     args = parser.parse_args()
-    if bool(args.source) == bool(args.normalize_source):
-        parser.error("provide exactly one of --source or --normalize-source")
+    paired = args.robot_root is not None or args.smpl_root is not None
+    if paired:
+        if args.robot_root is None or args.smpl_root is None:
+            parser.error("paired mode requires both --robot-root and --smpl-root")
+        if args.source or args.normalize_source:
+            parser.error("paired mode cannot be combined with --source or --normalize-source")
+        if args.hardlink:
+            parser.error("--hardlink is not supported in paired mode")
+        if args.clip_id is not None:
+            parser.error("--clip-id is not supported in paired mode; filenames define pair keys")
+    elif bool(args.source) == bool(args.normalize_source):
+        parser.error("provide --source, --normalize-source, or paired --robot-root/--smpl-root")
+    elif args.allow_unmatched:
+        parser.error("--allow-unmatched is only valid with --robot-root/--smpl-root")
 
     sources = args.source
-    if args.normalize_source:
+    if paired:
+        report = materialize_paired_sonic_motion(
+            args.robot_root,
+            args.smpl_root,
+            args.output,
+            fps=args.fps,
+            source_fps=args.source_fps,
+            joint_order=args.joint_order,
+            body_order=args.body_order,
+            overwrite=args.overwrite,
+            quaternion_order=args.quaternion_order,
+            fk_model_path=args.fk_model,
+            derive_velocities=not args.no_derive_velocities,
+            smpl_y_up=args.smpl_y_up,
+            allow_unmatched=args.allow_unmatched,
+        )
+    elif args.normalize_source:
         # Keep conversion artifacts in a temporary cold-path directory, then
         # let the existing materializer produce the checksummed immutable store
         # before the temporary directory is removed.
