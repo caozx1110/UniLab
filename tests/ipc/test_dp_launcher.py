@@ -276,6 +276,33 @@ def test_launch_torchrun_workers_preserves_explicit_nccl_transport(
     assert captured["NCCL_SHM_DISABLE"] == "0"
 
 
+def test_launch_torchrun_workers_can_leave_nccl_transport_unset(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    captured: dict[str, str] = {}
+
+    monkeypatch.delenv("NCCL_P2P_DISABLE", raising=False)
+    monkeypatch.delenv("NCCL_SHM_DISABLE", raising=False)
+    monkeypatch.setattr("unilab.ipc.dp_launcher.validate_dp_launchable", lambda devices: None)
+
+    def _run(command, *, env, check):
+        del command, check
+        captured.update(env)
+        return subprocess.CompletedProcess([], 0)
+
+    monkeypatch.setattr("unilab.ipc.dp_launcher.subprocess.run", _run)
+    launch_torchrun_workers(
+        (0, 1),
+        script_path="train.py",
+        argv=[],
+        log_dir="logs",
+        nccl_compat_defaults=False,
+    )
+
+    assert "NCCL_P2P_DISABLE" not in captured
+    assert "NCCL_SHM_DISABLE" not in captured
+
+
 # ---------------------------------------------------------------------------
 # Hydra compose surface
 # ---------------------------------------------------------------------------

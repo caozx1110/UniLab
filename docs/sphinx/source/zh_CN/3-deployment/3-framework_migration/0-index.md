@@ -41,6 +41,13 @@
 在不破坏 env/backend contract 的前提下移植 reward 项。
 :::
 
+:::{grid-item-card} SONIC 迁移
+:link: 7-sonic_unilab
+:link-type: doc
+使用 UniLab 多卡 launcher、CPU/NUMA 资源规划和 versioned motion manifest
+迁移 SONIC release。
+:::
+
 ::::
 
 ```{toctree}
@@ -52,4 +59,5 @@
 4-from_skrl
 5-task_config_translation
 6-reward_porting
+7-sonic_unilab
 ```

@@ -33,6 +33,16 @@ from .flip_tracking_sac import (
     G1WallFlipTrackingSACEnv,
 )
 from .motion_box_loader import BoxMotionData, BoxMotionLoader
+from .sonic import (
+    SONIC_ACTION_SCALE,
+    SONIC_BODY_ORDER,
+    SONIC_JOINT_ORDER,
+    SONIC_WRIST_JOINT_INDICES,
+    SonicG1TrackingCfg,
+    SonicG1TrackingEnv,
+    SonicG1TrackingEnvCfg,
+    sonic_action_scale,
+)
 from .tracking import (
     G1MotionTracking23DofCfg,
     G1MotionTracking23DofDeployEnvCfg,
@@ -95,4 +105,12 @@ __all__ = [
     "G1BoxTrackingEnvCfg",
     "BoxMotionData",
     "BoxMotionLoader",
+    "SONIC_ACTION_SCALE",
+    "SONIC_BODY_ORDER",
+    "SONIC_JOINT_ORDER",
+    "SONIC_WRIST_JOINT_INDICES",
+    "SonicG1TrackingCfg",
+    "SonicG1TrackingEnv",
+    "SonicG1TrackingEnvCfg",
+    "sonic_action_scale",
 ]

@@ -6,6 +6,10 @@ __unilab_registry_modules__ = (
 )
 
 from .g1 import (
+    SONIC_ACTION_SCALE,
+    SONIC_BODY_ORDER,
+    SONIC_JOINT_ORDER,
+    SONIC_WRIST_JOINT_INDICES,
     BoxMotionData,
     BoxMotionLoader,
     G1BoxTracking23DofCfg,
@@ -43,6 +47,10 @@ from .g1 import (
     G1WBTObs23DofCfg,
     G1WBTObsCfg,
     G1WBTObsEnv,
+    SonicG1TrackingCfg,
+    SonicG1TrackingEnv,
+    SonicG1TrackingEnvCfg,
+    sonic_action_scale,
 )
 from .x2 import (
     X2MotionTrackingCfg,
@@ -94,4 +102,12 @@ __all__ = [
     "G1WallFlipTrackingSAC23DofEnv",
     "G1BoxTracking23DofCfg",
     "G1BoxTracking23DofEnvCfg",
+    "SONIC_ACTION_SCALE",
+    "SONIC_BODY_ORDER",
+    "SONIC_JOINT_ORDER",
+    "SONIC_WRIST_JOINT_INDICES",
+    "SonicG1TrackingCfg",
+    "SonicG1TrackingEnv",
+    "SonicG1TrackingEnvCfg",
+    "sonic_action_scale",
 ]

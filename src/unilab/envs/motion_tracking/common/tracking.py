@@ -35,8 +35,8 @@ class MotionTrackingEnv(G1BaseEnv):
     _cfg: MotionTrackingCfg
 
     def __init__(self, cfg: MotionTrackingCfg, num_envs=1, backend_type="mujoco"):
-        if not cfg.motion_file:
-            raise ValueError("motion_file must be specified in config")
+        if not cfg.motion_file and cfg.motion_loader is None:
+            raise ValueError("motion_file or motion_loader must be specified in config")
 
         backend = create_backend(
             backend_type,
@@ -52,7 +52,15 @@ class MotionTrackingEnv(G1BaseEnv):
 
         # Resolve body IDs for backend querying and motion-file indexing.
         self.body_ids = self._backend.get_body_ids(cfg.body_names)
-        motion_body_ids = self._backend.get_motion_body_ids(cfg.body_names)
+        motion_body_ids = cfg.motion_data_body_indices
+        if motion_body_ids is None:
+            motion_body_ids = self._backend.get_motion_body_ids(cfg.body_names)
+        else:
+            motion_body_ids = np.asarray(motion_body_ids, dtype=np.int32)
+            if motion_body_ids.ndim != 1 or len(motion_body_ids) != len(cfg.body_names):
+                raise ValueError(
+                    "motion_data_body_indices must contain one index per configured body"
+                )
 
         self.anchor_body_idx = cfg.body_names.index(cfg.anchor_body_name)
 
@@ -70,8 +78,12 @@ class MotionTrackingEnv(G1BaseEnv):
         )
         self._has_undesired_contact_body_indices = bool(self.undesired_contact_body_indices.size)
 
-        # Load motion data
-        self.motion_loader = MotionLoader(cfg.motion_file, body_indices=motion_body_ids)
+        # Load motion data.  Specialized owners can inject a materialized
+        # loader so the generic path never opens and concatenates the corpus.
+        if cfg.motion_loader is not None:
+            self.motion_loader = cfg.motion_loader
+        else:
+            self.motion_loader = MotionLoader(cfg.motion_file, body_indices=motion_body_ids)
         self.motion_sampler = MotionSampler(
             self.motion_loader,
             mode=cfg.sampling_mode,

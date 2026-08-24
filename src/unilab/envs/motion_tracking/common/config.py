@@ -9,7 +9,7 @@ override these via subclasses.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal
 
 from unilab.assets import ASSETS_ROOT_PATH
 from unilab.base.scene import SceneCfg
@@ -117,6 +117,12 @@ class MotionTrackingCfg(G1BaseCfg):
     motion_file: str | list[str] = str(
         ASSETS_ROOT_PATH / "motions" / "g1" / "dance1_subject2_part.npz"
     )
+    # Owners with a pre-materialized motion store may inject a loader during
+    # cold-path environment construction.  Keeping this dependency on the
+    # config owner prevents the generic loader from opening the whole corpus
+    # before the specialized owner can replace it.
+    motion_loader: Any | None = field(default=None, repr=False, compare=False)
+    motion_data_body_indices: tuple[int, ...] | None = field(default=None, repr=False)
     # motion_file: str | list[str] = str(ASSETS_ROOT_PATH / "motions" / "g1" / "gangnam_style.npz")
     # motion_file: str | list[str] = str(ASSETS_ROOT_PATH / "motions" / "g1" / "fight1_subject5_from_csv.npz") #LAFAN
     # motion_file: str | list[str] = str(ASSETS_ROOT_PATH / "motions" / "g1" / "dance_basic_slide_180_R_loop_001__A322_M.npz") #LAFAN
