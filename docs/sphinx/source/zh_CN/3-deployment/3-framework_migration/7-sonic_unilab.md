@@ -97,8 +97,9 @@ UV_CACHE_DIR=/tmp/unilab-uv-cache uv run scripts/materialize_sonic_motion.py \
   --fk-model /abs/path/to/g1.xml --smpl-y-up
 ```
 
-converter 默认对 duplicate basename、缺失配对、原始 fps 或帧数不一致
-fail-closed；只有显式传入 `--allow-unmatched` 才会跳过未配对 key。每次只规范化
+converter 默认对 duplicate basename、缺失配对 fail-closed；robot 与 SMPL 按各自
+fps/duration 重采样到共同 target grid，帧数仍不一致时拒绝。只有显式传入
+`--allow-unmatched` 才会跳过未配对 key。每次只规范化
 一个 pair，并在所有 clip 通过 checksum/shape preflight 后原子发布 store。这里的
 命令是小样本用法，不代表全量 corpus 已验证。step/reset 热路径不能读取 PKL、XML
 或重新解析 manifest。训练前将生成的
