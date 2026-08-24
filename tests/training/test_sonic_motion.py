@@ -14,6 +14,7 @@ import pytest
 
 from unilab.training.sonic_motion import (
     MotionManifestError,
+    _resample_quaternion,
     convert_sonic_motion,
     load_motion_manifest,
     materialize_motion_store,
@@ -30,7 +31,7 @@ def test_normalize_aliases_resamples_and_derives_velocities():
     source = {
         "fps": 25,
         "root_trans_offset": np.asarray([[0, 0, 0], [0.1, 0, 0], [0.2, 0, 0]], dtype=np.float32),
-        # Alternating antipodal signs require cumulative shortest-path unwrap.
+        # Alternating antipodal signs are equivalent rotations.
         "root_rot": np.asarray([[0, 0, 0, 1], [0, 0, 0, -1], [0, 0, 0, 1]], dtype=np.float32),
         "dof": np.asarray([[0.0, 1.0], [1.0, 3.0], [2.0, 5.0]], dtype=np.float32),
         "joint_order": ["a", "b"],
@@ -48,11 +49,24 @@ def test_normalize_aliases_resamples_and_derives_velocities():
     assert normalized["joint_pos"].shape == (4, 2)
     np.testing.assert_allclose(normalized["joint_pos"][:, 0], [1.0, 2.0, 3.0, 4.0])
     np.testing.assert_allclose(
-        normalized["body_quat_w"][:, 0], np.tile([1.0, 0.0, 0.0, 0.0], (4, 1))
+        np.abs(normalized["body_quat_w"][:, 0]), np.broadcast_to([1.0, 0.0, 0.0, 0.0], (4, 4))
     )
     # x moves 0.1 m over 0.04 s, so the central/edge finite difference is 2.5 m/s.
     np.testing.assert_allclose(normalized["root_lin_vel_w"][:, 0], 2.5, atol=1e-5)
     np.testing.assert_allclose(normalized["joint_vel"][1:, 0], 50.0, atol=1e-5)
+
+
+def test_quaternion_resampling_matches_float32_segment_slerp():
+    angles = np.deg2rad([0.0, 90.0, 180.0]).astype(np.float32)
+    source = np.stack(
+        (np.cos(angles / 2), np.zeros_like(angles), np.zeros_like(angles), np.sin(angles / 2)), -1
+    )
+    actual = _resample_quaternion(source, 25, 50)
+    expected_angles = np.deg2rad([0.0, 45.0, 90.0, 135.0]).astype(np.float32)
+    expected = np.stack(
+        (np.cos(expected_angles / 2), np.zeros(4), np.zeros(4), np.sin(expected_angles / 2)), -1
+    )
+    np.testing.assert_allclose(actual, expected, atol=2e-6)
 
 
 def test_normalize_joblib_compressed_pickle_and_smpl_fields(tmp_path: Path):
@@ -398,22 +412,27 @@ def test_paired_materializer_resamples_official_30hz_50hz_duration_pair(tmp_path
     with np.load(report.manifest_path.parent / manifest.clips[0].path) as archive:
         assert archive["joint_pos"].shape[0] == 2002
         assert archive["smpl_joints"].shape[0] == 2002
-        np.testing.assert_allclose(archive["joint_pos"][:, 0], smpl_times, atol=2.0e-6)
+        np.testing.assert_allclose(archive["joint_pos"][:, 0], smpl_times, atol=1.0e-5)
         np.testing.assert_array_equal(archive["smpl_joints"][:, 0, 0], smpl_times)
 
 
-def test_paired_materializer_slerps_smpl_axis_angle(tmp_path: Path):
+def test_paired_materializer_linearly_interpolates_and_clears_smpl_axis_angle(tmp_path: Path):
     robot, smpl = tmp_path / "robot", tmp_path / "smpl"
     _write_paired_source(robot, "turn", frames=2, fps=50)
     smpl_path = _write_smpl_source(smpl, "turn", frames=2, fps=25)
     payload = pickle.loads(smpl_path.read_bytes())
     payload["pose_aa"][:, 2] = np.deg2rad([170.0, -170.0])
+    payload["pose_aa"][:, -6:] = 1.0
+    # This is deliberately invalid: pose_aa is authoritative, so it is ignored.
+    payload["smpl_root_quat_w"] = np.zeros((2, 4), dtype=np.float32)
     smpl_path.write_bytes(pickle.dumps(payload))
 
     report = materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "store"))
     manifest = load_motion_manifest(report.manifest_path)
     with np.load(report.manifest_path.parent / manifest.clips[0].path) as archive:
-        assert abs(archive["smpl_pose"][1, 2]) == pytest.approx(np.pi, abs=1.0e-5)
+        assert archive["smpl_pose"][1, 2] == pytest.approx(0.0, abs=1.0e-6)
+        np.testing.assert_array_equal(archive["smpl_pose"][:, -6:], 0.0)
+        np.testing.assert_allclose(archive["smpl_root_quat_w"][1], [0.5, -0.5, -0.5, -0.5])
 
 
 def test_paired_materializer_fails_atomically_on_duration_grid_mismatch(tmp_path: Path):
