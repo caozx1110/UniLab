@@ -8,6 +8,7 @@ import sys
 import weakref
 from pathlib import Path
 
+import joblib
 import numpy as np
 import pytest
 
@@ -28,9 +29,10 @@ def test_normalize_aliases_resamples_and_derives_velocities():
     # quaternions are converted to UniLab's WXYZ convention.
     source = {
         "fps": 25,
-        "root_trans_offset": np.asarray([[0, 0, 0], [0.1, 0, 0]], dtype=np.float32),
-        "root_rot": np.asarray([[0, 0, 0, 1], [0, 0, 0, 1]], dtype=np.float32),
-        "dof": np.asarray([[0.0, 1.0], [1.0, 3.0]], dtype=np.float32),
+        "root_trans_offset": np.asarray([[0, 0, 0], [0.1, 0, 0], [0.2, 0, 0]], dtype=np.float32),
+        # Alternating antipodal signs require cumulative shortest-path unwrap.
+        "root_rot": np.asarray([[0, 0, 0, 1], [0, 0, 0, -1], [0, 0, 0, 1]], dtype=np.float32),
+        "dof": np.asarray([[0.0, 1.0], [1.0, 3.0], [2.0, 5.0]], dtype=np.float32),
         "joint_order": ["a", "b"],
         "body_order": ["pelvis"],
     }
@@ -41,17 +43,19 @@ def test_normalize_aliases_resamples_and_derives_velocities():
         body_order=["pelvis"],
     )
     assert int(normalized["fps"]) == 50
-    assert normalized["joint_pos"].shape == (3, 2)
-    np.testing.assert_allclose(normalized["joint_pos"][:, 0], [1.0, 2.0, 3.0])
+    # Fixed upstream uses arange(0, duration, 1 / target_fps), so resampling
+    # excludes the source endpoint instead of stretching a linspace over it.
+    assert normalized["joint_pos"].shape == (4, 2)
+    np.testing.assert_allclose(normalized["joint_pos"][:, 0], [1.0, 2.0, 3.0, 4.0])
     np.testing.assert_allclose(
-        normalized["body_quat_w"][:, 0], np.tile([1.0, 0.0, 0.0, 0.0], (3, 1))
+        normalized["body_quat_w"][:, 0], np.tile([1.0, 0.0, 0.0, 0.0], (4, 1))
     )
     # x moves 0.1 m over 0.04 s, so the central/edge finite difference is 2.5 m/s.
     np.testing.assert_allclose(normalized["root_lin_vel_w"][:, 0], 2.5, atol=1e-5)
     np.testing.assert_allclose(normalized["joint_vel"][1:, 0], 50.0, atol=1e-5)
 
 
-def test_normalize_nested_pickle_and_smpl_fields(tmp_path: Path):
+def test_normalize_joblib_compressed_pickle_and_smpl_fields(tmp_path: Path):
     source = tmp_path / "raw.pkl"
     payload = {
         "clip_a": {
@@ -63,8 +67,7 @@ def test_normalize_nested_pickle_and_smpl_fields(tmp_path: Path):
             "smpl_joint_positions": np.arange(2 * 72, dtype=np.float32).reshape(2, 72),
         }
     }
-    with source.open("wb") as stream:
-        pickle.dump(payload, stream)
+    joblib.dump(payload, source, compress=3)
     normalized = normalize_sonic_motion(source, clip_id="clip_a")
     assert normalized["smpl_joints"].shape == (2, 24, 3)
     assert normalized["joint_pos"].dtype == np.float32
@@ -88,7 +91,9 @@ def test_convert_sonic_motion_writes_checksum_report(tmp_path: Path):
         convert_sonic_motion(source, output)
 
 
-def test_normalize_can_run_cold_path_mujoco_fk(tmp_path: Path):
+def test_normalize_resamples_inputs_before_cold_path_mujoco_fk(tmp_path: Path, monkeypatch):
+    import unilab.training.sonic_motion as sonic_motion
+
     model = tmp_path / "tiny.xml"
     model.write_text(
         """
@@ -108,19 +113,32 @@ def test_normalize_can_run_cold_path_mujoco_fk(tmp_path: Path):
 """,
         encoding="utf-8",
     )
+    original_fk = sonic_motion._mujoco_forward_kinematics
+    seen: dict[str, np.ndarray] = {}
+
+    def recording_fk(**kwargs):
+        for name in ("joint_pos", "root_pos", "root_quat_wxyz"):
+            seen[name] = np.asarray(kwargs[name]).copy()
+        return original_fk(**kwargs)
+
+    monkeypatch.setattr(sonic_motion, "_mujoco_forward_kinematics", recording_fk)
     normalized = normalize_sonic_motion(
         {
-            "fps": 50,
-            "dof": np.zeros((2, 1), dtype=np.float32),
-            "root_trans_offset": np.zeros((2, 3), dtype=np.float32),
-            "root_rot": np.tile([0, 0, 0, 1], (2, 1)).astype(np.float32),
+            "fps": 25,
+            "dof": np.arange(3, dtype=np.float32)[:, None],
+            "root_trans_offset": np.asarray(
+                [[0, 0, 0], [0.1, 0, 0], [0.2, 0, 0]], dtype=np.float32
+            ),
+            "root_rot": np.tile([0, 0, 0, 1], (3, 1)).astype(np.float32),
             "joint_order": ["hinge"],
         },
         fk_model_path=model,
         body_order=["root", "tip"],
     )
-    assert normalized["body_pos_w"].shape == (2, 2, 3)
-    np.testing.assert_allclose(normalized["body_pos_w"][:, 1, 0], 1.0)
+    assert normalized["body_pos_w"].shape == (4, 2, 3)
+    np.testing.assert_allclose(seen["joint_pos"][:, 0], [0.0, 0.5, 1.0, 1.5])
+    np.testing.assert_allclose(seen["root_pos"][:, 0], [0.0, 0.05, 0.1, 0.15])
+    np.testing.assert_allclose(normalized["body_pos_w"][:, 0], seen["root_pos"])
 
 
 def _clip(path: Path, frames: int = 4) -> None:
@@ -360,7 +378,45 @@ def test_paired_materializer_rejects_missing_and_duplicate_keys(tmp_path: Path):
         materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "duplicate_store"))
 
 
-def test_paired_materializer_fails_atomically_on_length_or_fps_mismatch(tmp_path: Path):
+def test_paired_materializer_resamples_official_30hz_50hz_duration_pair(tmp_path: Path):
+    robot = tmp_path / "robot"
+    smpl = tmp_path / "smpl"
+    robot_path = _write_paired_source(robot, "official", frames=1202, fps=30)
+    smpl_path = _write_smpl_source(smpl, "official", frames=2002, fps=50)
+    robot_payload = pickle.loads(robot_path.read_bytes())
+    robot_times = np.arange(1202, dtype=np.float32) / 30.0
+    robot_payload["dof"][:, 0] = robot_times
+    robot_path.write_bytes(pickle.dumps(robot_payload))
+    smpl_payload = pickle.loads(smpl_path.read_bytes())
+    smpl_times = np.arange(2002, dtype=np.float32) / 50.0
+    smpl_payload["smpl_joints"][:, 0, 0] = smpl_times
+    smpl_path.write_bytes(pickle.dumps(smpl_payload))
+
+    report = materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "store"))
+    manifest = load_motion_manifest(report.manifest_path)
+    assert manifest.clips[0].num_frames == 2002
+    with np.load(report.manifest_path.parent / manifest.clips[0].path) as archive:
+        assert archive["joint_pos"].shape[0] == 2002
+        assert archive["smpl_joints"].shape[0] == 2002
+        np.testing.assert_allclose(archive["joint_pos"][:, 0], smpl_times, atol=2.0e-6)
+        np.testing.assert_array_equal(archive["smpl_joints"][:, 0, 0], smpl_times)
+
+
+def test_paired_materializer_slerps_smpl_axis_angle(tmp_path: Path):
+    robot, smpl = tmp_path / "robot", tmp_path / "smpl"
+    _write_paired_source(robot, "turn", frames=2, fps=50)
+    smpl_path = _write_smpl_source(smpl, "turn", frames=2, fps=25)
+    payload = pickle.loads(smpl_path.read_bytes())
+    payload["pose_aa"][:, 2] = np.deg2rad([170.0, -170.0])
+    smpl_path.write_bytes(pickle.dumps(payload))
+
+    report = materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, tmp_path / "store"))
+    manifest = load_motion_manifest(report.manifest_path)
+    with np.load(report.manifest_path.parent / manifest.clips[0].path) as archive:
+        assert abs(archive["smpl_pose"][1, 2]) == pytest.approx(np.pi, abs=1.0e-5)
+
+
+def test_paired_materializer_fails_atomically_on_duration_grid_mismatch(tmp_path: Path):
     robot = tmp_path / "robot"
     smpl = tmp_path / "smpl"
     _write_paired_source(robot, "a")
@@ -368,13 +424,13 @@ def test_paired_materializer_fails_atomically_on_length_or_fps_mismatch(tmp_path
     _write_paired_source(robot, "bad", frames=3, fps=50)
     _write_smpl_source(smpl, "bad", frames=4, fps=50)
     output = tmp_path / "store"
-    with pytest.raises(MotionManifestError, match="length mismatch"):
+    with pytest.raises(MotionManifestError, match="duration/target-grid mismatch"):
         materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, output))
     assert not output.exists()
     assert not list(tmp_path.glob(".store.staging-*"))
 
     _write_smpl_source(smpl, "bad", frames=3, fps=60)
-    with pytest.raises(MotionManifestError, match="fps mismatch"):
+    with pytest.raises(MotionManifestError, match="duration/target-grid mismatch"):
         materialize_paired_sonic_motion(**_paired_kwargs(robot, smpl, output))
     assert not output.exists()
     assert not list(tmp_path.glob(".store.staging-*"))

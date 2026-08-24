@@ -210,7 +210,7 @@ def _load_motion_source(source: str | Path | Mapping[str, Any]) -> dict[str, Any
                     value = pickle.load(stream)
         except Exception as exc:  # noqa: BLE001 - normalize all loader errors
             # Some SONIC releases use joblib-compressed ``.pkl`` files.  Try
-            # joblib only after the stdlib loader fails, keeping joblib optional.
+            # the release decoder after the stdlib loader rejects the stream.
             if suffix != ".joblib":
                 try:
                     import joblib
@@ -305,8 +305,14 @@ def _validate_frame_axis(array: Any, name: str, frames: int | None) -> int:
 def _target_frame_count(num_frames: int, source_fps: float, target_fps: float) -> int:
     if num_frames <= 1:
         return num_frames
+    import math
+
     duration = (num_frames - 1) / source_fps
-    return max(2, int(round(duration * target_fps)) + 1)
+    # Match SONIC's exclusive-end ``torch.arange`` grid when interpolation is
+    # needed; equal-rate sources keep their original samples in the callers.
+    scaled_duration = duration * target_fps
+    tolerance = 1.0e-12 * max(1.0, abs(scaled_duration))
+    return max(1, int(math.ceil(scaled_duration - tolerance)))
 
 
 def _resample_linear(array: Any, source_fps: float, target_fps: float) -> Any:
@@ -316,7 +322,7 @@ def _resample_linear(array: Any, source_fps: float, target_fps: float) -> Any:
         return np.asarray(array, dtype=np.float32).copy()
     target_count = _target_frame_count(array.shape[0], source_fps, target_fps)
     source_times = np.arange(array.shape[0], dtype=np.float64) / source_fps
-    target_times = np.linspace(0.0, source_times[-1], target_count, dtype=np.float64)
+    target_times = np.arange(target_count, dtype=np.float64) / target_fps
     flat = np.asarray(array, dtype=np.float64).reshape(array.shape[0], -1)
     result = np.empty((target_count, flat.shape[1]), dtype=np.float64)
     for column in range(flat.shape[1]):
@@ -342,12 +348,18 @@ def _resample_quaternion(array: Any, source_fps: float, target_fps: float) -> An
         return values.astype(np.float32)
     target_count = _target_frame_count(values.shape[0], source_fps, target_fps)
     source_times = np.arange(values.shape[0], dtype=np.float64) / source_fps
-    target_times = np.linspace(0.0, source_times[-1], target_count, dtype=np.float64)
+    target_times = np.arange(target_count, dtype=np.float64) / target_fps
     flat = values.reshape(values.shape[0], -1, 4)
-    # Enforce shortest-path interpolation independently for every body.
+    # Unwrap cumulatively: comparing with the original predecessor leaves
+    # alternating antipodal inputs discontinuous.
     flat = flat.copy()
-    dots = np.sum(flat[1:] * flat[:-1], axis=-1)
-    flat[1:] = np.where(dots[..., None] < 0.0, -flat[1:], flat[1:])
+    for source_index in range(1, flat.shape[0]):
+        dots = np.sum(flat[source_index] * flat[source_index - 1], axis=-1)
+        flat[source_index] = np.where(
+            dots[..., None] < 0.0,
+            -flat[source_index],
+            flat[source_index],
+        )
     result = np.empty((target_count, flat.shape[1], 4), dtype=np.float64)
     for target_index, time_value in enumerate(target_times):
         right = int(np.searchsorted(source_times, time_value, side="right"))
@@ -456,6 +468,18 @@ def _axis_angle_to_quaternion_wxyz(axis_angle: Any) -> Any:
     return _normalize_quaternions(quat)
 
 
+def _quaternion_to_axis_angle_wxyz(quaternion: Any) -> Any:
+    import numpy as np
+
+    values = _normalize_quaternions(quaternion).astype(np.float64)
+    values = np.where(values[..., :1] < 0.0, -values, values)
+    vector = values[..., 1:]
+    vector_norm = np.linalg.norm(vector, axis=-1, keepdims=True)
+    angle = 2.0 * np.arctan2(vector_norm, np.clip(values[..., :1], 0.0, None))
+    scale = np.divide(angle, vector_norm, out=np.full_like(angle, 2.0), where=vector_norm > 1e-8)
+    return np.asarray(vector * scale, dtype=np.float32)
+
+
 def _derive_smpl_root_quaternion(
     smpl_pose: Any,
     *,
@@ -545,10 +569,10 @@ def _mujoco_forward_kinematics(
     if source_names is not None:
         for name in source_names:
             normalized = name.removesuffix("_dof")
-            joint_id = model_joint_by_name.get(name, model_joint_by_name.get(normalized))
-            if joint_id is None:
+            matched_joint_id = model_joint_by_name.get(name, model_joint_by_name.get(normalized))
+            if matched_joint_id is None:
                 raise MotionManifestError(f"FK model has no joint named {name!r}")
-            joint_ids.append(joint_id)
+            joint_ids.append(matched_joint_id)
     elif qpos_values.shape[1] == model.nu:
         joint_ids = actuator_joint_ids
     else:
@@ -751,6 +775,15 @@ def normalize_sonic_motion(
     if joint_vel is not None and (joint_vel.ndim != 2 or joint_vel.shape != joint_pos.shape):
         raise MotionManifestError("joint_vel must have the same shape as joint_pos")
 
+    resampled_before_fk = False
+    if body_pos is None and abs(source_rate - target_rate) > 1e-9:
+        # SONIC evaluates FK after generalized coordinates reach the target
+        # grid; post-FK body interpolation differs for articulated rotations.
+        joint_pos = _resample_linear(joint_pos, source_rate, target_rate)
+        root_pos = _resample_linear(root_pos, source_rate, target_rate)
+        root_quat = _resample_quaternion(root_quat, source_rate, target_rate)
+        resampled_before_fk = True
+
     if body_pos is None:
         if fk_model_path is None:  # pragma: no cover - guarded by earlier branch
             raise MotionManifestError("fk_model_path is required when body_pos_w is absent")
@@ -813,7 +846,7 @@ def normalize_sonic_motion(
 
     # Resample all pose/position signals on a common time grid.  Velocities are
     # recomputed after resampling, avoiding a stale dt from the source corpus.
-    if abs(source_rate - target_rate) > 1e-9:
+    if abs(source_rate - target_rate) > 1e-9 and not resampled_before_fk:
         joint_pos = _resample_linear(joint_pos, source_rate, target_rate)
         body_pos = _resample_linear(body_pos, source_rate, target_rate)
         body_quat = _resample_quaternion(body_quat, source_rate, target_rate)
@@ -1693,12 +1726,71 @@ def _unique_paired_field(
     return _as_array(source[present[0]], f"pair {pair_key!r} SMPL.{present[0]}")
 
 
+def _normalize_paired_smpl_fields(
+    fields: Mapping[str, Any],
+    *,
+    source_fps: float,
+    target_fps: float,
+    smpl_y_up: bool,
+) -> dict[str, Any]:
+    """Resample one SMPL source directly onto its target-rate time grid."""
+
+    import numpy as np
+
+    result: dict[str, Any] = {}
+    smpl_pose = fields.get("smpl_pose")
+    smpl_root_quat = fields.get("smpl_root_quat_w")
+    if smpl_root_quat is not None:
+        smpl_root_quat = np.asarray(smpl_root_quat, dtype=np.float32)
+        if smpl_root_quat.ndim != 2 or smpl_root_quat.shape[1] != 4:
+            raise MotionManifestError("smpl_root_quat_w must have shape (T,4)")
+        smpl_root_quat = _normalize_quaternions(smpl_root_quat)
+    elif smpl_pose is not None:
+        smpl_root_quat = _derive_smpl_root_quaternion(smpl_pose, smpl_y_up=smpl_y_up)
+    if smpl_root_quat is not None and abs(source_fps - target_fps) > 1.0e-9:
+        smpl_root_quat = _resample_quaternion(smpl_root_quat, source_fps, target_fps)
+
+    for canonical in ("smpl_joints", "smpl_pose", "smpl_transl"):
+        value = fields.get(canonical)
+        if value is None:
+            continue
+        value = np.asarray(value, dtype=np.float32)
+        if canonical == "smpl_pose" and (value.ndim != 2 or value.shape[1] % 3 != 0):
+            raise MotionManifestError("smpl_pose must have shape (T,J*3)")
+        if canonical == "smpl_joints" and value.ndim == 2:
+            if value.shape[1] % 3 != 0:
+                raise MotionManifestError("flattened smpl_joints must have a multiple-of-3 width")
+            value = value.reshape(value.shape[0], value.shape[1] // 3, 3)
+        if abs(source_fps - target_fps) > 1.0e-9:
+            if canonical == "smpl_pose":
+                pose_shape = value.shape
+                pose_quat = _axis_angle_to_quaternion_wxyz(value.reshape(value.shape[0], -1, 3))
+                value = _quaternion_to_axis_angle_wxyz(
+                    _resample_quaternion(pose_quat, source_fps, target_fps)
+                ).reshape((-1, *pose_shape[1:]))
+            else:
+                value = _resample_linear(value, source_fps, target_fps)
+        else:
+            value = value.copy()
+        result[canonical] = value
+    if smpl_root_quat is not None:
+        result["smpl_root_quat_w"] = np.asarray(smpl_root_quat, dtype=np.float32)
+    return result
+
+
 def _merge_paired_motion_source(
     robot_path: Path,
     smpl_path: Path,
     *,
     pair_key: str,
     source_fps: int | float | None,
+    target_fps: int | float,
+    joint_order: Sequence[str],
+    body_order: Sequence[str],
+    quaternion_order: str,
+    fk_model_path: str | Path | None,
+    derive_velocities: bool,
+    smpl_y_up: bool,
 ) -> tuple[dict[str, Any], float]:
     try:
         robot = _unwrap_motion_sequence(_load_motion_source(robot_path))
@@ -1711,10 +1803,7 @@ def _merge_paired_motion_source(
 
     robot_rate = _paired_source_fps(robot, pair_key=pair_key, label="robot", fallback=source_fps)
     smpl_rate = _paired_source_fps(smpl, pair_key=pair_key, label="SMPL", fallback=source_fps)
-    if abs(robot_rate - smpl_rate) > 1.0e-9:
-        raise MotionManifestError(
-            f"pair {pair_key!r} fps mismatch: robot={robot_rate:g}, SMPL={smpl_rate:g}"
-        )
+    target_rate = _scalar_number(target_fps, "target_fps")
 
     robot_joint_pos, robot_joint_name = _resolve_motion_field(robot, "joint_pos", None)
     if robot_joint_pos is None or robot_joint_name is None:
@@ -1743,17 +1832,45 @@ def _merge_paired_motion_source(
     smpl_frames: int | None = None
     for name, value in smpl_fields.items():
         smpl_frames = _validate_frame_axis(value, name, smpl_frames)
-    if smpl_frames != robot_frames:
-        raise MotionManifestError(
-            f"pair {pair_key!r} length mismatch: robot={robot_frames}, SMPL={smpl_frames}"
-        )
+    assert smpl_frames is not None
 
-    merged = dict(robot)
+    # Normalize independently sampled sources from their own FPS; routing SMPL
+    # through the robot rate would add a lossy official-corpus 50->30->50 trip.
+    robot_source = dict(robot)
     for canonical in smpl_aliases:
         for alias in (canonical, *_MOTION_FIELD_ALIASES.get(canonical, ())):
-            merged.pop(alias, None)
-    merged.update(smpl_fields)
-    return merged, robot_rate
+            robot_source.pop(alias, None)
+    normalized_robot = normalize_sonic_motion(
+        robot_source,
+        source_fps=robot_rate,
+        target_fps=target_rate,
+        joint_order=joint_order,
+        body_order=body_order,
+        quaternion_order=quaternion_order,
+        fk_model_path=fk_model_path,
+        derive_velocities=derive_velocities,
+        smpl_y_up=smpl_y_up,
+    )
+    normalized_smpl = _normalize_paired_smpl_fields(
+        smpl_fields,
+        source_fps=smpl_rate,
+        target_fps=target_rate,
+        smpl_y_up=smpl_y_up,
+    )
+    robot_target_frames = int(normalized_robot["joint_pos"].shape[0])
+    smpl_target_frames = int(normalized_smpl["smpl_joints"].shape[0])
+    if smpl_target_frames != robot_target_frames:
+        robot_duration = (robot_frames - 1) / robot_rate
+        smpl_duration = (smpl_frames - 1) / smpl_rate
+        raise MotionManifestError(
+            f"pair {pair_key!r} duration/target-grid mismatch at {target_rate:g} fps: "
+            f"robot={robot_frames}@{robot_rate:g} ({robot_duration:g}s)"
+            f"->{robot_target_frames}, SMPL={smpl_frames}@{smpl_rate:g} "
+            f"({smpl_duration:g}s)->{smpl_target_frames}"
+        )
+
+    normalized_robot.update(normalized_smpl)
+    return normalized_robot, target_rate
 
 
 def _publish_staged_motion_store(staging: Path, destination: Path, *, overwrite: bool) -> None:
@@ -1877,6 +1994,13 @@ def materialize_paired_sonic_motion(
                 smpl_index[pair_key],
                 pair_key=pair_key,
                 source_fps=source_fps,
+                target_fps=fps,
+                joint_order=joint_names,
+                body_order=body_names,
+                quaternion_order=quaternion_order,
+                fk_model_path=fk_model_path,
+                derive_velocities=derive_velocities,
+                smpl_y_up=smpl_y_up,
             )
             safe_key = re.sub(r"[^A-Za-z0-9_.-]+", "_", pair_key).strip("._") or "clip"
             target = clips_dir / f"{index:06d}_{safe_key}.npz"
@@ -1887,8 +2011,9 @@ def materialize_paired_sonic_motion(
                 target_fps=fps,
                 joint_order=joint_names,
                 body_order=body_names,
-                quaternion_order=quaternion_order,
-                fk_model_path=fk_model_path,
+                # ``merged`` is already canonical WXYZ with body poses
+                # materialized; the second pass only validates/writes it.
+                quaternion_order="wxyz",
                 derive_velocities=derive_velocities,
                 smpl_y_up=smpl_y_up,
                 compressed=compressed,
