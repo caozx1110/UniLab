@@ -655,11 +655,9 @@ class SonicPPORunner:
                     _, last_values = self.model.distribution(actor_obs, critic_obs, token_obs)
                 self.storage.compute_returns(last_values, self.algorithm.gamma, self.algorithm.lam)
                 metrics = self.algorithm.update(self.storage)
-                # Keep one immutable normalizer snapshot across collection and PPO.
-                # The just-consumed rollout updates the statistics for the next
-                # iteration, then rank-local moments are merged exactly once.
-                self.model.begin_normalizer_update()
-                self.model.update_normalizers(self.storage.critic_obs)
+                # SONIC v1.1 updates critic RMS after each normalized critic
+                # forward in train mode, then averages rank-local mean/var once
+                # per iteration. Rollout eval forwards never update it.
                 self.model.synchronize_normalizers()
                 _synchronize_cuda(self.device)
                 train_time = time.perf_counter() - train_started

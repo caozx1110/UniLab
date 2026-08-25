@@ -13,13 +13,29 @@ from torch.nn import functional as F
 
 
 class RunningMeanStd(nn.Module):
-    """Numerically stable per-feature running normalization."""
+    """SONIC v1.1 critic observation normalizer.
 
-    def __init__(self, width: int, epsilon: float = 1e-4) -> None:
+    The released trainer normalizes with the statistics visible at the start
+    of a critic forward, then updates those statistics from that PPO batch.
+    Rollout collection runs the model in eval mode and therefore leaves the
+    normalizer frozen.  Keeping that ordering is important: updating once from
+    the completed rollout is not equivalent to the twenty v1.1 PPO forwards.
+    """
+
+    def __init__(self, width: int, epsilon: float = 1e-5) -> None:
         super().__init__()
-        self.register_buffer("mean", torch.zeros(width))
-        self.register_buffer("var", torch.ones(width))
-        self.register_buffer("count", torch.tensor(float(epsilon)))
+        self.epsilon = float(epsilon)
+        self.frozen = False
+        self.register_buffer("mean", torch.zeros(width, dtype=torch.float32))
+        self.register_buffer("var", torch.ones(width, dtype=torch.float32))
+        # The pinned upstream implementation starts at one, not epsilon.
+        self.register_buffer("count", torch.ones((), dtype=torch.float32))
+
+    def freeze(self) -> None:
+        self.frozen = True
+
+    def unfreeze(self) -> None:
+        self.frozen = False
 
     @torch.no_grad()
     def update(self, values: torch.Tensor) -> None:
@@ -27,23 +43,33 @@ class RunningMeanStd(nn.Module):
         if flattened.numel() == 0:
             return
         batch_mean = flattened.mean(0)
-        batch_var = flattened.var(0, unbiased=False)
-        batch_count = torch.tensor(float(flattened.shape[0]), device=flattened.device)
+        # Match torch.Tensor.var's upstream default (Bessel corrected).
+        batch_var = flattened.var(0)
+        batch_count = torch.as_tensor(
+            float(flattened.shape[0]), device=flattened.device, dtype=torch.float32
+        )
         mean = cast(torch.Tensor, self.mean)
         var = cast(torch.Tensor, self.var)
         count = cast(torch.Tensor, self.count)
         delta = batch_mean - mean
         total = count + batch_count
-        mean.add_(delta * batch_count / total)
+        new_mean = mean + delta * batch_count / total
         m_a = var * count
         m_b = batch_var * batch_count
-        var.copy_((m_a + m_b + delta.square() * count * batch_count / total) / total)
+        new_var = (m_a + m_b + delta.square() * count * batch_count / total) / total
+        mean.copy_(new_mean)
+        var.copy_(new_var)
         count.copy_(total)
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         mean = cast(torch.Tensor, self.mean)
         var = cast(torch.Tensor, self.var)
-        return (values - mean.to(values)) / torch.sqrt(var.to(values) + 1e-5)
+        # Upstream computes the training input before mutating its statistics.
+        normalized = (values - mean.to(values)) / torch.sqrt(var.to(values) + self.epsilon)
+        normalized = normalized.clamp(-5.0, 5.0)
+        if self.training and not self.frozen:
+            self.update(values)
+        return normalized
 
 
 class FSQ(nn.Module):
@@ -747,7 +773,6 @@ class SonicActorCritic(nn.Module):
         self.critic_rms = (
             RunningMeanStd(self.critic_obs_dim) if self.critic_obs_normalization else None
         )
-        self._normalizer_start: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
         critic_widths = _normalise_hidden_dims(critic_hidden_dims, critic_fallback)
         # The release value head consumes privileged observations directly;
         # UniversalToken is an actor-side bottleneck and is not concatenated
@@ -886,49 +911,25 @@ class SonicActorCritic(nn.Module):
 
     @torch.no_grad()
     def begin_normalizer_update(self) -> None:
-        """Snapshot RMS state before a rank-local rollout is collected."""
-
-        if self.critic_rms is None:
-            self._normalizer_start = None
-            return
-        rms = self.critic_rms
-        self._normalizer_start = (
-            cast(torch.Tensor, rms.mean).detach().clone(),
-            cast(torch.Tensor, rms.var).detach().clone(),
-            cast(torch.Tensor, rms.count).detach().clone(),
-        )
+        """Compatibility no-op; v1.1 updates RMS inside critic forwards."""
 
     @torch.no_grad()
     def synchronize_normalizers(self) -> None:
         if self.critic_rms is None:
             return
         if not (dist.is_available() and dist.is_initialized()):
-            self._normalizer_start = None
-            return
-        if self._normalizer_start is None:
             return
         rms = self.critic_rms
-        start_mean, start_var, start_count = self._normalizer_start
         current_mean = cast(torch.Tensor, rms.mean)
         current_var = cast(torch.Tensor, rms.var)
-        current_count = cast(torch.Tensor, rms.count)
-        batch_count = (current_count - start_count).clamp_min(0.0)
-        batch_first = current_mean * current_count - start_mean * start_count
-        batch_second = (current_var + current_mean.square()) * current_count - (
-            start_var + start_mean.square()
-        ) * start_count
-        dist.all_reduce(batch_count, op=dist.ReduceOp.SUM)
-        dist.all_reduce(batch_first, op=dist.ReduceOp.SUM)
-        dist.all_reduce(batch_second, op=dist.ReduceOp.SUM)
-        total = start_count + batch_count
-        mean = (start_mean * start_count + batch_first) / total.clamp_min(1e-8)
-        var = ((start_var + start_mean.square()) * start_count + batch_second) / total.clamp_min(
-            1e-8
-        ) - mean.square()
-        current_mean.copy_(mean)
-        current_var.copy_(var.clamp_min(1e-6))
-        current_count.copy_(total)
-        self._normalizer_start = None
+        # The pinned trainer performs a crude arithmetic mean of each rank's
+        # accumulated mean/variance and deliberately does not synchronize
+        # count.  Preserve that executed behavior for checkpoint parity.
+        dist.all_reduce(current_mean, op=dist.ReduceOp.SUM)
+        dist.all_reduce(current_var, op=dist.ReduceOp.SUM)
+        world_size = dist.get_world_size()
+        current_mean.div_(world_size)
+        current_var.div_(world_size)
 
 
 __all__ = [
