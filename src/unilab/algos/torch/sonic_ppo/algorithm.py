@@ -87,7 +87,17 @@ class SonicPPO:
             if isinstance(raw_aux, Mapping)
             else {}
         )
-        self.optimizer = torch.optim.Adam(model.parameters(), lr=self.learning_rate)
+        decay_parameters: list[nn.Parameter] = []
+        bias_parameters: list[nn.Parameter] = []
+        for name, parameter in model.named_parameters():
+            (bias_parameters if name.endswith(".bias") else decay_parameters).append(parameter)
+        self.optimizer = torch.optim.AdamW(
+            (
+                {"params": decay_parameters, "weight_decay": 0.0},
+                {"params": bias_parameters, "weight_decay": 0.0},
+            ),
+            lr=self.learning_rate,
+        )
         self.update_count = 0
         self.last_optimizer_steps = 0
 
