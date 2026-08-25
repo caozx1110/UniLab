@@ -5,7 +5,7 @@
 
   <default>
     <default class="g1">
-      <joint frictionloss="0.3"/>
+      <joint frictionloss="0"/>
       <default class="visual">
         <geom group="2" type="mesh" density="0" material="silver" contype="0" conaffinity="0"/>
       </default>
