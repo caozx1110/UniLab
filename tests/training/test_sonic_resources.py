@@ -215,7 +215,10 @@ def test_numa_layout_must_cover_every_rank_gpu_node() -> None:
 def test_8x4090_profile_has_rank_local_six_cpu_segments() -> None:
     profile = SONIC_8X4090_76C_PROFILE
     assert profile.world_size == 8
-    resources = [profile.resolve(rank) for rank in range(profile.world_size)]
+    resources = [
+        profile.resolve(rank, available_cpu_ids=tuple(range(profile.cpu_count)))
+        for rank in range(profile.world_size)
+    ]
     assert [resource.worker_count for resource in resources] == [6] * 8
     assert resources[0].cpu_ids == tuple(range(0, 6))
     assert resources[3].cpu_ids == tuple(range(38, 44))
