@@ -1,11 +1,12 @@
-# SONIC release bridge profile.
+# SONIC bridge profile targeting the v1.1 observation recipe.
 #
-# This file mirrors the policy-defining values in
-# GR00T-WholeBodyControl/gear_sonic/config/exp/.../sonic_release.yaml.  It is
-# intentionally a bridge profile rather than a claim that the existing flat
-# RSL-RL motion-tracking task is SONIC-compatible.  `sonic.mode=preflight` is
-# safe to run without a CUDA driver; `sonic.mode=train` selects the built-in
-# native SonicPPO owner and should use a versioned motion manifest.
+# The observation ABI targets
+# GR00T-WholeBodyControl/gear_sonic/config/exp/manager/universal_token/
+# all_modes/sonic_v1_1.yaml at the pinned revision below.  This remains
+# intentionally an observation bridge profile, not a claim that named-model or
+# reward/task parity is complete.  `sonic.mode=preflight` is safe to run without
+# a CUDA driver; `sonic.mode=train` selects the built-in native SonicPPO owner
+# and should use a versioned motion manifest.
 
 defaults:
   - _self_
@@ -47,6 +48,11 @@ training:
   resume: null
 
 sonic:
+  # The task/backend owner is the single source; owner validation also pins
+  # these resolved values so CLI overrides cannot forge provenance.
+  target_recipe: ${sonic.owner.target_recipe}
+  target_revision: ${sonic.owner.target_revision}
+  observation_profile: ${sonic.owner.observation_profile}
   mode: preflight
   # In train mode a missing entrypoint selects the built-in native owner.
   # Set this explicitly only for a separately packaged compatible owner.
@@ -86,7 +92,7 @@ sonic:
     init_noise_std: 0.05
     std_clamp_min: 0.001
     std_clamp_max: 0.5
-  # sonic_release.yaml samples G1, teleop and SMPL uniformly.
+  # sonic_v1_1.yaml samples G1, teleop and SMPL uniformly.
   encoder_sample_probs: [1.0, 1.0, 1.0]
   optimizer_step_per_microbatch: true
   aux_loss_coef:

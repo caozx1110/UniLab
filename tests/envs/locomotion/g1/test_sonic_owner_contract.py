@@ -32,9 +32,9 @@ from unilab.training.sonic_store import SonicMotionLoader
 mujoco = pytest.importorskip("mujoco")
 
 # These expected layouts are transcribed from
-# GR00T-WholeBodyControl@c374bae5b9039cd0ee71377e654d11ce1bc69e1d:
+# GR00T-WholeBodyControl@a0732b642c0333077e127a2f56ab0014c196bca4:
 # gear_sonic/config/manager_env/observations/{policy/local_dir_hist,
-# critic/privileged_mf_hist,tokenizer/unitoken_all_noz}.yaml and the
+# critic/privileged_mf_hist,tokenizer/unitoken_all_noz_heading}.yaml and the
 # PolicyCfg/PrivilegedCfg/TokenizerCfg declarations in observations.py.
 # IsaacLab v2.3.2 ObservationManager iterates those configclass declarations.
 
@@ -167,13 +167,13 @@ def test_sonic_observation_layouts_are_immutable_and_contiguous() -> None:
             ("command_multi_future_nonflat", (10, 58), 3, 583),
             ("command_z_multi_future_nonflat", (10, 1), 583, 593),
             ("command_z", (1,), 593, 594),
-            ("motion_anchor_ori_b", (6,), 594, 600),
-            ("motion_anchor_ori_b_mf_nonflat", (10, 6), 600, 660),
+            ("motion_anchor_ori_heading_mf_nonflat", (10, 6), 594, 654),
+            ("motion_anchor_ori_heading", (6,), 654, 660),
             ("command_multi_future_lower_body", (240,), 660, 900),
             ("vr_3point_local_target", (9,), 900, 909),
             ("vr_3point_local_orn_target", (12,), 909, 921),
             ("smpl_joints_multi_future_local_nonflat", (10, 72), 921, 1641),
-            ("smpl_root_ori_b_multi_future", (10, 6), 1641, 1701),
+            ("smpl_root_ori_heading_multi_future", (10, 6), 1641, 1701),
             ("joint_pos_multi_future_wrist_for_smpl", (10, 6), 1701, 1761),
         ),
     }
@@ -280,8 +280,8 @@ def test_sonic_vr_offsets_and_training_deploy_width_provenance() -> None:
         SONIC_VR_BODY_OFFSETS,
         ((0.18, -0.025, 0.0), (0.18, 0.025, 0.0), (0.0, 0.0, 0.35)),
     )
-    # unitoken_all_noz.yaml is the 1761-wide training group.  The release
-    # encoder export observation_config_sonic_release.yaml selects 1750 active
+    # unitoken_all_noz_heading.yaml is the 1761-wide v1.1 training group.  The release
+    # encoder export observation_config_sonic_v1_1.yaml selects 1750 active
     # tokenizer dimensions plus one scalar mode, omitting the two command-z
     # terms (11 dimensions total).
     assert SONIC_TOKENIZER_OBS_DIM == 1761
@@ -347,7 +347,7 @@ def _synthetic_upstream_future(phase: int) -> dict[str, np.ndarray]:
 
 
 def test_sonic_compute_obs_matches_independent_upstream_reset_and_step_fixture() -> None:
-    """Every slice follows GR00T-WBC@c374bae5, using no production packer/layout oracle."""
+    """Every slice follows GR00T-WBC@a0732b64, without a production layout oracle."""
 
     mujoco_to_policy = _indices(
         "0 6 12 1 7 13 2 8 14 3 9 15 22 4 10 16 23 5 11 17 24 18 25 19 26 20 27 21 28"
@@ -464,8 +464,8 @@ def test_sonic_compute_obs_matches_independent_upstream_reset_and_step_fixture()
                 (3, 583, command.reshape(1, 10, 58)),
                 (583, 593, command_z),
                 (593, 594, command_z[:, 0]),
-                (594, 600, anchor_ori_b + 0.05),
-                (600, 660, future_ori + 0.05),
+                (594, 654, future_ori + 0.05),
+                (654, 660, anchor_ori_b + 0.05),
                 (660, 900, lower),
                 (900, 909, vr_pos),
                 (909, 921, vr_quat),
@@ -569,7 +569,10 @@ def test_sonic_env_uses_reordered_materialized_store(tmp_path: Path) -> None:
         np.testing.assert_array_equal(env._encoder_index[1], (0.0, 1.0, 0.0))
 
         state = env.step(np.zeros((2, 29), dtype=np.float32))
+        assert set(state.obs) == {"actor_obs", "critic_obs", "tokenizer"}
         assert state.obs["actor_obs"].shape == (2, 930)
+        assert state.obs["critic_obs"].shape == (2, 1645)
+        assert state.obs["tokenizer"].shape == (2, 1761)
         assert state.reward.shape == (2,)
 
         runner = SonicPPORunner(

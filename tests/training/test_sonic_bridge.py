@@ -38,6 +38,13 @@ def test_default_plan_uses_configured_eight_rank_budget(tmp_path: Path):
     assert plan.resources.worker_count == 6
     assert cfg.training.task_name == "SonicG1Tracking"
     assert cfg.training.sim_backend == "mujoco"
+    assert cfg.sonic.target_recipe == "sonic_v1_1"
+    assert cfg.sonic.target_revision == "a0732b642c0333077e127a2f56ab0014c196bca4"
+    assert cfg.sonic.observation_profile == "unitoken_all_noz_heading"
+    assert cfg.sonic.owner.target_recipe == cfg.sonic.target_recipe
+    assert cfg.sonic.owner.target_revision == cfg.sonic.target_revision
+    assert cfg.sonic.owner.observation_profile == cfg.sonic.observation_profile
+    assert plan.env_cfg_override["observation_profile"] == "unitoken_all_noz_heading"
     assert plan.env_cfg_override["cpu_ids"] == [0, 1, 2, 3, 4, 5]
     assert plan.env_cfg_override["reward_config"]["scales"]["motion_body_pos"] == 1.0
     # IsaacLab calls this ``decimation``; the UniLab EnvCfg contract uses the
@@ -234,4 +241,22 @@ def test_owner_backend_cannot_be_switched_by_training_override(tmp_path: Path):
         ]
     )
     with pytest.raises(SonicBridgeError, match="owner"):
+        build_sonic_launch_plan(cfg, root_dir=tmp_path, rank=0, world_size=1)
+
+
+@pytest.mark.parametrize(
+    ("override", "field"),
+    (
+        ("sonic.target_recipe=sonic_release", "target_recipe"),
+        ("sonic.target_revision=deadbeef", "target_revision"),
+        ("sonic.observation_profile=unitoken_all_noz", "observation_profile"),
+        ("sonic.owner.target_recipe=sonic_release", "target_recipe"),
+        ("sonic.owner.target_revision=deadbeef", "target_revision"),
+        ("sonic.owner.observation_profile=unitoken_all_noz", "observation_profile"),
+        ("env.observation_profile=unitoken_all_noz", "observation_profile"),
+    ),
+)
+def test_owner_provenance_overrides_fail_closed(tmp_path: Path, override: str, field: str) -> None:
+    cfg = _cfg(["training.log_dir=" + str(tmp_path), override])
+    with pytest.raises(SonicBridgeError, match=field):
         build_sonic_launch_plan(cfg, root_dir=tmp_path, rank=0, world_size=1)
