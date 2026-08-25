@@ -18,6 +18,15 @@ from unilab.training.sonic_bridge import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _mock_8x4090_cpuset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep profile-backed bridge tests independent of the CI runner cpuset."""
+    monkeypatch.setattr(
+        "unilab.training.sonic_bridge.available_logical_cpu_ids",
+        lambda: tuple(range(152)),
+    )
+
+
 def _cfg(overrides: list[str] | None = None):
     GlobalHydra.instance().clear()
     with initialize_config_dir(
