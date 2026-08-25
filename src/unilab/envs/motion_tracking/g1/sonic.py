@@ -406,6 +406,10 @@ class SonicG1TrackingCfg(MotionTrackingCfg):
     vr_body_names: tuple[str, ...] = SONIC_VR_BODY_ORDER
     vr_body_offsets: tuple[tuple[float, float, float], ...] = SONIC_VR_BODY_OFFSETS
     use_release_action_scale: bool = True
+    # The release wrapper clips the policy sample before passing it to the
+    # IsaacLab action manager.  PPO still stores/log-probs the unclipped sample;
+    # this bound therefore belongs at the environment action boundary.
+    action_clip_value: float = 20.0
     # SONIC clips are materialized in the configured 14-body order. The
     # shared tracking engine otherwise assumes MuJoCo body-id indexing.
     motion_data_body_indices: tuple[int, ...] = tuple(range(len(SONIC_BODY_ORDER)))
@@ -624,12 +628,18 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         actions = np.asarray(actions, dtype=np.float32)
         if actions.ndim != 2 or actions.shape[1] != len(SONIC_JOINT_ORDER):
             raise ValueError(f"SONIC actions must have shape (N, 29), got {actions.shape}")
-        state.info["last_actions"] = state.info.get("current_actions", np.zeros_like(actions))
-        state.info["current_actions"] = actions
+        clip_value = float(self._cfg.action_clip_value)
+        if clip_value <= 0.0:
+            raise ValueError(f"SONIC action_clip_value must be positive, got {clip_value}")
+        processed_actions = np.clip(actions, -clip_value, clip_value)
+        state.info["last_actions"] = state.info.get(
+            "current_actions", np.zeros_like(processed_actions)
+        )
+        state.info["current_actions"] = processed_actions
         delayed = (
             state.info["last_actions"]
             if self._cfg.control_config.simulate_action_latency
-            else actions
+            else processed_actions
         )
         # Scale/defaults share the IsaacLab policy ABI.  Only the completed
         # target is mapped back to the backend/MuJoCo actuator order.

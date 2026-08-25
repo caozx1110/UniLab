@@ -503,7 +503,7 @@ def test_sonic_policy_actions_map_to_mujoco_before_scale_default_and_bias() -> N
     instance._policy_to_backend = np.asarray(SONIC_POLICY_TO_MUJOCO, dtype=np.int32)
     instance.default_angles = np.arange(29, dtype=np.float32)
     instance._policy_default_angles = instance.default_angles[list(SONIC_MUJOCO_TO_POLICY)]
-    actions = (100 + np.arange(29, dtype=np.float32))[None]
+    actions = (np.arange(29, dtype=np.float32) - 14.0)[None]
     bias = (1000 + np.arange(29, dtype=np.float32))[None]
     state = SimpleNamespace(info={"default_dof_pos_bias": bias})
     target = instance.apply_action(actions, state)
