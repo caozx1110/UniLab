@@ -608,7 +608,7 @@ def test_cleanup_preserves_primary_error_and_attempts_every_action(
     assert lifecycle == ["close", "destroy"]
 
 
-def test_runner_updates_critic_rms_once_after_rollout(monkeypatch) -> None:
+def test_critic_rms_freezes_in_eval_and_updates_per_train_batch() -> None:
     config = {
         "num_steps_per_env": 1,
         "num_mini_batches": 1,
@@ -622,20 +622,21 @@ def test_runner_updates_critic_rms_once_after_rollout(monkeypatch) -> None:
         },
     }
     runner = SonicPPORunner(_StateEnv(), config, device="cpu")
-    calls: list[tuple[int, ...]] = []
-    original_update = runner.model.update_normalizers
-
-    def update(values: torch.Tensor) -> None:
-        calls.append(tuple(values.shape))
-        original_update(values)
-
-    monkeypatch.setattr(runner.model, "update_normalizers", update)
-
-    runner.learn(1)
-
-    assert calls == [(1, 2, 1645)]
     assert runner.model.critic_rms is not None
-    assert float(runner.model.critic_rms.count) == pytest.approx(2.0001)
+    critic_rms = runner.model.critic_rms
+    actor_obs = torch.zeros(2, runner.model.actor_obs_dim)
+    critic_obs = torch.ones(2, runner.model.critic_obs_dim)
+
+    assert float(critic_rms.count) == pytest.approx(1.0)
+    runner.model.eval()
+    runner.model.distribution(actor_obs, critic_obs)
+    assert float(critic_rms.count) == pytest.approx(1.0)
+
+    runner.model.train()
+    runner.model.distribution(actor_obs, critic_obs)
+    assert float(critic_rms.count) == pytest.approx(3.0)
+    runner.model.distribution(actor_obs, critic_obs)
+    assert float(critic_rms.count) == pytest.approx(5.0)
 
 
 def test_train_resume_runs_only_remaining_target_iterations(
