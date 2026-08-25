@@ -269,6 +269,8 @@ class SonicPPORunner:
         dimensions = dimensions if isinstance(dimensions, Mapping) else {}
         model_config = _get(self.config, "sonic.model", {})
         model_config = model_config if isinstance(model_config, Mapping) else {}
+        critic_config = model_config.get("critic", {})
+        critic_config = critic_config if isinstance(critic_config, Mapping) else {}
         self.num_envs = int(
             getattr(
                 env,
@@ -296,8 +298,16 @@ class SonicPPORunner:
             action_dim=int(_get(self.config, "action_dim", dimensions.get("action_dim", 29))),
             hidden_dims=model_config.get("hidden_dims"),
             actor_hidden_dims=model_config.get("actor_hidden_dims"),
-            critic_hidden_dims=model_config.get("critic_hidden_dims"),
+            critic_hidden_dims=model_config.get(
+                "critic_hidden_dims", critic_config.get("hidden_dims")
+            ),
             tokenizer_hidden_dim=int(model_config.get("tokenizer_hidden_dim", 512)),
+            encoder_hidden_dims=model_config.get("encoder_hidden_dims"),
+            kinematic_hidden_dims=model_config.get("kinematic_hidden_dims"),
+            model_profile=str(model_config.get("profile", "auto")),
+            tokenizer_fields=model_config.get("tokenizer_fields"),
+            encoders=model_config.get("encoders"),
+            decoders=model_config.get("decoders"),
             token_levels=int(model_config.get("token_levels", 32)),
             token_count=int(model_config.get("token_count", 2)),
             critic_obs_normalization=bool(model_config.get("critic_obs_normalization", False)),
@@ -305,6 +315,16 @@ class SonicPPORunner:
             std_clamp_min=float(model_config.get("std_clamp_min", 0.001)),
             std_clamp_max=float(model_config.get("std_clamp_max", 0.5)),
         ).to(self.device)
+        configured_contract_version = model_config.get("contract_version")
+        if (
+            configured_contract_version is not None
+            and str(configured_contract_version) != self.model.model_contract_version
+        ):
+            raise ValueError(
+                "SONIC model config contract/version mismatch: "
+                f"configured={configured_contract_version!r}, "
+                f"owner={self.model.model_contract_version!r}"
+            )
         _broadcast_model_state(self.model)
         self.algorithm = SonicPPO(self.model, self.config, self.device)
         self.storage = SonicRolloutStorage(
@@ -696,6 +716,8 @@ class SonicPPORunner:
             "iteration": self.current_learning_iteration,
             "token_info": token_info,
             "contract": {
+                "model_contract_version": self.model.model_contract_version,
+                "model_profile": self.model.model_profile,
                 "actor_obs_dim": self.model.actor_obs_dim,
                 "critic_obs_dim": self.model.critic_obs_dim,
                 "tokenizer_obs_dim": self.model.tokenizer_obs_dim,
@@ -728,7 +750,15 @@ class SonicPPORunner:
             contract = state["contract"]
             if not isinstance(contract, Mapping):
                 raise ValueError("SONIC checkpoint contract must be a mapping")
+            checkpoint_version = contract.get("model_contract_version")
+            if checkpoint_version != self.model.model_contract_version:
+                raise ValueError(
+                    "SONIC checkpoint model contract/version mismatch: "
+                    f"checkpoint={checkpoint_version!r}, "
+                    f"expected={self.model.model_contract_version!r}"
+                )
             expected_contract = {
+                "model_profile": self.model.model_profile,
                 "actor_obs_dim": self.model.actor_obs_dim,
                 "critic_obs_dim": self.model.critic_obs_dim,
                 "tokenizer_obs_dim": self.model.tokenizer_obs_dim,
@@ -757,7 +787,12 @@ class SonicPPORunner:
         try:
             self.model.load_state_dict(model_state)
         except RuntimeError as exc:
-            raise ValueError(f"SONIC checkpoint model shape mismatch: {exc}") from exc
+            label = (
+                "model contract/version mismatch"
+                if self.model.model_profile == "sonic_v1_1"
+                else "model shape mismatch"
+            )
+            raise ValueError(f"SONIC checkpoint {label}: {exc}") from exc
         if not has_contract:
             return
 

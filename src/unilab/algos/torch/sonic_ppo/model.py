@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import cast
+from collections.abc import Mapping, Sequence
+from math import prod
+from typing import Any, cast
 
 import torch
 import torch.distributed as dist
@@ -109,15 +110,118 @@ class FSQ(nn.Module):
         return (quantized * (self.levels // 2) + self.levels // 2).round().long()
 
 
-class UniversalToken(nn.Module):
-    """MLP encoder with the SONIC UniversalToken ``2 x 32`` bottleneck."""
+SONIC_V11_MODEL_CONTRACT_VERSION = "sonic_v1_1_named_universal_token.v1"
+_DENSE_TEST_MODEL_CONTRACT_VERSION = "unilab_sonic_dense_test.v1"
+
+
+_SONIC_V11_TOKENIZER_FIELDS: dict[str, dict[str, object]] = {
+    "encoder_index": {"slice": (0, 3), "shape": (3,)},
+    "command_multi_future_nonflat": {"slice": (3, 583), "shape": (10, 58)},
+    "command_z_multi_future_nonflat": {"slice": (583, 593), "shape": (10, 1)},
+    "command_z": {"slice": (593, 594), "shape": (1,)},
+    "motion_anchor_ori_heading_mf_nonflat": {
+        "slice": (594, 654),
+        "shape": (10, 6),
+    },
+    "motion_anchor_ori_heading": {"slice": (654, 660), "shape": (6,)},
+    "command_multi_future_lower_body": {"slice": (660, 900), "shape": (240,)},
+    "vr_3point_local_target": {"slice": (900, 909), "shape": (9,)},
+    "vr_3point_local_orn_target": {"slice": (909, 921), "shape": (12,)},
+    "smpl_joints_multi_future_local_nonflat": {
+        "slice": (921, 1641),
+        "shape": (10, 72),
+    },
+    "smpl_root_ori_heading_multi_future": {
+        "slice": (1641, 1701),
+        "shape": (10, 6),
+    },
+    "joint_pos_multi_future_wrist_for_smpl": {
+        "slice": (1701, 1761),
+        "shape": (10, 6),
+    },
+}
+
+_SONIC_V11_ENCODERS: dict[str, dict[str, object]] = {
+    "g1": {
+        "inputs": (
+            "command_multi_future_nonflat",
+            "motion_anchor_ori_heading_mf_nonflat",
+        ),
+        "temporal": True,
+        "hidden_dims": (2048, 1024, 512, 512),
+    },
+    "teleop": {
+        "inputs": (
+            "command_multi_future_lower_body",
+            "vr_3point_local_target",
+            "vr_3point_local_orn_target",
+            "motion_anchor_ori_heading",
+        ),
+        "temporal": False,
+        "hidden_dims": (2048, 1024, 512, 512),
+    },
+    "smpl": {
+        "inputs": (
+            "smpl_joints_multi_future_local_nonflat",
+            "smpl_root_ori_heading_multi_future",
+            "joint_pos_multi_future_wrist_for_smpl",
+        ),
+        "temporal": True,
+        "hidden_dims": (2048, 1024, 512, 512),
+    },
+}
+
+_SONIC_V11_DECODERS: dict[str, dict[str, object]] = {
+    "g1_dyn": {
+        "inputs": ("token_flattened", "actor_obs"),
+        "outputs": {"action": (29,)},
+        "hidden_dims": (4096, 4096, 2048, 2048, 1024, 1024, 512, 512),
+    },
+    "g1_kin": {
+        "inputs": ("token_flattened",),
+        "outputs": {
+            "command_multi_future_nonflat": (10, 58),
+            "motion_anchor_ori_heading_mf_nonflat": (10, 6),
+        },
+        "hidden_dims": (2048, 1024, 512, 512),
+    },
+}
+
+
+def _mlp(input_dim: int, output_dim: int, widths: Sequence[int]) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    last = int(input_dim)
+    for width in widths:
+        layers.extend((nn.Linear(last, int(width)), nn.SiLU()))
+        last = int(width)
+    layers.append(nn.Linear(last, int(output_dim)))
+    return nn.Sequential(*layers)
+
+
+def _checked_mapping(value: object, *, name: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise ValueError(f"{name} must be a mapping")
+    return cast(Mapping[str, Any], value)
+
+
+def _checked_names(value: object, *, name: str) -> tuple[str, ...]:
+    if not isinstance(value, Sequence) or isinstance(value, str):
+        raise ValueError(f"{name} must be a sequence of names")
+    names = tuple(str(item) for item in value)
+    if not names or len(set(names)) != len(names):
+        raise ValueError(f"{name} must contain unique names")
+    return names
+
+
+class _DenseUniversalToken(nn.Module):
+    """Small compatibility owner used only by explicit local/unit-test profiles."""
 
     def __init__(
         self,
-        input_dim: int = 1761,
-        num_tokens: int = 2,
-        levels: int = 32,
-        hidden_dim: int = 512,
+        input_dim: int,
+        num_tokens: int,
+        levels: int,
+        hidden_dim: int,
     ) -> None:
         super().__init__()
         if input_dim < 1 or hidden_dim < 1:
@@ -127,13 +231,7 @@ class UniversalToken(nn.Module):
         self.token_dim = int(levels)
         self.token_total_dim = self.num_tokens * self.token_dim
         self.fsq = FSQ(self.num_tokens, levels, self.token_dim)
-        self.encoder = nn.Sequential(
-            nn.Linear(self.input_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, self.token_total_dim),
-        )
+        self.encoder = _mlp(self.input_dim, self.token_total_dim, (hidden_dim, hidden_dim))
         self.reconstruction = nn.Linear(self.token_total_dim, self.input_dim)
 
     def encode(self, observations: torch.Tensor) -> torch.Tensor:
@@ -158,8 +256,6 @@ class UniversalToken(nn.Module):
         }
 
     def auxiliary_losses(self, observations: torch.Tensor) -> dict[str, torch.Tensor]:
-        """Return differentiable tokenizer reconstruction/commitment terms."""
-
         latent = self.encode(observations)
         tokens = self.fsq(latent)
         flat_tokens = tokens.reshape(*tokens.shape[:-2], -1)
@@ -167,6 +263,270 @@ class UniversalToken(nn.Module):
         return {
             "token_reconstruction": (reconstruction - observations).square().mean(),
             "token_commitment": (latent - tokens.detach()).square().mean(),
+        }
+
+
+class UniversalToken(nn.Module):
+    """SONIC v1.1 named encoders, shared FSQ and named decoders.
+
+    The flat 1761-wide environment/storage ABI stays unchanged.  Parsing and
+    architecture are supplied by the composed owner config; this module owns
+    only model-side validation and routing.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        actor_obs_dim: int,
+        action_dim: int,
+        *,
+        fields: Mapping[str, Any],
+        encoders: Mapping[str, Any],
+        decoders: Mapping[str, Any],
+        num_tokens: int = 2,
+        levels: int = 32,
+    ) -> None:
+        super().__init__()
+        if (input_dim, actor_obs_dim, action_dim, num_tokens, levels) != (
+            1761,
+            930,
+            29,
+            2,
+            32,
+        ):
+            raise ValueError(
+                "sonic_v1_1 requires tokenizer/actor/action/token/level dimensions 1761/930/29/2/32"
+            )
+        self.input_dim = int(input_dim)
+        self.actor_obs_dim = int(actor_obs_dim)
+        self.action_dim = int(action_dim)
+        self.num_tokens = int(num_tokens)
+        self.token_dim = int(levels)
+        self.token_total_dim = self.num_tokens * self.token_dim
+        self.fsq = FSQ(self.num_tokens, levels, self.token_dim)
+
+        self.field_slices: dict[str, tuple[int, int]] = {}
+        self.field_shapes: dict[str, tuple[int, ...]] = {}
+        coverage: list[tuple[int, int, str]] = []
+        for field_name, raw_field in fields.items():
+            field = _checked_mapping(raw_field, name=f"tokenizer field {field_name!r}")
+            raw_slice = field.get("slice")
+            raw_shape = field.get("shape")
+            if (
+                not isinstance(raw_slice, Sequence)
+                or isinstance(raw_slice, str)
+                or len(raw_slice) != 2
+                or not isinstance(raw_shape, Sequence)
+                or isinstance(raw_shape, str)
+            ):
+                raise ValueError(f"tokenizer field {field_name!r} needs slice=[start,end], shape")
+            start, end = (int(raw_slice[0]), int(raw_slice[1]))
+            shape = tuple(int(dim) for dim in raw_shape)
+            if start < 0 or end <= start or end > self.input_dim or any(dim < 1 for dim in shape):
+                raise ValueError(f"invalid tokenizer field {field_name!r} slice/shape")
+            if prod(shape) != end - start:
+                raise ValueError(f"tokenizer field {field_name!r} shape does not match its slice")
+            name = str(field_name)
+            self.field_slices[name] = (start, end)
+            self.field_shapes[name] = shape
+            coverage.append((start, end, name))
+        cursor = 0
+        for start, end, name in sorted(coverage):
+            if start != cursor:
+                raise ValueError(
+                    f"tokenizer fields must cover the flat ABI exactly; gap/overlap before {name!r}"
+                )
+            cursor = end
+        if cursor != self.input_dim:
+            raise ValueError("tokenizer fields do not cover the complete 1761D ABI")
+
+        self.encoder_names = tuple(str(name) for name in encoders)
+        if self.encoder_names != ("g1", "teleop", "smpl"):
+            raise ValueError("sonic_v1_1 encoders must be ordered [g1, teleop, smpl]")
+        if self.field_shapes.get("encoder_index") != (len(self.encoder_names),):
+            raise ValueError("encoder_index must have one column per named encoder")
+        self.encoder_inputs: dict[str, tuple[str, ...]] = {}
+        self.encoder_temporal: dict[str, bool] = {}
+        self.encoders = nn.ModuleDict()
+        for encoder_name, raw_encoder in encoders.items():
+            encoder = _checked_mapping(raw_encoder, name=f"encoder {encoder_name!r}")
+            inputs = _checked_names(encoder.get("inputs"), name=f"encoder {encoder_name}.inputs")
+            missing = [name for name in inputs if name not in self.field_shapes]
+            if missing:
+                raise ValueError(f"encoder {encoder_name!r} has unknown inputs: {missing}")
+            temporal = bool(encoder.get("temporal", False))
+            shapes = [self.field_shapes[name] for name in inputs]
+            if temporal:
+                prefixes = {shape[:-1] for shape in shapes}
+                if len(prefixes) != 1 or not next(iter(prefixes)):
+                    raise ValueError(
+                        f"temporal encoder {encoder_name!r} inputs need the same frame shape"
+                    )
+                input_width = prod(next(iter(prefixes))) * sum(shape[-1] for shape in shapes)
+            else:
+                input_width = sum(prod(shape) for shape in shapes)
+            widths = _normalise_hidden_dims(encoder.get("hidden_dims"), ())
+            self.encoders[str(encoder_name)] = _mlp(input_width, self.token_total_dim, widths)
+            self.encoder_inputs[str(encoder_name)] = inputs
+            self.encoder_temporal[str(encoder_name)] = temporal
+
+        self.decoder_inputs: dict[str, tuple[str, ...]] = {}
+        self.decoder_outputs: dict[str, dict[str, tuple[int, ...]]] = {}
+        self.decoders = nn.ModuleDict()
+        if tuple(str(name) for name in decoders) != ("g1_dyn", "g1_kin"):
+            raise ValueError("sonic_v1_1 decoders must be ordered [g1_dyn, g1_kin]")
+        available_inputs = {
+            "token_flattened": self.token_total_dim,
+            "actor_obs": self.actor_obs_dim,
+        }
+        for decoder_name, raw_decoder in decoders.items():
+            decoder = _checked_mapping(raw_decoder, name=f"decoder {decoder_name!r}")
+            inputs = _checked_names(decoder.get("inputs"), name=f"decoder {decoder_name}.inputs")
+            if any(name not in available_inputs for name in inputs):
+                raise ValueError(f"decoder {decoder_name!r} has unsupported inputs {inputs}")
+            raw_outputs = _checked_mapping(
+                decoder.get("outputs"), name=f"decoder {decoder_name}.outputs"
+            )
+            outputs: dict[str, tuple[int, ...]] = {}
+            for output_name, raw_shape in raw_outputs.items():
+                if not isinstance(raw_shape, Sequence) or isinstance(raw_shape, str):
+                    raise ValueError(f"decoder output {output_name!r} shape must be a sequence")
+                shape = tuple(int(dim) for dim in raw_shape)
+                if not shape or any(dim < 1 for dim in shape):
+                    raise ValueError(f"decoder output {output_name!r} has invalid shape")
+                outputs[str(output_name)] = shape
+            widths = _normalise_hidden_dims(decoder.get("hidden_dims"), ())
+            input_width = sum(available_inputs[name] for name in inputs)
+            output_width = sum(prod(shape) for shape in outputs.values())
+            self.decoders[str(decoder_name)] = _mlp(input_width, output_width, widths)
+            self.decoder_inputs[str(decoder_name)] = inputs
+            self.decoder_outputs[str(decoder_name)] = outputs
+        if self.decoder_inputs["g1_dyn"] != ("token_flattened", "actor_obs"):
+            raise ValueError("g1_dyn inputs must be [token_flattened, actor_obs]")
+        if self.decoder_outputs["g1_dyn"] != {"action": (self.action_dim,)}:
+            raise ValueError("g1_dyn must return the 29D action field")
+        expected_kin = {
+            "command_multi_future_nonflat": (10, 58),
+            "motion_anchor_ori_heading_mf_nonflat": (10, 6),
+        }
+        if self.decoder_inputs["g1_kin"] != ("token_flattened",):
+            raise ValueError("g1_kin input must be [token_flattened]")
+        if self.decoder_outputs["g1_kin"] != expected_kin:
+            raise ValueError("g1_kin outputs do not match the v1.1 heading fields")
+
+    def parse(self, observations: torch.Tensor) -> dict[str, torch.Tensor]:
+        if observations.ndim < 2 or observations.shape[-1] != self.input_dim:
+            raise ValueError(
+                f"tokenizer expects (..., {self.input_dim}), got {tuple(observations.shape)}"
+            )
+        leading = observations.shape[:-1]
+        return {
+            name: observations[..., start:end].reshape(*leading, *self.field_shapes[name])
+            for name, (start, end) in self.field_slices.items()
+        }
+
+    def _encoder_input(
+        self,
+        encoder_name: str,
+        parsed: Mapping[str, torch.Tensor],
+        leading: tuple[int, ...],
+    ) -> torch.Tensor:
+        values = [parsed[name] for name in self.encoder_inputs[encoder_name]]
+        if self.encoder_temporal[encoder_name]:
+            combined = torch.cat(values, dim=-1)
+        else:
+            combined = torch.cat([value.reshape(*leading, -1) for value in values], dim=-1)
+        return combined.reshape(prod(leading), -1)
+
+    def route(self, observations: torch.Tensor) -> tuple[torch.Tensor, dict[str, object]]:
+        parsed = self.parse(observations)
+        leading = tuple(int(dim) for dim in observations.shape[:-1])
+        encoder_index = parsed["encoder_index"].reshape(prod(leading), len(self.encoder_names))
+        masks = {
+            name: encoder_index[:, index].bool() for index, name in enumerate(self.encoder_names)
+        }
+        if (~torch.stack(tuple(masks.values()), dim=-1).any(dim=-1)).any():
+            raise ValueError("every SONIC sample must activate at least one named encoder")
+
+        flat_tokens = torch.zeros(
+            prod(leading),
+            self.num_tokens,
+            self.token_dim,
+            dtype=observations.dtype,
+            device=observations.device,
+        )
+        encoded_latents: dict[str, torch.Tensor] = {}
+        encoded_tokens: dict[str, torch.Tensor] = {}
+        for encoder_name in self.encoder_names:
+            mask = masks[encoder_name]
+            encoder_input = self._encoder_input(encoder_name, parsed, leading)[mask]
+            latent = self.encoders[encoder_name](encoder_input).reshape(
+                -1, self.num_tokens, self.token_dim
+            )
+            tokens = self.fsq(latent)
+            rows = mask.nonzero(as_tuple=False).flatten()
+            scattered = torch.zeros_like(flat_tokens).index_copy(0, rows, tokens)
+            # Upstream iterates g1 -> teleop -> smpl.  Later active routes win,
+            # so a paired SMPL/G1 sample uses its SMPL token for g1_dyn.
+            flat_tokens = torch.where(mask[:, None, None], scattered, flat_tokens)
+            encoded_latents[encoder_name] = latent
+            encoded_tokens[encoder_name] = tokens
+        tokens = flat_tokens.reshape(*leading, self.num_tokens, self.token_dim)
+        return tokens, {
+            "tokenizer_obs": parsed,
+            "encoder_masks": masks,
+            "encoded_latents": encoded_latents,
+            "encoded_tokens": encoded_tokens,
+        }
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        return self.route(observations)[0]
+
+    def decode(self, observations: torch.Tensor, actor_obs: torch.Tensor) -> dict[str, object]:
+        if (
+            actor_obs.shape[:-1] != observations.shape[:-1]
+            or actor_obs.shape[-1] != self.actor_obs_dim
+        ):
+            raise ValueError(
+                f"actor observations must have shape {(*observations.shape[:-1], self.actor_obs_dim)}"
+            )
+        tokens, details = self.route(observations)
+        token_flattened = tokens.reshape(*tokens.shape[:-2], self.token_total_dim)
+        decoder_values = {
+            "token_flattened": token_flattened,
+            "actor_obs": actor_obs,
+        }
+        decoded_outputs: dict[str, dict[str, torch.Tensor]] = {}
+        for decoder_name, decoder in self.decoders.items():
+            decoder_input = torch.cat(
+                [decoder_values[name] for name in self.decoder_inputs[decoder_name]], dim=-1
+            )
+            raw_output = decoder(decoder_input)
+            outputs: dict[str, torch.Tensor] = {}
+            cursor = 0
+            for output_name, shape in self.decoder_outputs[decoder_name].items():
+                width = prod(shape)
+                outputs[output_name] = raw_output[..., cursor : cursor + width].reshape(
+                    *raw_output.shape[:-1], *shape
+                )
+                cursor += width
+            decoded_outputs[decoder_name] = outputs
+        return {
+            **details,
+            "tokens": tokens,
+            "decoded_outputs": decoded_outputs,
+            "action_mean": decoded_outputs["g1_dyn"]["action"],
+        }
+
+    def get_token_info(self) -> dict[str, object]:
+        return {
+            "token_dim": self.token_dim,
+            "total_dim": self.token_total_dim,
+            "num_tokens": self.num_tokens,
+            "num_levels": self.token_dim,
+            "level_list": list(self.fsq.level_list),
+            "encoder_names": list(self.encoder_names),
+            "decoder_names": list(self.decoders),
         }
 
 
@@ -193,6 +553,12 @@ class SonicActorCritic(nn.Module):
         actor_hidden_dims: Sequence[int] | None = None,
         critic_hidden_dims: Sequence[int] | None = None,
         tokenizer_hidden_dim: int = 512,
+        encoder_hidden_dims: Sequence[int] | None = None,
+        kinematic_hidden_dims: Sequence[int] | None = None,
+        model_profile: str = "auto",
+        tokenizer_fields: Mapping[str, Any] | None = None,
+        encoders: Mapping[str, Any] | None = None,
+        decoders: Mapping[str, Any] | None = None,
         token_levels: int = 32,
         token_count: int = 2,
         critic_obs_normalization: bool = False,
@@ -219,41 +585,95 @@ class SonicActorCritic(nn.Module):
             raise ValueError(
                 "SONIC noise std requires 0 < std_clamp_min <= init_noise_std <= std_clamp_max"
             )
-        self.tokenizer = UniversalToken(
-            self.tokenizer_obs_dim,
-            num_tokens=token_count,
-            levels=token_levels,
-            hidden_dim=tokenizer_hidden_dim,
+        requested_profile = str(model_profile)
+        if requested_profile == "auto":
+            has_named_config = any(
+                value is not None for value in (tokenizer_fields, encoders, decoders)
+            )
+            requested_profile = "sonic_v1_1" if has_named_config else "dense_test"
+        if requested_profile not in {"sonic_v1_1", "dense_test"}:
+            raise ValueError(f"unknown SONIC model profile: {requested_profile!r}")
+        self.model_profile = requested_profile
+
+        shared_widths = (
+            tuple(int(width) for width in hidden_dims) if hidden_dims is not None else None
         )
+        if self.model_profile == "sonic_v1_1":
+            raw_fields = tokenizer_fields or _SONIC_V11_TOKENIZER_FIELDS
+            raw_encoders = encoders or _SONIC_V11_ENCODERS
+            raw_decoders = decoders or _SONIC_V11_DECODERS
+            encoder_widths = encoder_hidden_dims or shared_widths
+            dynamic_widths = actor_hidden_dims or shared_widths
+            kinematic_widths = kinematic_hidden_dims or shared_widths
+            configured_encoders: dict[str, dict[str, Any]] = {}
+            for name, raw_spec in raw_encoders.items():
+                spec = dict(_checked_mapping(raw_spec, name=f"encoder {name!r}"))
+                if encoder_widths is not None:
+                    spec["hidden_dims"] = tuple(encoder_widths)
+                configured_encoders[str(name)] = spec
+            configured_decoders: dict[str, dict[str, Any]] = {}
+            for name, raw_spec in raw_decoders.items():
+                spec = dict(_checked_mapping(raw_spec, name=f"decoder {name!r}"))
+                override = dynamic_widths if name == "g1_dyn" else kinematic_widths
+                if override is not None:
+                    spec["hidden_dims"] = tuple(override)
+                configured_decoders[str(name)] = spec
+            self.tokenizer: UniversalToken | _DenseUniversalToken = UniversalToken(
+                self.tokenizer_obs_dim,
+                self.actor_obs_dim,
+                self.action_dim,
+                fields=raw_fields,
+                encoders=configured_encoders,
+                decoders=configured_decoders,
+                num_tokens=token_count,
+                levels=token_levels,
+            )
+            self.model_contract_version = SONIC_V11_MODEL_CONTRACT_VERSION
+            critic_fallback = (
+                4096,
+                4096,
+                2048,
+                2048,
+                1024,
+                1024,
+                512,
+                512,
+            )
+        else:
+            self.tokenizer = _DenseUniversalToken(
+                self.tokenizer_obs_dim,
+                num_tokens=token_count,
+                levels=token_levels,
+                hidden_dim=tokenizer_hidden_dim,
+            )
+            self.model_contract_version = _DENSE_TEST_MODEL_CONTRACT_VERSION
+            token_dim = self.tokenizer.token_total_dim
+            fallback = (512, 256) if shared_widths is None else shared_widths
+            actor_widths = _normalise_hidden_dims(actor_hidden_dims, fallback)
+            self._dense_actor = _mlp(self.actor_obs_dim + token_dim, self.action_dim, actor_widths)
+            critic_fallback = actor_widths
         self.critic_obs_normalization = bool(critic_obs_normalization)
         self.critic_rms = (
             RunningMeanStd(self.critic_obs_dim) if self.critic_obs_normalization else None
         )
         self._normalizer_start: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None
-        token_dim = self.tokenizer.token_total_dim
-        fallback = (512, 256) if hidden_dims is None else tuple(hidden_dims)
-        actor_widths = _normalise_hidden_dims(actor_hidden_dims, fallback)
-        critic_widths = _normalise_hidden_dims(critic_hidden_dims, actor_widths)
-
-        def mlp(input_dim: int, output_dim: int, widths: Sequence[int]) -> nn.Sequential:
-            layers: list[nn.Module] = []
-            last = input_dim
-            for width in widths:
-                layers.extend((nn.Linear(last, int(width)), nn.SiLU()))
-                last = int(width)
-            layers.append(nn.Linear(last, output_dim))
-            return nn.Sequential(*layers)
-
-        self.actor = mlp(self.actor_obs_dim + token_dim, self.action_dim, actor_widths)
+        critic_widths = _normalise_hidden_dims(critic_hidden_dims, critic_fallback)
         # The release value head consumes privileged observations directly;
         # UniversalToken is an actor-side bottleneck and is not concatenated
         # into the critic input.
-        self.critic = mlp(self.critic_obs_dim, 1, critic_widths)
+        self.critic = _mlp(self.critic_obs_dim, 1, critic_widths)
         self.std_clamp_min = float(std_clamp_min)
         self.std_clamp_max = float(std_clamp_max)
         # The release actor owns a direct std parameter (not log_std) and
         # clamps it in-place to [0.001, 0.5] before constructing Normal.
         self.std = nn.Parameter(torch.full((self.action_dim,), float(init_noise_std)))
+
+    @property
+    def actor(self) -> nn.Sequential:
+        if self.model_profile == "sonic_v1_1":
+            tokenizer = cast(UniversalToken, self.tokenizer)
+            return cast(nn.Sequential, tokenizer.decoders["g1_dyn"])
+        return self._dense_actor
 
     def _features(
         self,
@@ -276,6 +696,8 @@ class SonicActorCritic(nn.Module):
                 device=actor_obs.device,
                 dtype=actor_obs.dtype,
             )
+            if self.model_profile == "sonic_v1_1":
+                token_obs[..., 0] = 1.0
         tokens = self.tokenizer(token_obs)
         flat_tokens = tokens.reshape(*tokens.shape[:-2], -1)
         if self.critic_rms is not None:
@@ -285,6 +707,17 @@ class SonicActorCritic(nn.Module):
             critic_obs,
             tokens,
         )
+
+    def named_outputs(
+        self,
+        actor_obs: torch.Tensor,
+        token_obs: torch.Tensor,
+    ) -> dict[str, object]:
+        """Return v1.1 action, named g1_kin reconstruction and route details."""
+
+        if self.model_profile != "sonic_v1_1":
+            raise RuntimeError("named_outputs requires model_profile='sonic_v1_1'")
+        return cast(UniversalToken, self.tokenizer).decode(token_obs, actor_obs)
 
     def distribution(
         self,
@@ -324,7 +757,11 @@ class SonicActorCritic(nn.Module):
         )
 
     def auxiliary_losses(self, token_obs: torch.Tensor) -> dict[str, torch.Tensor]:
-        return self.tokenizer.auxiliary_losses(token_obs)
+        if self.model_profile == "sonic_v1_1":
+            # The pinned five-loss recipe is owned by its subsequent child;
+            # Issue #4 only replaces the named architecture and routing.
+            return {}
+        return cast(_DenseUniversalToken, self.tokenizer).auxiliary_losses(token_obs)
 
     @torch.no_grad()
     def update_normalizers(self, critic_obs: torch.Tensor) -> None:
@@ -378,4 +815,10 @@ class SonicActorCritic(nn.Module):
         self._normalizer_start = None
 
 
-__all__ = ["FSQ", "RunningMeanStd", "SonicActorCritic", "UniversalToken"]
+__all__ = [
+    "FSQ",
+    "RunningMeanStd",
+    "SONIC_V11_MODEL_CONTRACT_VERSION",
+    "SonicActorCritic",
+    "UniversalToken",
+]

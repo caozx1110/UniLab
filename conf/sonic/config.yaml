@@ -82,10 +82,57 @@ sonic:
     critic_obs_dim: 1645
     tokenizer_obs_dim: 1761
   model:
-    # Release MLP widths; tiny CPU smoke tests can override this block.
-    actor_hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
-    critic_hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
-    tokenizer_hidden_dim: 1024
+    profile: sonic_v1_1
+    contract_version: sonic_v1_1_named_universal_token.v1
+    # Flat storage ABI parsed into the pinned v1.1 named fields on the model
+    # cold path. command-z remains in the ABI but is not consumed by an encoder.
+    tokenizer_fields:
+      encoder_index: {slice: [0, 3], shape: [3]}
+      command_multi_future_nonflat: {slice: [3, 583], shape: [10, 58]}
+      command_z_multi_future_nonflat: {slice: [583, 593], shape: [10, 1]}
+      command_z: {slice: [593, 594], shape: [1]}
+      motion_anchor_ori_heading_mf_nonflat: {slice: [594, 654], shape: [10, 6]}
+      motion_anchor_ori_heading: {slice: [654, 660], shape: [6]}
+      command_multi_future_lower_body: {slice: [660, 900], shape: [240]}
+      vr_3point_local_target: {slice: [900, 909], shape: [9]}
+      vr_3point_local_orn_target: {slice: [909, 921], shape: [12]}
+      smpl_joints_multi_future_local_nonflat: {slice: [921, 1641], shape: [10, 72]}
+      smpl_root_ori_heading_multi_future: {slice: [1641, 1701], shape: [10, 6]}
+      joint_pos_multi_future_wrist_for_smpl: {slice: [1701, 1761], shape: [10, 6]}
+    encoders:
+      g1:
+        inputs: [command_multi_future_nonflat, motion_anchor_ori_heading_mf_nonflat]
+        temporal: true
+        hidden_dims: [2048, 1024, 512, 512]
+      teleop:
+        inputs:
+          - command_multi_future_lower_body
+          - vr_3point_local_target
+          - vr_3point_local_orn_target
+          - motion_anchor_ori_heading
+        temporal: false
+        hidden_dims: [2048, 1024, 512, 512]
+      smpl:
+        inputs:
+          - smpl_joints_multi_future_local_nonflat
+          - smpl_root_ori_heading_multi_future
+          - joint_pos_multi_future_wrist_for_smpl
+        temporal: true
+        hidden_dims: [2048, 1024, 512, 512]
+    decoders:
+      g1_dyn:
+        inputs: [token_flattened, actor_obs]
+        outputs:
+          action: [29]
+        hidden_dims: [4096, 4096, 2048, 2048, 1024, 1024, 512, 512]
+      g1_kin:
+        inputs: [token_flattened]
+        outputs:
+          command_multi_future_nonflat: [10, 58]
+          motion_anchor_ori_heading_mf_nonflat: [10, 6]
+        hidden_dims: [2048, 1024, 512, 512]
+    critic:
+      hidden_dims: [4096, 4096, 2048, 2048, 1024, 1024, 512, 512]
     critic_obs_normalization: true
     token_count: 2
     token_levels: 32
@@ -95,9 +142,9 @@ sonic:
   # sonic_v1_1.yaml samples G1, teleop and SMPL uniformly.
   encoder_sample_probs: [1.0, 1.0, 1.0]
   optimizer_step_per_microbatch: true
-  aux_loss_coef:
-    token_reconstruction: 0.01
-    token_commitment: 0.0
+  # The pinned five-loss recipe is implemented by its own architecture-followup
+  # child; do not retain the prototype whole-1761 reconstruction claim here.
+  aux_loss_coef: {}
   resources:
     enabled: true
     profile: sonic-8x4090-76c-2numa
