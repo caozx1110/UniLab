@@ -20,6 +20,9 @@ env:
   sim_dt: 0.005
   decimation: 4
   ctrl_dt: null
+  anchor_pos_z_threshold: 0.15
+  anchor_ori_threshold: 0.2
+  ee_body_pos_z_threshold: 0.15
 
 reward:
   scales:

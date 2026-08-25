@@ -28,6 +28,7 @@ from unilab.utils.rotation import (
     np_quat_apply_batched,
     np_quat_apply_inverse,
     np_quat_conjugate_batched,
+    np_quat_error_magnitude_squared_batched,
     np_quat_mul_batched,
 )
 
@@ -44,6 +45,9 @@ SONIC_V1_1_REVISION = "a0732b642c0333077e127a2f56ab0014c196bca4"
 # Backward-compatible import alias for the now-versioned owner revision.
 SONIC_RELEASE_REVISION = SONIC_V1_1_REVISION
 SONIC_V1_1_OBSERVATION_PROFILE = "unitoken_all_noz_heading"
+SONIC_TERMINATION_DOWN_THRESHOLD = 0.75
+SONIC_TERMINATION_ROOT_HEIGHT_THRESHOLD = 0.5
+SONIC_TERMINATION_FOOT_POS_THRESHOLD = 0.2
 
 
 @dataclass(frozen=True)
@@ -378,6 +382,9 @@ class SonicG1TrackingCfg(MotionTrackingCfg):
     # leaving that inherited default here silently changes every local-frame
     # observation, reward, and termination while preserving all tensor shapes.
     anchor_body_name: str = "pelvis"
+    anchor_pos_z_threshold: float = 0.15
+    anchor_ori_threshold: float = 0.2
+    ee_body_pos_z_threshold: float = 0.15
     body_names: tuple[str, ...] = SONIC_BODY_ORDER
     ee_body_names: tuple[str, ...] = (
         "left_ankle_roll_link",
@@ -481,6 +488,13 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
             raise ValueError(
                 f"SONIC v1.1 observations require 14 bodies, got {len(cfg.body_names)}"
             )
+        self._sonic_foot_body_indices = np.asarray(
+            [
+                cfg.body_names.index("left_ankle_roll_link"),
+                cfg.body_names.index("right_ankle_roll_link"),
+            ],
+            dtype=np.int32,
+        )
         if len(cfg.vr_body_names) != 3:
             raise ValueError("SONIC v1.1 observations require three VR bodies")
         try:
@@ -628,6 +642,95 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         if isinstance(bias, np.ndarray):
             target_backend = target_backend + bias
         return target_backend
+
+    def _compute_terminations(
+        self,
+        motion_data: Any,
+        robot_body_pos_w: np.ndarray,
+        robot_body_quat_w: np.ndarray,
+    ) -> np.ndarray:
+        """Compute the SONIC v1.1 tracking termination contract.
+
+        SONIC uses the upstream adaptive height checks and full quaternion
+        error.  This owner-level override keeps those semantics isolated from
+        the historical generic motion-tracking termination behavior.
+        """
+        terminated = self._terminated
+        terminated.fill(False)
+
+        reference_root_z = motion_data.body_pos_w[:, 0, 2]
+        anchor_z_error = self._env_error
+        np.subtract(
+            motion_data.body_pos_w[:, self.anchor_body_idx, 2],
+            robot_body_pos_w[:, self.anchor_body_idx, 2],
+            out=anchor_z_error,
+        )
+        np.abs(anchor_z_error, out=anchor_z_error)
+        anchor_threshold = np.full_like(anchor_z_error, self._cfg.anchor_pos_z_threshold)
+        anchor_threshold[reference_root_z < SONIC_TERMINATION_ROOT_HEIGHT_THRESHOLD] = (
+            SONIC_TERMINATION_DOWN_THRESHOLD
+        )
+        np.greater(anchor_z_error, anchor_threshold, out=self._env_bool)
+        terminated |= self._env_bool
+
+        anchor_ori_error = np_quat_error_magnitude_squared_batched(
+            motion_data.body_quat_w[:, self.anchor_body_idx],
+            robot_body_quat_w[:, self.anchor_body_idx],
+        )
+        np.greater(anchor_ori_error, self._cfg.anchor_ori_threshold, out=self._env_bool)
+        terminated |= self._env_bool
+
+        if self._has_ee_body_indices:
+            np.subtract(
+                self.body_pos_relative_w[:, self.ee_body_indices, 2],
+                robot_body_pos_w[:, self.ee_body_indices, 2],
+                out=self._ee_pos_error_z,
+            )
+            np.abs(self._ee_pos_error_z, out=self._ee_pos_error_z)
+            ee_threshold = np.full_like(
+                self._ee_pos_error_z, self._cfg.ee_body_pos_z_threshold
+            )
+            ee_threshold[reference_root_z < SONIC_TERMINATION_ROOT_HEIGHT_THRESHOLD] = (
+                SONIC_TERMINATION_DOWN_THRESHOLD
+            )
+            np.greater(self._ee_pos_error_z, ee_threshold, out=self._ee_terminated)
+            np.logical_or.reduce(self._ee_terminated, axis=1, out=self._env_bool)
+            terminated |= self._env_bool
+
+        foot_error = self._body_vec_error[:, self._sonic_foot_body_indices]
+        np.subtract(
+            self.body_pos_relative_w[:, self._sonic_foot_body_indices],
+            robot_body_pos_w[:, self._sonic_foot_body_indices],
+            out=foot_error,
+        )
+        np.square(foot_error, out=foot_error)
+        foot_error_squared = self._ee_pos_error_z[:, : self._sonic_foot_body_indices.size]
+        np.sum(foot_error, axis=-1, out=foot_error_squared)
+        np.greater(
+            foot_error_squared,
+            SONIC_TERMINATION_FOOT_POS_THRESHOLD**2,
+            out=self._ee_terminated[:, : self._sonic_foot_body_indices.size],
+        )
+        np.logical_or.reduce(
+            self._ee_terminated[:, : self._sonic_foot_body_indices.size],
+            axis=1,
+            out=self._env_bool,
+        )
+        terminated |= self._env_bool
+
+        if self._cfg.terminate_on_undesired_contacts and self._has_undesired_contact_body_indices:
+            body_z = robot_body_pos_w[:, self.undesired_contact_body_indices, 2]
+            np.less(
+                body_z,
+                self._cfg.undesired_contact_z_threshold,
+                out=self._undesired_contact_mask,
+            )
+            np.logical_or.reduce(self._undesired_contact_mask, axis=-1, out=self._env_bool)
+            terminated |= self._env_bool
+
+        timeout = self.motion_sampler.current_frames >= self.motion_sampler.current_clip_end_frames
+        terminated |= timeout
+        return terminated
 
     def _policy_joint_values(self, values: np.ndarray) -> np.ndarray:
         return np.asarray(values)[:, self._backend_to_policy]
