@@ -451,9 +451,9 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         self._vr_body_offsets = np.asarray(cfg.vr_body_offsets, dtype=np.float32)
         if self._vr_body_offsets.shape != (3, 3):
             raise ValueError("SONIC vr_body_offsets must have shape (3, 3)")
-        self._history = np.zeros((num_envs, self.cfg.history_length, 93), dtype=np.float32)
+        self._history = np.zeros((num_envs, self._cfg.history_length, 93), dtype=np.float32)
         self._critic_history = np.zeros_like(self._history)
-        self._encoder_index = np.zeros((num_envs, len(self.cfg.encoder_names)), dtype=np.float32)
+        self._encoder_index = np.zeros((num_envs, len(self._cfg.encoder_names)), dtype=np.float32)
         self._sample_encoder_indices(np.arange(num_envs, dtype=np.int32))
         self._actor_obs_width = SONIC_ACTOR_OBS_DIM
         self._critic_obs_width = SONIC_CRITIC_OBS_DIM
@@ -526,12 +526,12 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
     def _sample_encoder_indices(self, env_ids: np.ndarray) -> None:
         if not len(env_ids):
             return
-        probabilities = np.asarray(self.cfg.encoder_sample_probs, dtype=np.float64)
-        if probabilities.shape != (len(self.cfg.encoder_names),) or np.any(probabilities < 0):
+        probabilities = np.asarray(self._cfg.encoder_sample_probs, dtype=np.float64)
+        if probabilities.shape != (len(self._cfg.encoder_names),) or np.any(probabilities < 0):
             raise ValueError("encoder_sample_probs must match encoder_names and be non-negative")
         if probabilities.sum() <= 0:
             raise ValueError("encoder_sample_probs must contain a positive mass")
-        teleop_probability = float(self.cfg.teleop_sample_prob_when_smpl)
+        teleop_probability = float(self._cfg.teleop_sample_prob_when_smpl)
         if not 0.0 <= teleop_probability <= 1.0:
             raise ValueError("teleop_sample_prob_when_smpl must be in [0, 1]")
         if not self._sonic_has_smpl:
@@ -573,13 +573,14 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         state.info["current_actions"] = actions
         delayed = (
             state.info["last_actions"]
-            if self.cfg.control_config.simulate_action_latency
+            if self._cfg.control_config.simulate_action_latency
             else actions
         )
         # Scale/defaults share the IsaacLab policy ABI.  Only the completed
         # target is mapped back to the backend/MuJoCo actuator order.
         target_policy = (
-            delayed * np.asarray(self.cfg.control_config.action_scale) + self._policy_default_angles
+            delayed * np.asarray(self._cfg.control_config.action_scale)
+            + self._policy_default_angles
         )
         target_backend = target_policy[:, self._policy_to_backend]
         bias = state.info.get("default_dof_pos_bias")
@@ -638,7 +639,7 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         return actions
 
     def _tokenizer_corruption(self, data: np.ndarray, scale: float) -> np.ndarray:
-        if not self.cfg.tokenizer_enable_corruption:
+        if not self._cfg.tokenizer_enable_corruption:
             return data
         seed = self._configured_obs_noise_seed()
         rng = np.random if seed is None else getattr(self, "_obs_noise_rng", None)
@@ -668,10 +669,10 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
             ),
             "body_pos": future_fields["body_pos_w"].reshape(
                 len(frame_indices), -1, self._sonic_num_bodies, 3
-            )[:, :, : len(self.cfg.body_names)],
+            )[:, :, : len(self._cfg.body_names)],
             "body_quat": future_fields["body_quat_w"].reshape(
                 len(frame_indices), -1, self._sonic_num_bodies, 4
-            )[:, :, : len(self.cfg.body_names)],
+            )[:, :, : len(self._cfg.body_names)],
         }
         smpl_indices = self._sonic_store.future_indices(frame_indices, self._smpl_future_offsets)
         smpl_joint_fields = self._sonic_store.gather_fields(
@@ -699,7 +700,7 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         return result
 
     def _zero_smpl_reference(self, num_envs: int) -> dict[str, np.ndarray]:
-        smpl_frames = self.cfg.smpl_num_future_frames
+        smpl_frames = self._cfg.smpl_num_future_frames
         return {
             "smpl_joints": np.zeros((num_envs, smpl_frames, 24, 3), dtype=np.float32),
             "smpl_root_quat": np.broadcast_to(
@@ -709,17 +710,19 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         }
 
     def _zero_future_reference(self, num_envs: int) -> dict[str, np.ndarray]:
-        frames = self.cfg.num_future_frames
+        frames = self._cfg.num_future_frames
         result = {
             "joint_pos": np.zeros((num_envs, frames, 29), dtype=np.float32),
             "joint_vel": np.zeros((num_envs, frames, 29), dtype=np.float32),
-            "body_pos": np.zeros((num_envs, frames, len(self.cfg.body_names), 3), dtype=np.float32),
+            "body_pos": np.zeros(
+                (num_envs, frames, len(self._cfg.body_names), 3), dtype=np.float32
+            ),
             "body_quat": np.broadcast_to(
                 np.asarray([1, 0, 0, 0], dtype=np.float32),
-                (num_envs, frames, len(self.cfg.body_names), 4),
+                (num_envs, frames, len(self._cfg.body_names), 4),
             ).copy(),
             "smpl_joint_pos": np.zeros(
-                (num_envs, self.cfg.smpl_num_future_frames, 29), dtype=np.float32
+                (num_envs, self._cfg.smpl_num_future_frames, 29), dtype=np.float32
             ),
         }
         result.update(self._zero_smpl_reference(num_envs))
@@ -744,7 +747,7 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         gravity = np.broadcast_to(np.asarray([0.0, 0.0, -1.0], dtype=np.float32), (len(env_ids), 3))
         gravity = np.asarray(np_quat_apply_inverse(anchor_quat, gravity), dtype=np.float32)
         joint_pos = dof_pos - policy_default_angles
-        noise_cfg = self.cfg.noise_config
+        noise_cfg = self._cfg.noise_config
         actor_gyro = gyro
         actor_joint_pos = joint_pos
         actor_joint_vel = dof_vel
