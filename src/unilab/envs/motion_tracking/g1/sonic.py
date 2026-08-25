@@ -33,6 +33,12 @@ from unilab.utils.rotation import (
 )
 
 from ..common.motion_loader import MotionSampler
+from ..common.rewards import (
+    anti_shake_ang_vel,
+    joint_acc_l2,
+    tracking_vr_2wrists_local_ori,
+    tracking_vr_5point_local,
+)
 
 if TYPE_CHECKING:
     from unilab.training.sonic_store import SonicMotionStore
@@ -405,6 +411,30 @@ class SonicG1TrackingCfg(MotionTrackingCfg):
     observation_profile: str = SONIC_V1_1_OBSERVATION_PROFILE
     vr_body_names: tuple[str, ...] = SONIC_VR_BODY_ORDER
     vr_body_offsets: tuple[tuple[float, float, float], ...] = SONIC_VR_BODY_OFFSETS
+    reward_point_body_names: tuple[str, ...] = (
+        "torso_link",
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link",
+    )
+    reward_point_body_offsets: tuple[tuple[float, float, float], ...] = (
+        (0.0, 0.0, 0.5),
+        (0.0, 0.0, 0.0),
+        (0.0, 0.0, 0.0),
+    )
+    anti_shake_body_names: tuple[str, ...] = (
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link",
+    )
+    wrist_reward_body_names: tuple[str, ...] = (
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link",
+    )
+    ankle_joint_names: tuple[str, ...] = (
+        "left_ankle_pitch_joint",
+        "left_ankle_roll_joint",
+        "right_ankle_pitch_joint",
+        "right_ankle_roll_joint",
+    )
     use_release_action_scale: bool = True
     # The release wrapper clips the policy sample before passing it to the
     # IsaacLab action manager.  PPO still stores/log-probs the unclipped sample;
@@ -433,6 +463,38 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
     """G1 tracking env exposing actor, critic and tokenizer groups."""
 
     _cfg: SonicG1TrackingCfg
+
+    def _init_reward_functions(self):
+        super()._init_reward_functions()
+        body_names = tuple(self._cfg.body_names)
+        self._anti_shake_body_indices = np.asarray(
+            [body_names.index(name) for name in self._cfg.anti_shake_body_names],
+            dtype=np.int32,
+        )
+        self._vr_point_body_indices = np.asarray(
+            [body_names.index(name) for name in self._cfg.reward_point_body_names], dtype=np.int32
+        )
+        self._vr_point_body_offsets = np.asarray(
+            self._cfg.reward_point_body_offsets, dtype=np.float32
+        )
+        if self._vr_point_body_offsets.shape != (len(self._vr_point_body_indices), 3):
+            raise ValueError("SONIC reward_point_body_offsets must match reward point bodies")
+        self._wrist_body_indices = np.asarray(
+            [body_names.index(name) for name in self._cfg.wrist_reward_body_names],
+            dtype=np.int32,
+        )
+        self._joint_acc_indices = np.asarray(
+            [SONIC_JOINT_ORDER.index(name) for name in self._cfg.ankle_joint_names],
+            dtype=np.int32,
+        )
+        self._reward_fns.update(
+            {
+                "anti_shake_ang_vel": anti_shake_ang_vel,
+                "tracking_vr_5point_local": tracking_vr_5point_local,
+                "tracking_vr_2wrists_local_ori": tracking_vr_2wrists_local_ori,
+                "feet_acc": joint_acc_l2,
+            }
+        )
 
     def __init__(self, cfg: SonicG1TrackingCfg, num_envs: int = 1, backend_type: str = "mujoco"):
         if (

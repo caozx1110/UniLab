@@ -162,6 +162,7 @@ class MotionTrackingEnv(G1BaseEnv):
         self._body_vec_tmp = np.empty((num_envs, n_body, 3), dtype=dtype)
         self._joint_error = np.empty((num_envs, self._num_action), dtype=dtype)
         self._joint_error_upper = np.empty((num_envs, self._num_action), dtype=dtype)
+        self._previous_dof_vel = np.zeros((num_envs, self._num_action), dtype=dtype)
         self._env_error = np.empty((num_envs,), dtype=dtype)
         self._env_error2 = np.empty((num_envs,), dtype=dtype)
         self._reward_term = np.empty((num_envs,), dtype=dtype)
@@ -173,6 +174,13 @@ class MotionTrackingEnv(G1BaseEnv):
         self._undesired_contact_mask = np.empty(
             (num_envs, self.undesired_contact_body_indices.size), dtype=bool
         )
+        self._vr_ref_points_w = np.empty((num_envs, n_body, 3), dtype=dtype)
+        self._vr_robot_points_w = np.empty((num_envs, n_body, 3), dtype=dtype)
+        self._vr_ref_points_local = np.empty((num_envs, n_body, 3), dtype=dtype)
+        self._vr_robot_points_local = np.empty((num_envs, n_body, 3), dtype=dtype)
+        self._vr_rotation_tmp = np.empty((num_envs, n_body, 3), dtype=dtype)
+        self._vr_ref_quats_local = np.empty((num_envs, n_body, 4), dtype=dtype)
+        self._vr_robot_quats_local = np.empty((num_envs, n_body, 4), dtype=dtype)
 
         self._enable_reward_log = True
         self._init_reward_functions()
@@ -506,8 +514,22 @@ class MotionTrackingEnv(G1BaseEnv):
             quat_error_x=self._quat_error_x,
             ee_pos_error_z=self._ee_pos_error_z,
             undesired_contact_mask=self._undesired_contact_mask,
+            previous_dof_vel=self._previous_dof_vel,
+            anti_shake_body_indices=getattr(self, "_anti_shake_body_indices", None),
+            vr_point_body_indices=getattr(self, "_vr_point_body_indices", None),
+            vr_point_body_offsets=getattr(self, "_vr_point_body_offsets", None),
+            wrist_body_indices=getattr(self, "_wrist_body_indices", None),
+            joint_acc_indices=getattr(self, "_joint_acc_indices", None),
+            ctrl_dt=self._cfg.ctrl_dt,
+            vr_ref_points_w=self._vr_ref_points_w,
+            vr_robot_points_w=self._vr_robot_points_w,
+            vr_ref_points_local=self._vr_ref_points_local,
+            vr_robot_points_local=self._vr_robot_points_local,
+            vr_rotation_tmp=self._vr_rotation_tmp,
+            vr_ref_quats_local=self._vr_ref_quats_local,
+            vr_robot_quats_local=self._vr_robot_quats_local,
         )
-        return compute_reward(
+        reward = compute_reward(
             ctx,
             active_reward_fns=self._active_reward_fns,
             all_reward_fns=self._reward_fns,
@@ -515,6 +537,13 @@ class MotionTrackingEnv(G1BaseEnv):
             ctrl_dt=self._cfg.ctrl_dt,
             enable_log=self._enable_reward_log,
         )
+        self._previous_dof_vel[:] = dof_vel
+        return reward
+
+    def reset(self, env_indices: np.ndarray) -> tuple[dict[str, np.ndarray], dict]:
+        obs, info = super().reset(env_indices)
+        self._previous_dof_vel[env_indices] = self.get_dof_vel()[env_indices]
+        return obs, info
 
 
 class MotionTrackingDeployEnv(MotionTrackingEnv):

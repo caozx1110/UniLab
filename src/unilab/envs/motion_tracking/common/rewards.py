@@ -20,6 +20,8 @@ from typing import Any, Callable, Mapping
 
 import numpy as np
 
+from unilab.utils.rotation import np_quat_conjugate_batched
+
 
 @dataclass
 class RewardConfig:
@@ -38,6 +40,10 @@ class RewardConfig:
             "motion_joint_vel": 0.0,
             "action_rate_l2": -0.1,
             "joint_limit": -10.0,
+            "anti_shake_ang_vel": 0.0,
+            "tracking_vr_5point_local": 0.0,
+            "tracking_vr_2wrists_local_ori": 0.0,
+            "feet_acc": 0.0,
         }
     )
     # Standard deviations for exponential rewards
@@ -49,6 +55,9 @@ class RewardConfig:
     std_body_ang_vel: float = 3.14
     std_joint_pos: float = 0.2
     std_joint_vel: float = 1.0
+    std_vr_local_pos: float = 0.1
+    std_wrist_local_ori: float = 0.1
+    anti_shake_ang_vel_threshold: float = 1.5
 
 
 @dataclass
@@ -95,6 +104,20 @@ class RewardContext:
     quat_error_x: np.ndarray | None = None
     ee_pos_error_z: np.ndarray | None = None
     undesired_contact_mask: np.ndarray | None = None
+    previous_dof_vel: np.ndarray | None = None
+    anti_shake_body_indices: np.ndarray | None = None
+    vr_point_body_indices: np.ndarray | None = None
+    vr_point_body_offsets: np.ndarray | None = None
+    wrist_body_indices: np.ndarray | None = None
+    joint_acc_indices: np.ndarray | None = None
+    ctrl_dt: float = 0.0
+    vr_ref_points_w: np.ndarray | None = None
+    vr_robot_points_w: np.ndarray | None = None
+    vr_ref_points_local: np.ndarray | None = None
+    vr_robot_points_local: np.ndarray | None = None
+    vr_rotation_tmp: np.ndarray | None = None
+    vr_ref_quats_local: np.ndarray | None = None
+    vr_robot_quats_local: np.ndarray | None = None
 
 
 # ── buffered math helpers ────────────────────────────────────────────
@@ -130,8 +153,9 @@ def _mean_body_xyz_squared_error(
 def _quat_error_magnitude_squared_body(
     ctx: RewardContext, q1: np.ndarray, q2: np.ndarray
 ) -> np.ndarray:
-    rel_w = _required_array(ctx.quat_error_w, "quat_error_w")
-    rel_x = _required_array(ctx.quat_error_x, "quat_error_x")
+    width = q1.shape[-2]
+    rel_w = _required_array(ctx.quat_error_w, "quat_error_w")[:, :width]
+    rel_x = _required_array(ctx.quat_error_x, "quat_error_x")[:, :width]
     # Motion/backend quaternions are unit quaternions, so the relative
     # rotation angle only needs abs(dot(q1, q2)).
     np.multiply(q1[..., 0], q2[..., 0], out=rel_w)
@@ -318,6 +342,148 @@ def joint_limit(ctx: RewardContext) -> np.ndarray:
     np.square(joint_error, out=joint_error)
     np.sum(joint_error, axis=1, out=reward_term)
     return reward_term
+
+
+def _required_indices(value: np.ndarray | None, name: str) -> np.ndarray:
+    if value is None or value.size == 0:
+        raise RuntimeError(f"RewardContext.{name} is required for this reward term")
+    return value
+
+
+def _rotate_vectors_inplace(
+    quat: np.ndarray, vectors: np.ndarray, out: np.ndarray, tmp: np.ndarray
+) -> None:
+    """Rotate broadcast-compatible vectors without allocating in the term."""
+    qx, qy, qz = quat[..., 1], quat[..., 2], quat[..., 3]
+    vx, vy, vz = vectors[..., 0], vectors[..., 1], vectors[..., 2]
+    tmp[..., 0] = 2.0 * (qy * vz - qz * vy)
+    tmp[..., 1] = 2.0 * (qz * vx - qx * vz)
+    tmp[..., 2] = 2.0 * (qx * vy - qy * vx)
+    out[..., 0] = vx + quat[..., 0] * tmp[..., 0] + qy * tmp[..., 2] - qz * tmp[..., 1]
+    out[..., 1] = vy + quat[..., 0] * tmp[..., 1] + qz * tmp[..., 0] - qx * tmp[..., 2]
+    out[..., 2] = vz + quat[..., 0] * tmp[..., 2] + qx * tmp[..., 1] - qy * tmp[..., 0]
+
+
+def _quat_mul_conjugate_left_inplace(left: np.ndarray, right: np.ndarray, out: np.ndarray) -> None:
+    """Compute ``conjugate(left) * right`` into ``out``."""
+    lw, lx, ly, lz = left[..., 0], -left[..., 1], -left[..., 2], -left[..., 3]
+    rw, rx, ry, rz = right[..., 0], right[..., 1], right[..., 2], right[..., 3]
+    out[..., 0] = lw * rw - lx * rx - ly * ry - lz * rz
+    out[..., 1] = lw * rx + lx * rw + ly * rz - lz * ry
+    out[..., 2] = lw * ry - lx * rz + ly * rw + lz * rx
+    out[..., 3] = lw * rz + lx * ry - ly * rx + lz * rw
+
+
+def anti_shake_ang_vel(ctx: RewardContext) -> np.ndarray:
+    body_indices = _required_indices(ctx.anti_shake_body_indices, "anti_shake_body_indices")
+    robot_ang_vel = _required_array(ctx.robot_body_ang_vel_w, "robot_body_ang_vel_w")
+    body_vec_error = _required_array(ctx.body_vec_error, "body_vec_error")[:, : body_indices.size]
+    env_error = _required_array(ctx.env_error, "env_error")
+    reward_term = _required_array(ctx.reward_term, "reward_term")
+    np.take(robot_ang_vel, body_indices, axis=1, out=body_vec_error)
+    np.square(body_vec_error, out=body_vec_error)
+    speed_squared = body_vec_error[..., 0]
+    np.sum(body_vec_error, axis=2, out=speed_squared)
+    np.sqrt(speed_squared, out=speed_squared)
+    np.subtract(speed_squared, ctx.reward_config.anti_shake_ang_vel_threshold, out=speed_squared)
+    np.maximum(speed_squared, 0.0, out=speed_squared)
+    np.square(speed_squared, out=speed_squared)
+    np.sum(speed_squared, axis=1, out=env_error)
+    np.divide(env_error, body_indices.size, out=reward_term)
+    return reward_term
+
+
+def tracking_vr_5point_local(ctx: RewardContext) -> np.ndarray:
+    body_indices = _required_indices(ctx.vr_point_body_indices, "vr_point_body_indices")
+    offsets = _required_array(ctx.vr_point_body_offsets, "vr_point_body_offsets")
+    motion_data = ctx.motion_data
+    robot_pos = _required_array(ctx.robot_body_pos_w, "robot_body_pos_w")
+    robot_quat_all = _required_array(ctx.robot_body_quat_w, "robot_body_quat_w")
+    ref_points_w = _required_array(ctx.vr_ref_points_w, "vr_ref_points_w")[:, : body_indices.size]
+    robot_points_w = _required_array(ctx.vr_robot_points_w, "vr_robot_points_w")[
+        :, : body_indices.size
+    ]
+    ref_points_local = _required_array(ctx.vr_ref_points_local, "vr_ref_points_local")[
+        :, : body_indices.size
+    ]
+    robot_points_local = _required_array(ctx.vr_robot_points_local, "vr_robot_points_local")[
+        :, : body_indices.size
+    ]
+    rotation_tmp = _required_array(ctx.vr_rotation_tmp, "vr_rotation_tmp")[:, : body_indices.size]
+    np.take(motion_data.body_pos_w, body_indices, axis=1, out=ref_points_w)
+    ref_quat = np.take(motion_data.body_quat_w, body_indices, axis=1)
+    _rotate_vectors_inplace(ref_quat, offsets[None, :, :], rotation_tmp, ref_points_local)
+    ref_points_w += rotation_tmp
+    np.take(robot_pos, body_indices, axis=1, out=robot_points_w)
+    robot_quat = np.take(robot_quat_all, body_indices, axis=1)
+    _rotate_vectors_inplace(robot_quat, offsets[None, :, :], rotation_tmp, robot_points_local)
+    robot_points_w += rotation_tmp
+
+    anchor_idx = ctx.anchor_body_idx
+    ref_anchor_pos = motion_data.body_pos_w[:, anchor_idx]
+    robot_anchor_pos = robot_pos[:, anchor_idx]
+    np.subtract(ref_points_w, ref_anchor_pos[:, None, :], out=ref_points_local)
+    np.subtract(robot_points_w, robot_anchor_pos[:, None, :], out=robot_points_local)
+    ref_anchor_quat = motion_data.body_quat_w[:, anchor_idx, None, :]
+    robot_anchor_quat = robot_quat_all[:, anchor_idx, None, :]
+    _rotate_vectors_inplace(
+        np_quat_conjugate_batched(ref_anchor_quat), ref_points_local, ref_points_local, rotation_tmp
+    )
+    _rotate_vectors_inplace(
+        np_quat_conjugate_batched(robot_anchor_quat),
+        robot_points_local,
+        robot_points_local,
+        rotation_tmp,
+    )
+    env_error = _required_array(ctx.env_error, "env_error")
+    np.subtract(ref_points_local, robot_points_local, out=ref_points_local)
+    np.square(ref_points_local, out=ref_points_local)
+    point_error = ref_points_local[..., 0]
+    np.sum(ref_points_local, axis=2, out=point_error)
+    np.sum(point_error, axis=1, out=env_error)
+    env_error /= body_indices.size
+    return _exp_reward_from_error(ctx, env_error, ctx.reward_config.std_vr_local_pos)
+
+
+def tracking_vr_2wrists_local_ori(ctx: RewardContext) -> np.ndarray:
+    body_indices = _required_indices(ctx.wrist_body_indices, "wrist_body_indices")
+    motion_data = ctx.motion_data
+    robot_quat = _required_array(ctx.robot_body_quat_w, "robot_body_quat_w")
+    ref_local = _required_array(ctx.vr_ref_quats_local, "vr_ref_quats_local")[
+        :, : body_indices.size
+    ]
+    robot_local = _required_array(ctx.vr_robot_quats_local, "vr_robot_quats_local")[
+        :, : body_indices.size
+    ]
+    ref_indices = np.take(motion_data.body_quat_w, body_indices, axis=1)
+    robot_indices = np.take(robot_quat, body_indices, axis=1)
+    ref_anchor = motion_data.body_quat_w[:, ctx.anchor_body_idx, None, :]
+    robot_anchor = robot_quat[:, ctx.anchor_body_idx, None, :]
+    _quat_mul_conjugate_left_inplace(ref_anchor, ref_indices, ref_local)
+    _quat_mul_conjugate_left_inplace(robot_anchor, robot_indices, robot_local)
+    error = _quat_error_magnitude_squared_body(ctx, ref_local, robot_local)
+    env_error = _required_array(ctx.env_error, "env_error")
+    np.sum(error, axis=1, out=env_error)
+    env_error /= body_indices.size
+    return _exp_reward_from_error(ctx, env_error, ctx.reward_config.std_wrist_local_ori)
+
+
+def joint_acc_l2(ctx: RewardContext) -> np.ndarray:
+    joint_indices = _required_indices(ctx.joint_acc_indices, "joint_acc_indices")
+    dof_vel = _required_array(ctx.dof_vel, "dof_vel")
+    previous_dof_vel = _required_array(ctx.previous_dof_vel, "previous_dof_vel")
+    joint_error = _required_array(ctx.joint_error, "joint_error")[:, : joint_indices.size]
+    joint_error_upper = _required_array(ctx.joint_error_upper, "joint_error_upper")[
+        :, : joint_indices.size
+    ]
+    env_error = _required_array(ctx.env_error, "env_error")
+    np.take(dof_vel, joint_indices, axis=1, out=joint_error)
+    np.take(previous_dof_vel, joint_indices, axis=1, out=joint_error_upper)
+    joint_error -= joint_error_upper
+    joint_error /= ctx.ctrl_dt
+    np.square(joint_error, out=joint_error)
+    np.sum(joint_error, axis=1, out=env_error)
+    return env_error
 
 
 def build_reward_functions() -> dict[str, Callable[[RewardContext], np.ndarray]]:

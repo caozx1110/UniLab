@@ -153,3 +153,38 @@ def test_compute_reward_matches_hand_computed_weighted_sum():
 
     expected = (1.0 * joint_pos_ref - 0.1 * action_rate_ref - 0.5 * undesired_ref) * ctrl_dt
     np.testing.assert_allclose(reward, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_sonic_owner_reward_terms_match_release_formulas():
+    ctx = _make_ctx()
+    num_envs, n_body = 2, 3
+    identity = np.broadcast_to(np.array([1.0, 0.0, 0.0, 0.0]), (num_envs, n_body, 4)).copy()
+    ctx.motion_data.body_quat_w = identity.copy()
+    ctx.robot_body_quat_w = identity.copy()
+    ctx.motion_data.body_pos_w = np.array(
+        [[[0.0, 0.0, 0.0], [0.0, 0.0, 1.0], [0.0, 1.0, 0.0]]] * num_envs
+    )
+    ctx.robot_body_pos_w = ctx.motion_data.body_pos_w.copy()
+    ctx.anti_shake_body_indices = np.array([1, 2], dtype=np.int32)
+    ctx.robot_body_ang_vel_w.fill(0.0)
+    ctx.robot_body_ang_vel_w[:, 1, 0] = 2.5
+    ctx.robot_body_ang_vel_w[:, 2, 0] = 1.0
+    np.testing.assert_allclose(rewards.anti_shake_ang_vel(ctx), 0.5)
+
+    ctx.vr_point_body_indices = np.array([1, 2, 0], dtype=np.int32)
+    ctx.vr_point_body_offsets = np.zeros((3, 3))
+    ctx.wrist_body_indices = np.array([1, 2], dtype=np.int32)
+    ctx.vr_ref_points_w = np.empty((num_envs, n_body, 3))
+    ctx.vr_robot_points_w = np.empty((num_envs, n_body, 3))
+    ctx.vr_ref_points_local = np.empty((num_envs, n_body, 3))
+    ctx.vr_robot_points_local = np.empty((num_envs, n_body, 3))
+    ctx.vr_rotation_tmp = np.empty((num_envs, n_body, 3))
+    ctx.vr_ref_quats_local = np.empty((num_envs, n_body, 4))
+    ctx.vr_robot_quats_local = np.empty((num_envs, n_body, 4))
+    np.testing.assert_allclose(rewards.tracking_vr_5point_local(ctx), 1.0)
+    np.testing.assert_allclose(rewards.tracking_vr_2wrists_local_ori(ctx), 1.0)
+
+    ctx.joint_acc_indices = np.array([0, 1], dtype=np.int32)
+    ctx.previous_dof_vel = ctx.dof_vel - 0.02
+    ctx.ctrl_dt = 0.02
+    np.testing.assert_allclose(rewards.joint_acc_l2(ctx), 2.0)
