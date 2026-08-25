@@ -424,6 +424,7 @@ class SonicG1TrackingCfg(MotionTrackingCfg):
     anti_shake_body_names: tuple[str, ...] = (
         "left_wrist_yaw_link",
         "right_wrist_yaw_link",
+        "head_link",
     )
     wrist_reward_body_names: tuple[str, ...] = (
         "left_wrist_yaw_link",
@@ -467,8 +468,14 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
     def _init_reward_functions(self):
         super()._init_reward_functions()
         body_names = tuple(self._cfg.body_names)
+        anti_shake_body_indices: list[int] = []
+        for name in self._cfg.anti_shake_body_names:
+            if name == "head_link" and name not in body_names:
+                anti_shake_body_indices.append(body_names.index("torso_link"))
+            else:
+                anti_shake_body_indices.append(body_names.index(name))
         self._anti_shake_body_indices = np.asarray(
-            [body_names.index(name) for name in self._cfg.anti_shake_body_names],
+            anti_shake_body_indices,
             dtype=np.int32,
         )
         self._vr_point_body_indices = np.asarray(

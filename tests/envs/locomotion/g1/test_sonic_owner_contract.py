@@ -107,6 +107,14 @@ def test_sonic_wrist_feature_uses_release_order() -> None:
     assert SONIC_WRIST_JOINT_INDICES == (23, 24, 25, 26, 27, 28)
 
 
+def test_sonic_antishake_includes_fixed_head_body() -> None:
+    assert SonicG1TrackingCfg().anti_shake_body_names == (
+        "left_wrist_yaw_link",
+        "right_wrist_yaw_link",
+        "head_link",
+    )
+
+
 def test_sonic_policy_joint_abi_matches_fixed_upstream_mapping() -> None:
     assert SONIC_POLICY_JOINT_ORDER[:6] == (
         "left_hip_pitch_joint",
