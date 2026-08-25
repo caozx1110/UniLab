@@ -364,7 +364,10 @@ def test_sonic_compute_obs_matches_independent_upstream_reset_and_step_fixture()
     offsets = np.asarray(((0.18, -0.025, 0), (0.18, 0.025, 0), (0, 0, 0.35)))
     instance._vr_body_offsets = offsets.astype(np.float32)
     instance._cfg = SonicG1TrackingCfg()
-    instance.motion_sampler = SimpleNamespace(current_frames=np.asarray([0], dtype=np.int64))
+    instance.motion_sampler = SimpleNamespace(
+        current_frames=np.asarray([0], dtype=np.int64),
+        current_clip_end_frames=np.asarray([1], dtype=np.int64),
+    )
     futures = [_synthetic_upstream_future(phase) for phase in range(2)]
     instance._future_reference = lambda frame: futures[int(frame[0])]
     # Deterministic stand-in for upstream AdditiveUniformNoiseCfg. This proves
@@ -400,7 +403,7 @@ def test_sonic_compute_obs_matches_independent_upstream_reset_and_step_fixture()
             actor_history = np.concatenate([actor_history[:, 1:], actor_current[:, None]], 1)
             critic_history = np.concatenate([critic_history[:, 1:], critic_current[:, None]], 1)
             instance._sonic_reset_ids = None
-        instance.motion_sampler.current_frames[:] = phase
+        instance.motion_sampler.current_frames[:] = max(phase - 1, 0)
         future = futures[phase]
         ref_anchor_pos = future["body_pos"][:, 0, 0]
         ref_anchor_angle = future["body_angle"][:, 0, 0]

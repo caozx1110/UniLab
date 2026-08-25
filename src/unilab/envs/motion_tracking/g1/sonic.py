@@ -915,6 +915,19 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         )
         return result
 
+    def _observation_frame_indices(
+        self, env_ids: np.ndarray, *, reference_refresh: bool
+    ) -> np.ndarray:
+        frame_indices = self.motion_sampler.current_frames[env_ids].copy()
+        if self._sonic_reset_ids is None and not reference_refresh:
+            np.add(frame_indices, 1, out=frame_indices)
+            np.minimum(
+                frame_indices,
+                self.motion_sampler.current_clip_end_frames[env_ids],
+                out=frame_indices,
+            )
+        return frame_indices
+
     def _zero_smpl_reference(self, num_envs: int) -> dict[str, np.ndarray]:
         smpl_frames = self._cfg.smpl_num_future_frames
         return {
@@ -1022,7 +1035,8 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
             env_ids = np.arange(linvel.shape[0], dtype=np.int32)
         policy_default_angles = self._policy_defaults_for_obs(info, env_ids)
         last_actions = self._actions_for_obs(info, env_ids)
-        is_clip_refresh = "env_ids" in info and self._sonic_reset_ids is None
+        is_reference_refresh = "env_ids" in info
+        is_clip_refresh = is_reference_refresh and self._sonic_reset_ids is None
         if is_clip_refresh:
             self._sample_encoder_indices(env_ids)
         actor_terms, critic_history_terms = self._build_history(
@@ -1037,7 +1051,9 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
             advance_history=not is_clip_refresh,
         )
 
-        frame_indices = self.motion_sampler.current_frames[env_ids]
+        frame_indices = self._observation_frame_indices(
+            env_ids, reference_refresh=is_reference_refresh
+        )
         future = self._future_reference(frame_indices)
         robot_anchor_pos = robot_body_pos_w[:, self.anchor_body_idx]
         robot_anchor_quat = robot_body_quat_w[:, self.anchor_body_idx]
