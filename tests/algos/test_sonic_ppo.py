@@ -104,6 +104,113 @@ def test_named_outputs_shapes_and_both_decoders_receive_gradients(sonic_v11_spec
         assert all(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in decoder.parameters())
 
 
+def test_named_auxiliary_losses_route_masks_and_pair_mse(sonic_v11_specs) -> None:
+    model = _named_model(sonic_v11_specs)
+    routes = ((1, 0, 0), (0, 1, 0), (1, 0, 1), (1, 1, 1))
+    token_obs = torch.cat([_named_token_obs(route) for route in routes])
+    outputs = model.tokenizer.decode(token_obs, torch.zeros(4, 930))
+    losses = model.tokenizer.auxiliary_losses(outputs)
+
+    assert set(losses) == {
+        "g1_recon",
+        "g1_smpl_latent",
+        "g1_teleop_latent",
+        "teleop_smpl_latent",
+        "reencoded_smpl_g1_latent",
+    }
+    assert all(torch.isfinite(loss) for loss in losses.values())
+    latents = outputs["encoded_latents"]
+    masks = outputs["encoder_masks"]
+    assert losses["g1_smpl_latent"] == torch.nn.functional.mse_loss(
+        latents["g1"][masks["g1_has_smpl"]], latents["smpl"]
+    )
+    assert losses["g1_teleop_latent"] == torch.nn.functional.mse_loss(
+        latents["g1"][masks["g1_has_teleop"]], latents["teleop"][masks["teleop_has_g1"]]
+    )
+    assert losses["teleop_smpl_latent"] == torch.nn.functional.mse_loss(
+        latents["teleop"][masks["teleop_has_smpl"]], latents["smpl"][masks["smpl_has_teleop"]]
+    )
+
+
+def test_named_auxiliary_losses_backward_reaches_all_encoders_and_decoders(sonic_v11_specs) -> None:
+    model = _named_model(sonic_v11_specs)
+    routes = ((1, 0, 0), (0, 1, 0), (1, 0, 1), (1, 1, 1))
+    outputs = model.tokenizer.decode(
+        torch.cat([_named_token_obs(route) for route in routes]), torch.zeros(4, 930)
+    )
+    sum(model.tokenizer.auxiliary_losses(outputs).values()).backward()
+    for module in model.tokenizer.encoders.values():
+        assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in module.parameters())
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for parameter in model.tokenizer.decoders["g1_kin"].parameters()
+    )
+
+
+def test_named_auxiliary_losses_sparse_pairs_are_connected_zero(sonic_v11_specs) -> None:
+    model = _named_model(sonic_v11_specs)
+    outputs = model.tokenizer.decode(_named_token_obs((1, 0, 0)), torch.zeros(1, 930))
+    losses = model.tokenizer.auxiliary_losses(outputs)
+    pair_names = {
+        "g1_smpl_latent",
+        "g1_teleop_latent",
+        "teleop_smpl_latent",
+        "reencoded_smpl_g1_latent",
+    }
+    assert all(losses[name].item() == 0 for name in pair_names)
+    assert all(losses[name].grad_fn is not None for name in pair_names)
+    sum(losses.values()).backward()
+
+
+def test_named_ppo_update_uses_one_training_forward_per_microbatch(sonic_v11_specs) -> None:
+    torch.manual_seed(0)
+    model = _named_model(sonic_v11_specs)
+    storage = SonicRolloutStorage(1, 4)
+    actor = torch.randn(4, 930)
+    critic = torch.randn(4, 1645)
+    tokenizer = torch.cat([_named_token_obs(route) for route in ((1, 0, 0), (0, 1, 0), (1, 0, 1), (1, 1, 1))])
+    distribution, values = model.distribution(actor, critic, tokenizer)
+    actions = distribution.sample()
+    storage.add(actor, critic, tokenizer, actions, torch.arange(1, 5, dtype=torch.float32), torch.zeros(4), values,
+                distribution.log_prob(actions).sum(-1), distribution.mean, distribution.stddev)
+    storage.compute_returns(torch.zeros(4))
+    algorithm = SonicPPO(
+        model,
+        num_learning_epochs=1,
+        num_mini_batches=1,
+        microbatch_size=1,
+        aux_loss_coef={name: 1.0 for name in (
+            "g1_recon", "g1_smpl_latent", "g1_teleop_latent", "teleop_smpl_latent",
+            "reencoded_smpl_g1_latent",
+        )},
+    )
+    policy, _, auxiliary = model.training_forward(actor, critic, tokenizer)
+    (policy.mean.square().mean() + sum(auxiliary.values())).backward()
+    assert any(
+        parameter.grad is not None and parameter.grad.abs().sum() > 0
+        for parameter in model.tokenizer.decoders["g1_dyn"].parameters()
+    )
+    model.zero_grad(set_to_none=True)
+    calls = 0
+    original_forward = model.training_forward
+
+    def training_forward(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_forward(*args, **kwargs)
+
+    model.training_forward = training_forward
+    model.distribution = lambda *args, **kwargs: pytest.fail("distribution called during update")
+    model.auxiliary_losses = lambda *args, **kwargs: pytest.fail("auxiliary_losses called during update")
+    metrics = algorithm.update(storage)
+    assert calls == 4
+    assert {
+        "g1_recon", "g1_smpl_latent", "g1_teleop_latent", "teleop_smpl_latent",
+        "reencoded_smpl_g1_latent",
+    } <= set(metrics)
+    assert all(np.isfinite(metrics[name]) for name in metrics)
+
+
 @pytest.mark.parametrize("version", [None, "unilab_sonic_dense_test.v1"])
 def test_named_runner_rejects_missing_or_prototype_contract_version(tmp_path, sonic_v11_specs, version) -> None:
     runner = SonicPPORunner(_StateEnv(), _named_runner_config(sonic_v11_specs), device="cpu")
