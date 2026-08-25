@@ -204,7 +204,9 @@ def apply_sonic_torch_threads(
     """
     runtime = torch_runtime
     if runtime is None:
-        import torch as runtime  # noqa: PLC0415
+        import torch as imported_torch  # noqa: PLC0415
+
+        runtime = imported_torch
 
     requested_intra = int(resources.torch_num_threads)
     requested_inter = int(resources.torch_num_interop_threads)
