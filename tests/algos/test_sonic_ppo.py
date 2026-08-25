@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+import yaml
 
 from unilab.algos.torch.sonic_ppo import (
     FSQ,
@@ -32,6 +34,106 @@ def _obs(num_envs: int) -> dict[str, torch.Tensor]:
         "privileged": torch.zeros(num_envs, 1645),
         "tokens": torch.zeros(num_envs, 1761),
     }
+
+
+@pytest.fixture(scope="module")
+def sonic_v11_specs() -> dict[str, object]:
+    config_path = Path(__file__).resolve().parents[2] / "conf/sonic/config.yaml"
+    config = yaml.safe_load(config_path.read_text())
+    return config["sonic"]["model"]
+
+
+def _named_model(specs: dict[str, object]) -> SonicActorCritic:
+    return SonicActorCritic(
+        hidden_dims=(8,),
+        model_profile="sonic_v1_1",
+        tokenizer_fields=specs["tokenizer_fields"],
+        encoders=specs["encoders"],
+        decoders=specs["decoders"],
+        token_count=specs["token_count"],
+        token_levels=specs["token_levels"],
+        critic_hidden_dims=(8,),
+    )
+
+
+def _named_token_obs(route: tuple[int, ...], batch_size: int = 1) -> torch.Tensor:
+    observations = torch.zeros(batch_size, 1761)
+    observations[:, : len(route)] = torch.tensor(route, dtype=observations.dtype)
+    return observations
+
+
+def _named_runner_config(specs: dict[str, object]) -> dict[str, object]:
+    return {
+        "num_steps_per_env": 1,
+        "num_mini_batches": 1,
+        "num_learning_epochs": 1,
+        "dimensions": {"actor_obs_dim": 930, "critic_obs_dim": 1645, "tokenizer_obs_dim": 1761, "action_dim": 29},
+        "sonic": {"model": {**specs, "profile": "sonic_v1_1", "hidden_dims": [8], "critic_hidden_dims": [8]}},
+    }
+
+
+def test_named_model_reads_config_and_routes_one_hot_gradients(sonic_v11_specs) -> None:
+    model = _named_model(sonic_v11_specs)
+    for route_index, encoder_name in enumerate(("g1", "teleop", "smpl")):
+        model.zero_grad()
+        tokens = model.tokenizer(_named_token_obs(tuple(int(index == route_index) for index in range(3))))
+        tokens.sum().backward()
+        for name, encoder in model.tokenizer.encoders.items():
+            gradients = [parameter.grad for parameter in encoder.parameters()]
+            has_gradient = any(gradient is not None and gradient.abs().sum() > 0 for gradient in gradients)
+            assert has_gradient is (name == encoder_name)
+
+
+def test_named_model_multihot_g1_smpl_uses_smpl_token(sonic_v11_specs) -> None:
+    model = _named_model(sonic_v11_specs)
+    smpl_tokens = model.tokenizer(_named_token_obs((0, 0, 1)))
+    paired_tokens = model.tokenizer(_named_token_obs((1, 0, 1)))
+    assert torch.equal(paired_tokens, smpl_tokens)
+
+
+def test_named_outputs_shapes_and_both_decoders_receive_gradients(sonic_v11_specs) -> None:
+    model = _named_model(sonic_v11_specs)
+    output = model.named_outputs(torch.zeros(3, 930), _named_token_obs((1, 0, 0), 3))
+    decoded = output["decoded_outputs"]
+    assert output["action_mean"].shape == (3, 29)
+    assert decoded["g1_dyn"]["action"].shape == (3, 29)
+    assert decoded["g1_kin"]["command_multi_future_nonflat"].shape == (3, 10, 58)
+    assert decoded["g1_kin"]["motion_anchor_ori_heading_mf_nonflat"].shape == (3, 10, 6)
+    sum(decoded_name[output_name].sum() for decoded_name in decoded.values() for output_name in decoded_name).backward()
+    for decoder in model.tokenizer.decoders.values():
+        assert all(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in decoder.parameters())
+
+
+@pytest.mark.parametrize("version", [None, "unilab_sonic_dense_test.v1"])
+def test_named_runner_rejects_missing_or_prototype_contract_version(tmp_path, sonic_v11_specs, version) -> None:
+    runner = SonicPPORunner(_StateEnv(), _named_runner_config(sonic_v11_specs), device="cpu")
+    checkpoint = tmp_path / "checkpoint.pt"
+    runner.save(checkpoint)
+    state = torch.load(checkpoint, weights_only=False)
+    if version is None:
+        del state["contract"]["model_contract_version"]
+    else:
+        state["contract"]["model_contract_version"] = version
+    torch.save(state, checkpoint)
+    with pytest.raises(ValueError, match="contract/version mismatch"):
+        runner.load(checkpoint)
+
+
+def test_named_model_supports_tiny_native_ppo_update(sonic_v11_specs) -> None:
+    torch.manual_seed(0)
+    model = _named_model(sonic_v11_specs)
+    storage = SonicRolloutStorage(1, 1)
+    actor = torch.randn(1, 930)
+    critic = torch.randn(1, 1645)
+    tokenizer = _named_token_obs((1, 0, 0))
+    distribution, value = model.distribution(actor, critic, tokenizer)
+    actions = distribution.sample()
+    storage.add(actor, critic, tokenizer, actions, torch.zeros(1), torch.zeros(1), value, distribution.log_prob(actions).sum(-1), distribution.mean, distribution.stddev)
+    storage.compute_returns(torch.zeros(1))
+    algorithm = SonicPPO(model, num_learning_epochs=1, num_mini_batches=1)
+    metrics = algorithm.update(storage)
+    assert set(metrics) == {"loss", "value_loss", "policy_loss", "entropy", "approx_kl"}
+    assert algorithm.last_optimizer_steps == 1
 
 
 def test_fsq_contract_shape_and_range() -> None:
