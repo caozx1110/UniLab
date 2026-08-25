@@ -75,6 +75,9 @@ SONIC_ROLLOUT_HORIZON = SONIC_RELEASE_SPEC.horizon
 # ``training.sim_backend`` override must not silently select another env.
 SONIC_OWNER_TASK = "SonicG1Tracking"
 SONIC_OWNER_BACKEND = "mujoco"
+SONIC_OWNER_RECIPE = "sonic_v1_1"
+SONIC_OWNER_REVISION = "a0732b642c0333077e127a2f56ab0014c196bca4"
+SONIC_OWNER_OBSERVATION_PROFILE = "unitoken_all_noz_heading"
 
 
 @dataclass(frozen=True)
@@ -170,6 +173,35 @@ def validate_sonic_owner(
             "SONIC owner is not registered for this task/backend yet: "
             f"task={task!r}, backend={backend!r}"
         )
+    provenance_required = require_owner_marker or bool(identity_map)
+    if provenance_required:
+        env = config.get("env")
+        env_map = env if isinstance(env, Mapping) else {}
+        metadata_sources = {
+            "target_recipe": (
+                owner_map.get("target_recipe"),
+                identity_map.get("target_recipe"),
+                SONIC_OWNER_RECIPE,
+            ),
+            "target_revision": (
+                owner_map.get("target_revision"),
+                identity_map.get("target_revision"),
+                SONIC_OWNER_REVISION,
+            ),
+            "observation_profile": (
+                owner_map.get("observation_profile"),
+                identity_map.get("observation_profile"),
+                env_map.get("observation_profile"),
+                SONIC_OWNER_OBSERVATION_PROFILE,
+            ),
+        }
+        for name, values in metadata_sources.items():
+            expected = values[-1]
+            if any(value != expected for value in values[:-1]):
+                raise SonicConfigError(
+                    f"SONIC owner metadata mismatch for {name}: expected {expected!r}, "
+                    f"got {values[:-1]!r}"
+                )
     return task, backend
 
 

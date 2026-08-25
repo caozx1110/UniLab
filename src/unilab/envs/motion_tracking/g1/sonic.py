@@ -1,4 +1,4 @@
-"""SONIC release owner for the UniLab G1 MuJoCo environment.
+"""SONIC owner with the v1.1 observation ABI for the UniLab G1 MuJoCo environment.
 
 The regular :class:`G1MotionTrackingEnv` intentionally keeps its historical
 flat actor/critic contract.  SONIC needs a separate owner because its policy
@@ -40,7 +40,10 @@ if TYPE_CHECKING:
 SONIC_ACTOR_OBS_DIM = 930
 SONIC_CRITIC_OBS_DIM = 1645
 SONIC_TOKENIZER_OBS_DIM = 1761
-SONIC_RELEASE_REVISION = "c374bae5b9039cd0ee71377e654d11ce1bc69e1d"
+SONIC_V1_1_REVISION = "a0732b642c0333077e127a2f56ab0014c196bca4"
+# Backward-compatible import alias for the now-versioned owner revision.
+SONIC_RELEASE_REVISION = SONIC_V1_1_REVISION
+SONIC_V1_1_OBSERVATION_PROFILE = "unitoken_all_noz_heading"
 
 
 @dataclass(frozen=True)
@@ -78,14 +81,14 @@ def _sonic_layout(
     return tuple(result)
 
 
-# Provenance: GR00T-WholeBodyControl@SONIC_RELEASE_REVISION and IsaacLab
+# Provenance: GR00T-WholeBodyControl@SONIC_V1_1_REVISION and IsaacLab
 # v2.3.2 ObservationManager._prepare_terms.  The manager iterates the
 # configclass ``__dict__``, so class declaration order wins over Hydra's
 # visually listed defaults order.
 #   gear_sonic/config/manager_env/observations/{policy/local_dir_hist,
-#   critic/privileged_mf_hist,tokenizer/unitoken_all_noz}.yaml and
+#   critic/privileged_mf_hist,tokenizer/unitoken_all_noz_heading}.yaml and
 #   gear_sonic/envs/manager_env/mdp/observations.py
-# The 1761-wide tokenizer is the *training* observation group.  The release
+# The 1761-wide tokenizer is the *training* observation group.  The v1.1
 # deploy encoder's 1751 input is a different export ABI: one scalar mode plus
 # the active 1750-wide union (the two unused command-z terms are omitted).
 SONIC_ACTOR_OBSERVATION_TERMS = _sonic_layout(
@@ -117,16 +120,48 @@ SONIC_TOKENIZER_OBSERVATION_TERMS = _sonic_layout(
         ("command_multi_future_nonflat", (10, 58)),
         ("command_z_multi_future_nonflat", (10, 1)),
         ("command_z", (1,)),
-        ("motion_anchor_ori_b", (6,)),
-        ("motion_anchor_ori_b_mf_nonflat", (10, 6)),
+        ("motion_anchor_ori_heading_mf_nonflat", (10, 6)),
+        ("motion_anchor_ori_heading", (6,)),
         ("command_multi_future_lower_body", (240,)),
         ("vr_3point_local_target", (9,)),
         ("vr_3point_local_orn_target", (12,)),
         ("smpl_joints_multi_future_local_nonflat", (10, 72)),
-        ("smpl_root_ori_b_multi_future", (10, 6)),
+        ("smpl_root_ori_heading_multi_future", (10, 6)),
         ("joint_pos_multi_future_wrist_for_smpl", (10, 6)),
     )
 )
+
+
+def _sonic_heading_quat(quat_w: np.ndarray) -> np.ndarray:
+    """Match SONIC v1.1's WXYZ ``get_heading_q`` swing/twist projection."""
+
+    quat_w = np.asarray(quat_w)
+    if quat_w.ndim < 1 or quat_w.shape[-1] != 4:
+        raise ValueError(f"SONIC heading quaternion must have shape (..., 4), got {quat_w.shape}")
+    heading = np.zeros_like(quat_w)
+    heading[..., 0] = quat_w[..., 0]
+    heading[..., 3] = quat_w[..., 3]
+    norm = np.linalg.norm(heading, axis=-1, keepdims=True)
+    return heading / np.clip(norm, np.asarray(1.0e-9, dtype=norm.dtype), None)
+
+
+def _sonic_heading_relative_rot6d(
+    robot_quat_w: np.ndarray, target_quat_w: np.ndarray
+) -> np.ndarray:
+    """Return a0732b64 Python-training ``inv(heading(robot)) * target`` rot6d."""
+
+    robot_quat_w = np.asarray(robot_quat_w)
+    target_quat_w = np.asarray(target_quat_w)
+    if target_quat_w.ndim < robot_quat_w.ndim or target_quat_w.shape[-1] != 4:
+        raise ValueError(
+            "SONIC target quaternion must have shape broadcastable from robot (..., 4), "
+            f"got robot={robot_quat_w.shape}, target={target_quat_w.shape}"
+        )
+    heading_inv = np_quat_conjugate_batched(_sonic_heading_quat(robot_quat_w))
+    while heading_inv.ndim < target_quat_w.ndim:
+        heading_inv = np.expand_dims(heading_inv, axis=-2)
+    relative_quat = np_quat_mul_batched(heading_inv, target_quat_w)
+    return np_matrix_first_two_cols_from_quat(relative_quat)
 
 
 def pack_sonic_observation_terms(
@@ -360,6 +395,7 @@ class SonicG1TrackingCfg(MotionTrackingCfg):
     encoder_sample_probs: tuple[float, ...] = (1.0, 1.0, 1.0)
     teleop_sample_prob_when_smpl: float = 0.5
     tokenizer_enable_corruption: bool = True
+    observation_profile: str = SONIC_V1_1_OBSERVATION_PROFILE
     vr_body_names: tuple[str, ...] = SONIC_VR_BODY_ORDER
     vr_body_offsets: tuple[tuple[float, float, float], ...] = SONIC_VR_BODY_OFFSETS
     use_release_action_scale: bool = True
@@ -394,10 +430,15 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
             or cfg.smpl_num_future_frames != 10
         ):
             raise ValueError(
-                "SONIC release observations require 10 history, future, and SMPL-future frames"
+                "SONIC v1.1 observations require 10 history, future, and SMPL-future frames"
             )
         if tuple(cfg.encoder_names) != ("g1", "teleop", "smpl"):
-            raise ValueError("SONIC release encoder_names must be ('g1', 'teleop', 'smpl')")
+            raise ValueError("SONIC v1.1 encoder_names must be ('g1', 'teleop', 'smpl')")
+        if cfg.observation_profile != SONIC_V1_1_OBSERVATION_PROFILE:
+            raise ValueError(
+                "SONIC v1.1 observations require "
+                f"observation_profile={SONIC_V1_1_OBSERVATION_PROFILE!r}"
+            )
         self._sonic_reset_ids: np.ndarray | None = None
         self._sonic_store = self._resolve_store(cfg)
         # Snapshot immutable motion metadata on the cold path.  Observation
@@ -438,10 +479,10 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         )
         if len(cfg.body_names) != 14:
             raise ValueError(
-                f"SONIC release observations require 14 bodies, got {len(cfg.body_names)}"
+                f"SONIC v1.1 observations require 14 bodies, got {len(cfg.body_names)}"
             )
         if len(cfg.vr_body_names) != 3:
-            raise ValueError("SONIC release observations require three VR bodies")
+            raise ValueError("SONIC v1.1 observations require three VR bodies")
         try:
             self._vr_body_rows = np.asarray(
                 [tuple(cfg.body_names).index(name) for name in cfg.vr_body_names], dtype=np.int32
@@ -855,16 +896,12 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         ).astype(np.float32)
 
         ref_anchor_quat = future["body_quat"][:, :, self.anchor_body_idx]
-        robot_anchor_quat_future = robot_anchor_quat[:, None, :]
-        relative_future_quat = np_quat_mul_batched(
-            np.broadcast_to(
-                np_quat_conjugate_batched(robot_anchor_quat_future), ref_anchor_quat.shape
-            ),
-            ref_anchor_quat,
+        anchor_ori_heading = _sonic_heading_relative_rot6d(robot_anchor_quat, anchor_quat).astype(
+            np.float32
         )
-        future_ori = np_matrix_first_two_cols_from_quat(relative_future_quat).reshape(
-            len(env_ids), -1
-        )
+        future_ori_heading = _sonic_heading_relative_rot6d(
+            robot_anchor_quat, ref_anchor_quat
+        ).reshape(len(env_ids), -1)
         command = np.concatenate(
             [
                 future["joint_pos"].reshape(len(env_ids), -1),
@@ -902,19 +939,12 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
         smpl_local = np_quat_apply_batched(
             np_quat_conjugate_batched(smpl_root)[..., None, :], smpl_joints
         )
-        smpl_ori = np_matrix_first_two_cols_from_quat(
-            np_quat_mul_batched(
-                np.broadcast_to(
-                    np_quat_conjugate_batched(robot_anchor_quat)[:, None, :], smpl_root.shape
-                ),
-                smpl_root,
-            )
-        )
+        smpl_ori_heading = _sonic_heading_relative_rot6d(robot_anchor_quat, smpl_root)
         # TokenizerCfg.enable_corruption is independent of actor noise level.
-        anchor_ori_token = self._tokenizer_corruption(anchor_ori_b, 0.05)
-        future_ori_token = self._tokenizer_corruption(future_ori, 0.05)
+        anchor_ori_token = self._tokenizer_corruption(anchor_ori_heading, 0.05)
+        future_ori_token = self._tokenizer_corruption(future_ori_heading, 0.05)
         smpl_local = self._tokenizer_corruption(smpl_local, 0.05)
-        smpl_ori = self._tokenizer_corruption(smpl_ori, 0.05)
+        smpl_ori_token = self._tokenizer_corruption(smpl_ori_heading, 0.05)
         wrist_q = future["smpl_joint_pos"][:, :, SONIC_WRIST_JOINT_INDICES]
         actor_obs = pack_sonic_observation_terms(actor_terms, SONIC_ACTOR_OBSERVATION_TERMS)
         critic_obs = pack_sonic_observation_terms(
@@ -934,13 +964,15 @@ class SonicG1TrackingEnv(MotionTrackingEnv):
                 "command_multi_future_nonflat": command.reshape(len(env_ids), 10, 58),
                 "command_z_multi_future_nonflat": command_z_multi,
                 "command_z": command_z_multi[:, 0],
-                "motion_anchor_ori_b": anchor_ori_token,
-                "motion_anchor_ori_b_mf_nonflat": future_ori_token.reshape(len(env_ids), 10, 6),
+                "motion_anchor_ori_heading_mf_nonflat": future_ori_token.reshape(
+                    len(env_ids), 10, 6
+                ),
+                "motion_anchor_ori_heading": anchor_ori_token,
                 "command_multi_future_lower_body": lower,
                 "vr_3point_local_target": vr_pos,
                 "vr_3point_local_orn_target": vr_quat,
                 "smpl_joints_multi_future_local_nonflat": smpl_local.reshape(len(env_ids), 10, 72),
-                "smpl_root_ori_b_multi_future": smpl_ori,
+                "smpl_root_ori_heading_multi_future": smpl_ori_token,
                 "joint_pos_multi_future_wrist_for_smpl": wrist_q,
             },
             SONIC_TOKENIZER_OBSERVATION_TERMS,
@@ -966,6 +998,8 @@ __all__ = [
     "SONIC_POLICY_JOINT_ORDER",
     "SONIC_POLICY_TO_MUJOCO",
     "SONIC_RELEASE_REVISION",
+    "SONIC_V1_1_OBSERVATION_PROFILE",
+    "SONIC_V1_1_REVISION",
     "SONIC_TOKENIZER_OBSERVATION_TERMS",
     "SONIC_WRIST_JOINT_INDICES",
     "SonicObservationTerm",

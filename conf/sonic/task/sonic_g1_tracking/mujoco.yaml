@@ -1,6 +1,7 @@
 # @package _global_
-# Verified SONIC baseline owner. Backend identity, task timing, and reward
-# injection live here; switching backend requires another explicit owner file.
+# SONIC MuJoCo owner targeting the v1.1 heading-observation profile. Backend
+# identity, task timing, and reward injection live here; switching backend
+# requires another explicit owner file.
 training:
   task_name: SonicG1Tracking
   sim_backend: mujoco
@@ -9,8 +10,12 @@ sonic:
   owner:
     task_name: SonicG1Tracking
     sim_backend: mujoco
+    target_recipe: sonic_v1_1
+    target_revision: a0732b642c0333077e127a2f56ab0014c196bca4
+    observation_profile: unitoken_all_noz_heading
 
 env:
+  observation_profile: ${sonic.owner.observation_profile}
   # SONIC's physics timing: 0.005 * 4 = 0.02 s control period.
   sim_dt: 0.005
   decimation: 4
