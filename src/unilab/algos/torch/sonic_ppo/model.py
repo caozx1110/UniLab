@@ -9,6 +9,7 @@ from typing import Any, cast
 import torch
 import torch.distributed as dist
 from torch import nn
+from torch.nn import functional as F
 
 
 class RunningMeanStd(nn.Module):
@@ -447,6 +448,17 @@ class UniversalToken(nn.Module):
         }
         if (~torch.stack(tuple(masks.values()), dim=-1).any(dim=-1)).any():
             raise ValueError("every SONIC sample must activate at least one named encoder")
+        # Pair masks use each source encoder's compact row space, matching the
+        # pinned v1.1 implementation rather than the full flattened batch.
+        masks.update(
+            {
+                "g1_has_smpl": masks["smpl"][masks["g1"]],
+                "g1_has_teleop": masks["teleop"][masks["g1"]],
+                "teleop_has_g1": masks["g1"][masks["teleop"]],
+                "teleop_has_smpl": masks["smpl"][masks["teleop"]],
+                "smpl_has_teleop": masks["teleop"][masks["smpl"]],
+            }
+        )
 
         flat_tokens = torch.zeros(
             prod(leading),
@@ -516,6 +528,85 @@ class UniversalToken(nn.Module):
             "tokens": tokens,
             "decoded_outputs": decoded_outputs,
             "action_mean": decoded_outputs["g1_dyn"]["action"],
+        }
+
+    @staticmethod
+    def _paired_mse(
+        left: torch.Tensor,
+        right: torch.Tensor,
+        *,
+        name: str,
+    ) -> torch.Tensor:
+        if left.shape != right.shape:
+            raise ValueError(
+                f"SONIC auxiliary loss {name!r} shape mismatch: "
+                f"{tuple(left.shape)} != {tuple(right.shape)}"
+            )
+        if left.numel() == 0:
+            # Preserve a differentiable zero for modality-sparse microbatches.
+            return left.sum() * 0.0 + right.sum() * 0.0
+        return F.mse_loss(left, right)
+
+    def auxiliary_losses(self, outputs: Mapping[str, object]) -> dict[str, torch.Tensor]:
+        """Compute the five MSE terms executed by the pinned v1.1 recipe."""
+
+        parsed = cast(Mapping[str, torch.Tensor], outputs["tokenizer_obs"])
+        masks = cast(Mapping[str, torch.Tensor], outputs["encoder_masks"])
+        latents = cast(Mapping[str, torch.Tensor], outputs["encoded_latents"])
+        decoded = cast(Mapping[str, Mapping[str, torch.Tensor]], outputs["decoded_outputs"])
+
+        reconstruction_target = torch.cat(
+            (
+                parsed["command_multi_future_nonflat"],
+                parsed["motion_anchor_ori_heading_mf_nonflat"],
+            ),
+            dim=-1,
+        )
+        reconstruction = torch.cat(
+            (
+                decoded["g1_kin"]["command_multi_future_nonflat"],
+                decoded["g1_kin"]["motion_anchor_ori_heading_mf_nonflat"],
+            ),
+            dim=-1,
+        )
+
+        g1_smpl = latents["g1"][masks["g1_has_smpl"]]
+        g1_teleop = latents["g1"][masks["g1_has_teleop"]]
+        teleop_for_g1 = latents["teleop"][masks["teleop_has_g1"]]
+        teleop_smpl = latents["teleop"][masks["teleop_has_smpl"]]
+        smpl_for_teleop = latents["smpl"][masks["smpl_has_teleop"]]
+
+        # Cycle consistency re-encodes the SMPL-selected g1_kin output through
+        # the raw G1 encoder and does not quantize or detach either side.
+        cycle_input = reconstruction.reshape(
+            -1, reconstruction.shape[-2] * reconstruction.shape[-1]
+        )
+        reencoded_smpl_g1 = self.encoders["g1"](cycle_input[masks["smpl"]]).reshape(
+            -1, self.num_tokens, self.token_dim
+        )
+
+        return {
+            "g1_recon": F.mse_loss(reconstruction, reconstruction_target),
+            "g1_smpl_latent": self._paired_mse(
+                g1_smpl,
+                latents["smpl"],
+                name="g1_smpl_latent",
+            ),
+            "g1_teleop_latent": self._paired_mse(
+                g1_teleop,
+                teleop_for_g1,
+                name="g1_teleop_latent",
+            ),
+            "teleop_smpl_latent": self._paired_mse(
+                teleop_smpl,
+                smpl_for_teleop,
+                name="teleop_smpl_latent",
+            ),
+            "reencoded_smpl_g1_latent": self._paired_mse(
+                reencoded_smpl_g1,
+                g1_smpl,
+                name="reencoded_smpl_g1_latent",
+            ),
         }
 
     def get_token_info(self) -> dict[str, object]:
@@ -731,6 +822,31 @@ class SonicActorCritic(nn.Module):
             self.std.clamp_(self.std_clamp_min, self.std_clamp_max)
         std = self.std.expand_as(mean)
         return torch.distributions.Normal(mean, std), self.critic(critic_features).squeeze(-1)
+
+    def training_forward(
+        self,
+        actor_obs: torch.Tensor,
+        critic_obs: torch.Tensor,
+        token_obs: torch.Tensor,
+    ) -> tuple[torch.distributions.Normal, torch.Tensor, dict[str, torch.Tensor]]:
+        """Run one shared policy forward for PPO and v1.1 auxiliary losses."""
+
+        if self.model_profile != "sonic_v1_1":
+            distribution, value = self.distribution(actor_obs, critic_obs, token_obs)
+            return distribution, value, self.auxiliary_losses(token_obs)
+        if critic_obs.shape[-1] != self.critic_obs_dim:
+            raise ValueError(
+                f"critic expects {self.critic_obs_dim} features, got {critic_obs.shape[-1]}"
+            )
+        tokenizer = cast(UniversalToken, self.tokenizer)
+        outputs = tokenizer.decode(token_obs, actor_obs)
+        mean = cast(torch.Tensor, outputs["action_mean"])
+        critic_features = self.critic_rms(critic_obs) if self.critic_rms is not None else critic_obs
+        with torch.no_grad():
+            self.std.clamp_(self.std_clamp_min, self.std_clamp_max)
+        distribution = torch.distributions.Normal(mean, self.std.expand_as(mean))
+        value = self.critic(critic_features).squeeze(-1)
+        return distribution, value, tokenizer.auxiliary_losses(outputs)
 
     def act(
         self,

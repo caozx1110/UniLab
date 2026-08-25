@@ -142,9 +142,15 @@ sonic:
   # sonic_v1_1.yaml samples G1, teleop and SMPL uniformly.
   encoder_sample_probs: [1.0, 1.0, 1.0]
   optimizer_step_per_microbatch: true
-  # The pinned five-loss recipe is implemented by its own architecture-followup
-  # child; do not retain the prototype whole-1761 reconstruction claim here.
-  aux_loss_coef: {}
+  # Pinned sonic_v1_1 auxiliary/cycle recipe.  All five are MSE in the
+  # upstream implementation; the configured teleop detach flag is not acted
+  # upon by that pinned loss class, so UniLab preserves the executed gradient.
+  aux_loss_coef:
+    g1_recon: 0.01
+    g1_smpl_latent: 1.0
+    g1_teleop_latent: 1.0
+    teleop_smpl_latent: 1.0
+    reencoded_smpl_g1_latent: 1.0
   resources:
     enabled: true
     profile: sonic-8x4090-76c-2numa

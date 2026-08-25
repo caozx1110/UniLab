@@ -176,11 +176,19 @@ class SonicPPO:
                     if self.optimizer_step_per_microbatch:
                         self.optimizer.zero_grad(set_to_none=True)
                     batch = {name: value[:, env_ids] for name, value in observations}
-                    distribution, values = self.model.distribution(
-                        batch["actor_obs"],
-                        batch["critic_obs"],
-                        batch["tokenizer_obs"],
-                    )
+                    if self.aux_loss_coef:
+                        distribution, values, aux_losses = self.model.training_forward(
+                            batch["actor_obs"],
+                            batch["critic_obs"],
+                            batch["tokenizer_obs"],
+                        )
+                    else:
+                        distribution, values = self.model.distribution(
+                            batch["actor_obs"],
+                            batch["critic_obs"],
+                            batch["tokenizer_obs"],
+                        )
+                        aux_losses = {}
                     new_log_prob = distribution.log_prob(batch["actions"]).sum(-1)
                     entropy = distribution.entropy().sum(-1)
                     with torch.no_grad():
@@ -221,11 +229,6 @@ class SonicPPO:
                         policy_loss
                         + self.value_loss_coef * value_loss
                         - self.entropy_coef * entropy_mean
-                    )
-                    aux_losses = (
-                        self.model.auxiliary_losses(batch["tokenizer_obs"])
-                        if self.aux_loss_coef
-                        else {}
                     )
                     for name, coefficient in self.aux_loss_coef.items():
                         if name in aux_losses:
