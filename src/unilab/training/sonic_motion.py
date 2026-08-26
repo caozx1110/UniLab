@@ -21,6 +21,10 @@ from typing import Any, Mapping, Sequence
 
 MANIFEST_VERSION = 1
 MANIFEST_SCHEMA = "unilab.sonic.motion"
+GLOBAL_MMAP_STORE_VERSION = 1
+GLOBAL_MMAP_STORE_SCHEMA = "unilab.sonic.global_mmap_store"
+GLOBAL_MMAP_TRUSTED_RECEIPT_VERSION = 1
+GLOBAL_MMAP_TRUSTED_RECEIPT_SCHEMA = "unilab.sonic.global_mmap_trusted_receipt"
 _SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 _SHAPE_SYMBOLS = {"*", "num_frames", "num_joints", "num_bodies"}
 
@@ -36,6 +40,17 @@ class MotionMaterializationReport:
     manifest_path: Path
     clip_count: int
     total_frames: int
+    total_bytes: int
+
+
+@dataclass(frozen=True)
+class GlobalMmapMaterializationReport:
+    """Summary of an immutable, global SONIC mmap store publication."""
+
+    sidecar_path: Path
+    trusted_receipt_path: Path
+    frame_count: int
+    fields: tuple[str, ...]
     total_bytes: int
 
 
@@ -1345,6 +1360,8 @@ def _compare_arrays(
     clip: MotionClip,
     manifest: MotionManifest,
 ) -> None:
+    import numpy as np
+
     # ``fps`` is clip metadata rather than a frame-aligned field.  It remains
     # in the NPZ for MotionLoader compatibility but is intentionally omitted
     # from ``manifest.fields``.
@@ -1360,8 +1377,17 @@ def _compare_arrays(
         fps_array = arrays["fps"]
         if getattr(fps_array, "ndim", None) != 0:
             raise MotionManifestError(f"clip {clip.id!r} metadata 'fps' must be scalar")
-    import numpy as np
-
+        try:
+            fps_value = float(fps_array)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise MotionManifestError(f"clip {clip.id!r} metadata 'fps' is invalid") from exc
+        if not np.isfinite(fps_value) or not np.isclose(
+            fps_value, clip.fps, rtol=0.0, atol=1.0e-6
+        ):
+            raise MotionManifestError(
+                f"clip {clip.id!r} archive fps={fps_value:g} disagrees with "
+                f"manifest fps={clip.fps:g}"
+            )
     for name, spec in expected.items():
         array = arrays[name]
         resolved_shape = tuple(_resolve_dimension(item, clip, manifest) for item in spec.shape)
@@ -2059,8 +2085,13 @@ resolve_clip_path = resolve_manifest_clip_path
 
 
 __all__ = [
+    "GLOBAL_MMAP_TRUSTED_RECEIPT_SCHEMA",
+    "GLOBAL_MMAP_TRUSTED_RECEIPT_VERSION",
+    "GLOBAL_MMAP_STORE_SCHEMA",
+    "GLOBAL_MMAP_STORE_VERSION",
     "MANIFEST_SCHEMA",
     "MANIFEST_VERSION",
+    "GlobalMmapMaterializationReport",
     "MotionClip",
     "MotionField",
     "MotionFieldSpec",

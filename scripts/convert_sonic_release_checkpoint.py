@@ -1,5 +1,5 @@
 #!/usr/bin/env -S uv run --script
-"""Convert the official SONIC v1.1 TRL checkpoint to UniLab format."""
+"""Convert the official SONIC release TRL checkpoint to UniLab format."""
 
 from __future__ import annotations
 
@@ -14,13 +14,13 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from unilab.algos.torch.sonic_ppo.checkpoint import (  # noqa: E402
-    convert_official_sonic_v11_checkpoint_file,
+    convert_official_sonic_release_checkpoint_file,
 )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--source", required=True, help="Official sonic_v1_1/last.pt")
+    parser.add_argument("--source", required=True, help="Official sonic_release/last.pt")
     parser.add_argument("--output", required=True, help="Destination UniLab checkpoint")
     parser.add_argument("--horizon", type=int, default=24)
     parser.add_argument("--model-only", action="store_true", help="Do not carry optimizer state")
@@ -33,12 +33,13 @@ def main() -> None:
     args = parser.parse_args()
     if not args.trust_source:
         parser.error("--trust-source is required because the official checkpoint uses pickle")
-    report = convert_official_sonic_v11_checkpoint_file(
+    report = convert_official_sonic_release_checkpoint_file(
         args.source,
         args.output,
         horizon=args.horizon,
         include_optimizer=not args.model_only,
         overwrite=args.overwrite,
+        trust_source=args.trust_source,
     )
     print(json.dumps(report, indent=2, sort_keys=True))
 

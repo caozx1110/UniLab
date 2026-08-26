@@ -1,5 +1,5 @@
 # @package _global_
-# SONIC MuJoCo owner targeting the v1.1 heading-observation profile. Backend
+# SONIC MuJoCo owner targeting the original release observation profile. Backend
 # identity, task timing, and reward injection live here; switching backend
 # requires another explicit owner file.
 training:
@@ -10,9 +10,23 @@ sonic:
   owner:
     task_name: SonicG1Tracking
     sim_backend: mujoco
-    target_recipe: sonic_v1_1
-    target_revision: a0732b642c0333077e127a2f56ab0014c196bca4
-    observation_profile: unitoken_all_noz_heading
+    target_recipe: sonic_release
+    target_revision: c374bae5b9039cd0ee71377e654d11ce1bc69e1d
+    observation_profile: unitoken_all_noz
+  # A rank-local full-corpus shard contains about 6M frames. These eight
+  # float32 fields occupy about 7.1 GiB/rank (56.6 GiB across eight ranks) on
+  # the 503 GiB SONIC workstation and cover every tracking/observation gather.
+  # Keep only two full clips in the lazy fallback, never a second full corpus.
+  motion_hot_fields:
+    - joint_pos
+    - joint_vel
+    - body_pos_w
+    - body_quat_w
+    - body_lin_vel_w
+    - body_ang_vel_w
+    - smpl_joints
+    - smpl_root_quat_w
+  motion_cache_size: 2
 
 env:
   observation_profile: ${sonic.owner.observation_profile}
@@ -20,14 +34,58 @@ env:
   sim_dt: 0.005
   decimation: 4
   ctrl_dt: null
+  # The release loader freezes a selected clip tail during training.
+  freeze_frame_aug: true
+  freeze_frame_prob: 0.1
+  domain_rand:
+    # SONIC release level0_4: these reset-time mappings use UniLab's existing
+    # backend payloads. Upstream applies them at startup; reset-time sampling
+    # is the closest portable contract currently available.
+    randomize_body_mass: true
+    body_mass_multiplier_range: [0.8, 2.5]
+    body_mass_body_names:
+      - torso_link
+      - left_wrist_yaw_link
+      - right_wrist_yaw_link
+    randomize_geom_friction: true
+    # UniLab exposes one MuJoCo sliding-friction coefficient. Use the
+    # upstream dynamic range on named robot collision geoms; restitution and
+    # the independent static range remain unsupported by this contract.
+    friction_range: [0.3, 1.2]
+    friction_geom_pattern: ".*_(collision|geom)$"
+    randomize_joint_default_pos: true
+    joint_default_pos_range: [-0.01, 0.01]
   action_clip_value: 20.0
+  truncate_on_clip_end: true
+  root_height_ema_alpha: 0.1
+  root_height_threshold: 0.5
+  down_height_termination_threshold: 0.75
+  foot_pos_threshold: 0.2
   anchor_pos_z_threshold: 0.15
   anchor_ori_threshold: 0.2
   ee_body_pos_z_threshold: 0.15
+  # Pinned sonic_release adaptive curriculum.  Bins are clip-local in the
+  # SONIC owner, unlike the generic global-frame MotionSampler.
+  adaptive_sampler_bin_size: 50
+  adaptive_sampler_init_num_failures: 1
+  adaptive_sampler_uniform_sampling_rate: 0.1
+  adaptive_sampler_failure_rate_max_over_mean: 200
+  adaptive_sampler_pre_failure_sample_window: 200
+  adaptive_sampler_sequence_length_agnostic: true
+  # Recompute only after one full collection.  This retains the release's
+  # per-step adaptive statistics while avoiding O(full-corpus bins) work on
+  # every reset; keep aligned with algo.num_steps_per_env.
+  adaptive_sampler_probability_refresh_interval_steps: ${algo.num_steps_per_env}
+  # Source TrackingCommand: a rank works on 1024 loaded motion slots at a
+  # time. The slots are sampled with replacement from the global curriculum.
+  active_motion_pool_size: 1024
+  # Source ImResampleCallback: reload the active slots after every 250
+  # completed PPO global steps, then reset all environments.
+  motion_resample_frequency: 250
+  undesired_contact_body_names: [pelvis, left_hip_roll_link, left_knee_link, right_hip_roll_link, right_knee_link, torso_link, left_shoulder_roll_link, right_shoulder_roll_link]
   reward_point_body_names: [torso_link, left_wrist_yaw_link, right_wrist_yaw_link]
   reward_point_body_offsets: [[0.0, 0.0, 0.5], [0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
   anti_shake_body_names: [left_wrist_yaw_link, right_wrist_yaw_link, head_link]
-  wrist_reward_body_names: [left_wrist_yaw_link, right_wrist_yaw_link]
   ankle_joint_names: [left_ankle_pitch_joint, left_ankle_roll_joint, right_ankle_pitch_joint, right_ankle_roll_joint]
 
 reward:
@@ -43,9 +101,9 @@ reward:
     motion_joint_vel: 0.0
     action_rate_l2: -0.1
     joint_limit: -10.0
+    undesired_contacts: -0.1
     anti_shake_ang_vel: -0.005
     tracking_vr_5point_local: 2.0
-    tracking_vr_2wrists_local_ori: 0.4
     feet_acc: -2.5e-6
   std_root_pos: 0.3
   std_root_ori: 0.4
@@ -56,5 +114,4 @@ reward:
   std_joint_pos: 0.2
   std_joint_vel: 1.0
   std_vr_local_pos: 0.1
-  std_wrist_local_ori: 0.1
   anti_shake_ang_vel_threshold: 1.5

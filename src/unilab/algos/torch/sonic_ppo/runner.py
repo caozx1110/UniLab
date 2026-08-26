@@ -18,6 +18,15 @@ from omegaconf import DictConfig, OmegaConf
 from unilab.training.sonic_contract import validate_sonic_owner
 from unilab.training.sonic_resources import apply_sonic_torch_threads
 
+from .adaptive_state import (
+    SONIC_ADAPTIVE_CHECKPOINT_GLOBAL_MMAP,
+    SONIC_ADAPTIVE_CHECKPOINT_RANK_LOCAL,
+    SONIC_ADAPTIVE_SYNC_INTERVAL,
+    capture_sampler_state,
+    restore_sampler_state,
+    sampler_checkpoint_variant,
+    sync_sampler_state,
+)
 from .algorithm import SonicPPO
 from .model import SonicActorCritic
 from .storage import SonicRolloutStorage
@@ -538,9 +547,17 @@ class SonicPPORunner:
                 self.device,
                 self.num_envs,
             )
+            # NpEnv keeps terminal observations in a full-size reusable
+            # buffer, but only done rows are populated for the current step.
+            # Evaluate exactly the timeout rows: untouched rows may contain
+            # zeros/stale values and, for SONIC's named tokenizer, an all-zero
+            # encoder mask is deliberately invalid.
+            final_actor = final_actor[timeout_mask]
+            final_critic = final_critic[timeout_mask]
+            final_token = final_token[timeout_mask]
             with torch.no_grad():
                 _, final_values = self.model.distribution(final_actor, final_critic, final_token)
-            correction[timeout_mask] = self.algorithm.gamma * final_values.detach()[timeout_mask]
+            correction[timeout_mask] = self.algorithm.gamma * final_values.detach().reshape(-1)
         except (TypeError, ValueError, RuntimeError) as exc:
             raise ValueError(
                 "SONIC timeout transition supplied an invalid final_observation; "
@@ -563,6 +580,39 @@ class SonicPPORunner:
             _obs(result, "critic", self.model.critic_obs_dim, self.device, self.num_envs),
             _obs(result, "tokenizer", self.model.tokenizer_obs_dim, self.device, self.num_envs),
         )
+
+    def _maybe_resample_motion_pool(
+        self, completed_global_steps: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Run the release-private active-pool callback at PPO boundaries."""
+
+        callback = getattr(self.env, "maybe_resample_motion_pool", None)
+        if callback is None:
+            return None
+        if not callable(callback):
+            raise TypeError("SONIC env maybe_resample_motion_pool must be callable")
+        return self._reset() if callback(completed_global_steps) else None
+
+    def _sync_adaptive_sampler_for_iteration(self, completed_iteration: int) -> bool:
+        """Synchronize global-mmap counters when the configured cadence is due."""
+
+        sync_interval = int(
+            _get(
+                self.config,
+                "sonic.sync_adaptive_sampling_all_gpus_freq",
+                SONIC_ADAPTIVE_SYNC_INTERVAL,
+            )
+        )
+        if sync_interval < 0:
+            raise ValueError("SONIC adaptive sampling sync interval must be non-negative")
+        if (
+            sync_interval == 0
+            or completed_iteration % sync_interval
+            or sampler_checkpoint_variant(self.env) != SONIC_ADAPTIVE_CHECKPOINT_GLOBAL_MMAP
+        ):
+            return False
+        sync_sampler_state(self.env, device=self.device)
+        return True
 
     def learn(self, num_learning_iterations: int) -> dict[str, float]:
         if num_learning_iterations < 0:
@@ -655,10 +705,14 @@ class SonicPPORunner:
                     _, last_values = self.model.distribution(actor_obs, critic_obs, token_obs)
                 self.storage.compute_returns(last_values, self.algorithm.gamma, self.algorithm.lam)
                 metrics = self.algorithm.update(self.storage)
-                # SONIC v1.1 updates critic RMS after each normalized critic
+                # SONIC release updates critic RMS after each normalized critic
                 # forward in train mode, then averages rank-local mean/var once
                 # per iteration. Rollout eval forwards never update it.
                 self.model.synchronize_normalizers()
+                self._sync_adaptive_sampler_for_iteration(iteration + 1)
+                refreshed_observations = self._maybe_resample_motion_pool(iteration + 1)
+                if refreshed_observations is not None:
+                    actor_obs, critic_obs, token_obs = refreshed_observations
                 _synchronize_cuda(self.device)
                 train_time = time.perf_counter() - train_started
                 if dist.is_available() and dist.is_initialized():
@@ -684,12 +738,12 @@ class SonicPPORunner:
                 save_interval = int(
                     _get(self.config, "algo.save_interval", _get(self.config, "save_interval", 500))
                 )
-                if (
+                checkpoint_due = (
                     self.log_dir is not None
-                    and self.is_main_process
                     and save_interval > 0
                     and self.current_learning_iteration % save_interval == 0
-                ):
+                )
+                if checkpoint_due and self.is_main_process:
                     self.save(self.log_dir / f"model_{self.current_learning_iteration}.pt")
             if self.log_dir is not None and self.is_main_process:
                 self.save(self.log_dir / "last.pt")
@@ -707,10 +761,26 @@ class SonicPPORunner:
         algorithm_state = {
             key: value for key, value in self.algorithm.state_dict().items() if key != "optimizer"
         }
+        adaptive_state = capture_sampler_state(self.env)
+        adaptive_variant = sampler_checkpoint_variant(self.env)
+        if adaptive_variant == SONIC_ADAPTIVE_CHECKPOINT_RANK_LOCAL:
+            warnings.warn(
+                "SONIC adaptive sampler uses rank-local bins; its counters are not written "
+                "to this rank-zero checkpoint and will restart from configured statistics "
+                "on resume",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         state = {
             "model": self.model.state_dict(),
             "optimizer": self.algorithm.optimizer.state_dict(),
             "algorithm": algorithm_state,
+            **({"sonic_adaptive_sampling": adaptive_state} if adaptive_state is not None else {}),
+            **(
+                {"sonic_adaptive_sampling_checkpoint_variant": adaptive_variant}
+                if adaptive_variant is not None
+                else {}
+            ),
             "iteration": self.current_learning_iteration,
             "token_info": token_info,
             "contract": {
@@ -787,7 +857,7 @@ class SonicPPORunner:
         except RuntimeError as exc:
             label = (
                 "model contract/version mismatch"
-                if self.model.model_profile == "sonic_v1_1"
+                if self.model.model_profile == "sonic_release"
                 else "model shape mismatch"
             )
             raise ValueError(f"SONIC checkpoint {label}: {exc}") from exc
@@ -805,6 +875,59 @@ class SonicPPORunner:
         if isinstance(algorithm_state, Mapping):
             self.algorithm.load_state_dict(
                 {key: value for key, value in algorithm_state.items() if key != "optimizer"}
+            )
+        current_adaptive_variant = sampler_checkpoint_variant(self.env)
+        checkpoint_adaptive_state = state.get("sonic_adaptive_sampling")
+        checkpoint_adaptive_variant = state.get("sonic_adaptive_sampling_checkpoint_variant")
+        if checkpoint_adaptive_variant is not None and not isinstance(
+            checkpoint_adaptive_variant, str
+        ):
+            raise ValueError("SONIC checkpoint adaptive sampler variant must be a string")
+        if checkpoint_adaptive_variant not in {
+            None,
+            SONIC_ADAPTIVE_CHECKPOINT_GLOBAL_MMAP,
+            SONIC_ADAPTIVE_CHECKPOINT_RANK_LOCAL,
+        }:
+            raise ValueError(
+                f"unsupported SONIC adaptive checkpoint variant: {checkpoint_adaptive_variant!r}"
+            )
+        if (
+            checkpoint_adaptive_variant == SONIC_ADAPTIVE_CHECKPOINT_GLOBAL_MMAP
+            and checkpoint_adaptive_state is None
+        ):
+            raise ValueError("SONIC global-mmap adaptive checkpoint is missing sampler state")
+        if (
+            checkpoint_adaptive_variant == SONIC_ADAPTIVE_CHECKPOINT_RANK_LOCAL
+            and checkpoint_adaptive_state is not None
+        ):
+            raise ValueError("SONIC rank-local adaptive checkpoint must not contain sampler state")
+        if current_adaptive_variant == SONIC_ADAPTIVE_CHECKPOINT_GLOBAL_MMAP:
+            if checkpoint_adaptive_state is None:
+                warnings.warn(
+                    "SONIC checkpoint has no restorable adaptive sampler state; starting the "
+                    "active sampler from its configured initial statistics (warm-start)",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            elif not isinstance(checkpoint_adaptive_state, Mapping):
+                raise ValueError("SONIC checkpoint adaptive sampler state must be a mapping")
+            else:
+                restore_sampler_state(self.env, checkpoint_adaptive_state)
+        elif current_adaptive_variant == SONIC_ADAPTIVE_CHECKPOINT_RANK_LOCAL:
+            if checkpoint_adaptive_state is not None:
+                raise ValueError(
+                    "SONIC checkpoint contains shared adaptive sampler state but the active "
+                    "environment has rank-local bins"
+                )
+            warnings.warn(
+                "SONIC active sampler uses rank-local bins; adaptive counters restart from "
+                "configured statistics on resume",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+        elif checkpoint_adaptive_state is not None:
+            raise ValueError(
+                "SONIC checkpoint contains adaptive sampler state but env has no sampler"
             )
         self.current_learning_iteration = int(state.get("iteration", 0))
 

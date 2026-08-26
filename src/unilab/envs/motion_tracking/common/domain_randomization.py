@@ -32,11 +32,15 @@ class MotionTrackingDomainRandomizationProvider(DomainRandomizationProvider):
         *,
         base_kp: np.ndarray | None = None,
         base_kd: np.ndarray | None = None,
+        base_body_mass: np.ndarray | None = None,
+        body_mass_body_ids: np.ndarray | None = None,
         base_geom_friction: np.ndarray | None = None,
         foot_geom_ids: np.ndarray | None = None,
     ) -> None:
         self._base_kp = base_kp
         self._base_kd = base_kd
+        self._base_body_mass = base_body_mass
+        self._body_mass_body_ids = body_mass_body_ids
         self._base_geom_friction = base_geom_friction
         self._foot_geom_ids = foot_geom_ids
         self._last_reset_observation_timing_ms: dict[str, float] = {}
@@ -47,7 +51,11 @@ class MotionTrackingDomainRandomizationProvider(DomainRandomizationProvider):
 
     def validate(self, env: Any, capabilities: DomainRandomizationCapabilities) -> None:
         validate_common_reset_randomization(
-            env, capabilities, base_kp=self._base_kp, base_kd=self._base_kd
+            env,
+            capabilities,
+            base_kp=self._base_kp,
+            base_kd=self._base_kd,
+            base_body_mass=self._base_body_mass,
         )
         validate_interval_push_support(env, capabilities)
         if getattr(env.cfg.domain_rand, "randomize_geom_friction", False):
@@ -79,10 +87,25 @@ class MotionTrackingDomainRandomizationProvider(DomainRandomizationProvider):
             "last_actions": zero_actions(num_reset, env._num_action),
         }
         randomization = build_common_reset_randomization(
-            env, num_reset, base_kp=self._base_kp, base_kd=self._base_kd
+            env,
+            num_reset,
+            base_kp=self._base_kp,
+            base_kd=self._base_kd,
+            base_body_mass=self._base_body_mass,
         )
 
         dr_cfg = env.cfg.domain_rand
+        if getattr(dr_cfg, "randomize_body_mass", False):
+            if randomization is None or randomization.body_mass is None:
+                raise RuntimeError("body-mass randomization did not produce a payload")
+            if self._body_mass_body_ids is None or self._body_mass_body_ids.size == 0:
+                raise ValueError("randomize_body_mass=True but no target body IDs were cached")
+            target_ids = self._body_mass_body_ids
+            if np.any(target_ids < 0) or np.any(target_ids >= randomization.body_mass.shape[1]):
+                raise ValueError("body mass target IDs are outside the backend body table")
+            target_mask = np.zeros(randomization.body_mass.shape[1], dtype=bool)
+            target_mask[target_ids] = True
+            randomization.body_mass[:, ~target_mask] = self._base_body_mass[~target_mask]
         if getattr(dr_cfg, "randomize_geom_friction", False):
             assert self._base_geom_friction is not None
             assert self._foot_geom_ids is not None

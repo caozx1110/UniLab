@@ -37,7 +37,7 @@ def _obs(num_envs: int) -> dict[str, torch.Tensor]:
 
 
 @pytest.fixture(scope="module")
-def sonic_v11_specs() -> dict[str, object]:
+def sonic_release_specs() -> dict[str, object]:
     config_path = Path(__file__).resolve().parents[2] / "conf/sonic/config.yaml"
     config = yaml.safe_load(config_path.read_text())
     return config["sonic"]["model"]
@@ -46,7 +46,7 @@ def sonic_v11_specs() -> dict[str, object]:
 def _named_model(specs: dict[str, object]) -> SonicActorCritic:
     return SonicActorCritic(
         hidden_dims=(8,),
-        model_profile="sonic_v1_1",
+        model_profile="sonic_release",
         tokenizer_fields=specs["tokenizer_fields"],
         encoders=specs["encoders"],
         decoders=specs["decoders"],
@@ -67,45 +67,85 @@ def _named_runner_config(specs: dict[str, object]) -> dict[str, object]:
         "num_steps_per_env": 1,
         "num_mini_batches": 1,
         "num_learning_epochs": 1,
-        "dimensions": {"actor_obs_dim": 930, "critic_obs_dim": 1645, "tokenizer_obs_dim": 1761, "action_dim": 29},
-        "sonic": {"model": {**specs, "profile": "sonic_v1_1", "hidden_dims": [8], "critic_hidden_dims": [8]}},
+        "dimensions": {
+            "actor_obs_dim": 930,
+            "critic_obs_dim": 1645,
+            "tokenizer_obs_dim": 1761,
+            "action_dim": 29,
+        },
+        "sonic": {
+            "model": {
+                **specs,
+                "profile": "sonic_release",
+                "hidden_dims": [8],
+                "critic_hidden_dims": [8],
+            }
+        },
     }
 
 
-def test_named_model_reads_config_and_routes_one_hot_gradients(sonic_v11_specs) -> None:
-    model = _named_model(sonic_v11_specs)
+def test_named_model_reads_config_and_routes_one_hot_gradients(sonic_release_specs) -> None:
+    model = _named_model(sonic_release_specs)
     for route_index, encoder_name in enumerate(("g1", "teleop", "smpl")):
         model.zero_grad()
-        tokens = model.tokenizer(_named_token_obs(tuple(int(index == route_index) for index in range(3))))
+        tokens = model.tokenizer(
+            _named_token_obs(tuple(int(index == route_index) for index in range(3)))
+        )
         tokens.sum().backward()
         for name, encoder in model.tokenizer.encoders.items():
             gradients = [parameter.grad for parameter in encoder.parameters()]
-            has_gradient = any(gradient is not None and gradient.abs().sum() > 0 for gradient in gradients)
+            has_gradient = any(
+                gradient is not None and gradient.abs().sum() > 0 for gradient in gradients
+            )
             assert has_gradient is (name == encoder_name)
 
 
-def test_named_model_multihot_g1_smpl_uses_smpl_token(sonic_v11_specs) -> None:
-    model = _named_model(sonic_v11_specs)
+def test_named_model_multihot_g1_smpl_uses_smpl_token(sonic_release_specs) -> None:
+    model = _named_model(sonic_release_specs)
     smpl_tokens = model.tokenizer(_named_token_obs((0, 0, 1)))
     paired_tokens = model.tokenizer(_named_token_obs((1, 0, 1)))
     assert torch.equal(paired_tokens, smpl_tokens)
 
 
-def test_named_outputs_shapes_and_both_decoders_receive_gradients(sonic_v11_specs) -> None:
-    model = _named_model(sonic_v11_specs)
+def test_named_outputs_shapes_and_both_decoders_receive_gradients(sonic_release_specs) -> None:
+    model = _named_model(sonic_release_specs)
     output = model.named_outputs(torch.zeros(3, 930), _named_token_obs((1, 0, 0), 3))
     decoded = output["decoded_outputs"]
     assert output["action_mean"].shape == (3, 29)
     assert decoded["g1_dyn"]["action"].shape == (3, 29)
     assert decoded["g1_kin"]["command_multi_future_nonflat"].shape == (3, 10, 58)
-    assert decoded["g1_kin"]["motion_anchor_ori_heading_mf_nonflat"].shape == (3, 10, 6)
-    sum(decoded_name[output_name].sum() for decoded_name in decoded.values() for output_name in decoded_name).backward()
+    assert decoded["g1_kin"]["motion_anchor_ori_b_mf_nonflat"].shape == (3, 10, 6)
+    sum(
+        decoded_name[output_name].sum()
+        for decoded_name in decoded.values()
+        for output_name in decoded_name
+    ).backward()
     for decoder in model.tokenizer.decoders.values():
-        assert all(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in decoder.parameters())
+        assert all(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in decoder.parameters()
+        )
 
 
-def test_named_auxiliary_losses_route_masks_and_pair_mse(sonic_v11_specs) -> None:
-    model = _named_model(sonic_v11_specs)
+def test_named_g1_kin_unpacks_each_temporal_frame_before_output_fields(
+    sonic_release_specs,
+) -> None:
+    model = _named_model(sonic_release_specs)
+    with torch.no_grad():
+        for parameter in model.tokenizer.decoders["g1_kin"].parameters():
+            parameter.zero_()
+        model.tokenizer.decoders["g1_kin"][-1].bias.copy_(torch.arange(640.0))
+
+    decoded = model.named_outputs(torch.zeros(1, 930), _named_token_obs((1, 0, 0)))[
+        "decoded_outputs"
+    ]["g1_kin"]
+    expected = torch.arange(640.0).reshape(1, 10, 64)
+    assert torch.equal(decoded["command_multi_future_nonflat"], expected[..., :58])
+    assert torch.equal(decoded["motion_anchor_ori_b_mf_nonflat"], expected[..., 58:])
+
+
+def test_named_auxiliary_losses_route_masks_and_pair_mse(sonic_release_specs) -> None:
+    model = _named_model(sonic_release_specs)
     routes = ((1, 0, 0), (0, 1, 0), (1, 0, 1), (1, 1, 1))
     token_obs = torch.cat([_named_token_obs(route) for route in routes])
     outputs = model.tokenizer.decode(token_obs, torch.zeros(4, 930))
@@ -132,23 +172,28 @@ def test_named_auxiliary_losses_route_masks_and_pair_mse(sonic_v11_specs) -> Non
     )
 
 
-def test_named_auxiliary_losses_backward_reaches_all_encoders_and_decoders(sonic_v11_specs) -> None:
-    model = _named_model(sonic_v11_specs)
+def test_named_auxiliary_losses_backward_reaches_all_encoders_and_decoders(
+    sonic_release_specs,
+) -> None:
+    model = _named_model(sonic_release_specs)
     routes = ((1, 0, 0), (0, 1, 0), (1, 0, 1), (1, 1, 1))
     outputs = model.tokenizer.decode(
         torch.cat([_named_token_obs(route) for route in routes]), torch.zeros(4, 930)
     )
     sum(model.tokenizer.auxiliary_losses(outputs).values()).backward()
     for module in model.tokenizer.encoders.values():
-        assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in module.parameters())
+        assert any(
+            parameter.grad is not None and parameter.grad.abs().sum() > 0
+            for parameter in module.parameters()
+        )
     assert any(
         parameter.grad is not None and parameter.grad.abs().sum() > 0
         for parameter in model.tokenizer.decoders["g1_kin"].parameters()
     )
 
 
-def test_named_auxiliary_losses_sparse_pairs_are_connected_zero(sonic_v11_specs) -> None:
-    model = _named_model(sonic_v11_specs)
+def test_named_auxiliary_losses_sparse_pairs_are_connected_zero(sonic_release_specs) -> None:
+    model = _named_model(sonic_release_specs)
     outputs = model.tokenizer.decode(_named_token_obs((1, 0, 0)), torch.zeros(1, 930))
     losses = model.tokenizer.auxiliary_losses(outputs)
     pair_names = {
@@ -162,27 +207,45 @@ def test_named_auxiliary_losses_sparse_pairs_are_connected_zero(sonic_v11_specs)
     sum(losses.values()).backward()
 
 
-def test_named_ppo_update_uses_one_training_forward_per_microbatch(sonic_v11_specs) -> None:
+def test_named_ppo_update_uses_one_training_forward_per_microbatch(sonic_release_specs) -> None:
     torch.manual_seed(0)
-    model = _named_model(sonic_v11_specs)
+    model = _named_model(sonic_release_specs)
     storage = SonicRolloutStorage(1, 4)
     actor = torch.randn(4, 930)
     critic = torch.randn(4, 1645)
-    tokenizer = torch.cat([_named_token_obs(route) for route in ((1, 0, 0), (0, 1, 0), (1, 0, 1), (1, 1, 1))])
+    tokenizer = torch.cat(
+        [_named_token_obs(route) for route in ((1, 0, 0), (0, 1, 0), (1, 0, 1), (1, 1, 1))]
+    )
     distribution, values = model.distribution(actor, critic, tokenizer)
     actions = distribution.sample()
-    storage.add(actor, critic, tokenizer, actions, torch.arange(1, 5, dtype=torch.float32), torch.zeros(4), values,
-                distribution.log_prob(actions).sum(-1), distribution.mean, distribution.stddev)
+    storage.add(
+        actor,
+        critic,
+        tokenizer,
+        actions,
+        torch.arange(1, 5, dtype=torch.float32),
+        torch.zeros(4),
+        values,
+        distribution.log_prob(actions).sum(-1),
+        distribution.mean,
+        distribution.stddev,
+    )
     storage.compute_returns(torch.zeros(4))
     algorithm = SonicPPO(
         model,
         num_learning_epochs=1,
         num_mini_batches=1,
         microbatch_size=1,
-        aux_loss_coef={name: 1.0 for name in (
-            "g1_recon", "g1_smpl_latent", "g1_teleop_latent", "teleop_smpl_latent",
-            "reencoded_smpl_g1_latent",
-        )},
+        aux_loss_coef={
+            name: 1.0
+            for name in (
+                "g1_recon",
+                "g1_smpl_latent",
+                "g1_teleop_latent",
+                "teleop_smpl_latent",
+                "reencoded_smpl_g1_latent",
+            )
+        },
     )
     policy, _, auxiliary = model.training_forward(actor, critic, tokenizer)
     (policy.mean.square().mean() + sum(auxiliary.values())).backward()
@@ -201,19 +264,26 @@ def test_named_ppo_update_uses_one_training_forward_per_microbatch(sonic_v11_spe
 
     model.training_forward = training_forward
     model.distribution = lambda *args, **kwargs: pytest.fail("distribution called during update")
-    model.auxiliary_losses = lambda *args, **kwargs: pytest.fail("auxiliary_losses called during update")
+    model.auxiliary_losses = lambda *args, **kwargs: pytest.fail(
+        "auxiliary_losses called during update"
+    )
     metrics = algorithm.update(storage)
     assert calls == 4
     assert {
-        "g1_recon", "g1_smpl_latent", "g1_teleop_latent", "teleop_smpl_latent",
+        "g1_recon",
+        "g1_smpl_latent",
+        "g1_teleop_latent",
+        "teleop_smpl_latent",
         "reencoded_smpl_g1_latent",
     } <= set(metrics)
     assert all(np.isfinite(metrics[name]) for name in metrics)
 
 
 @pytest.mark.parametrize("version", [None, "unilab_sonic_dense_test.v1"])
-def test_named_runner_rejects_missing_or_prototype_contract_version(tmp_path, sonic_v11_specs, version) -> None:
-    runner = SonicPPORunner(_StateEnv(), _named_runner_config(sonic_v11_specs), device="cpu")
+def test_named_runner_rejects_missing_or_prototype_contract_version(
+    tmp_path, sonic_release_specs, version
+) -> None:
+    runner = SonicPPORunner(_StateEnv(), _named_runner_config(sonic_release_specs), device="cpu")
     checkpoint = tmp_path / "checkpoint.pt"
     runner.save(checkpoint)
     state = torch.load(checkpoint, weights_only=False)
@@ -226,16 +296,27 @@ def test_named_runner_rejects_missing_or_prototype_contract_version(tmp_path, so
         runner.load(checkpoint)
 
 
-def test_named_model_supports_tiny_native_ppo_update(sonic_v11_specs) -> None:
+def test_named_model_supports_tiny_native_ppo_update(sonic_release_specs) -> None:
     torch.manual_seed(0)
-    model = _named_model(sonic_v11_specs)
+    model = _named_model(sonic_release_specs)
     storage = SonicRolloutStorage(1, 1)
     actor = torch.randn(1, 930)
     critic = torch.randn(1, 1645)
     tokenizer = _named_token_obs((1, 0, 0))
     distribution, value = model.distribution(actor, critic, tokenizer)
     actions = distribution.sample()
-    storage.add(actor, critic, tokenizer, actions, torch.zeros(1), torch.zeros(1), value, distribution.log_prob(actions).sum(-1), distribution.mean, distribution.stddev)
+    storage.add(
+        actor,
+        critic,
+        tokenizer,
+        actions,
+        torch.zeros(1),
+        torch.zeros(1),
+        value,
+        distribution.log_prob(actions).sum(-1),
+        distribution.mean,
+        distribution.stddev,
+    )
     storage.compute_returns(torch.zeros(1))
     algorithm = SonicPPO(model, num_learning_epochs=1, num_mini_batches=1)
     metrics = algorithm.update(storage)
@@ -432,6 +513,35 @@ class _StateEnv:
         return self.init_state()
 
 
+class _RankLocalAdaptiveSampler:
+    bin_size = 50
+    bin_count = 1
+    _clip_offsets = np.asarray([0], dtype=np.int32)
+    _clip_lengths = np.asarray([50], dtype=np.int32)
+    _bin_clip_indices = np.asarray([0], dtype=np.int32)
+    _bin_local_starts = np.asarray([0], dtype=np.int32)
+    _bin_local_ends = np.asarray([50], dtype=np.int32)
+
+    def __init__(self) -> None:
+        self.bin_episode_count = np.asarray([1.0], dtype=np.float64)
+        self.bin_failed_count = np.asarray([1.0], dtype=np.float64)
+        self._steps_since_probability_refresh = 0
+        self._sampling_prob = np.asarray([1.0], dtype=np.float64)
+        self._sampling_cdf = np.asarray([1.0], dtype=np.float64)
+
+    def _refresh_sampling_probabilities(self) -> None:
+        pass
+
+
+class _RankLocalAdaptiveEnv(_StateEnv):
+    def __init__(self) -> None:
+        self.motion_sampler = _RankLocalAdaptiveSampler()
+        self._cfg = SimpleNamespace(
+            motion_global_mmap_sidecar=None,
+            motion_shard_clips=True,
+        )
+
+
 def test_runner_np_env_state_checkpoint_resume(tmp_path) -> None:
     config = {
         "num_steps_per_env": 1,
@@ -452,6 +562,51 @@ def test_runner_np_env_state_checkpoint_resume(tmp_path) -> None:
     restored = SonicPPORunner(_StateEnv(), config, device="cpu")
     restored.load(checkpoint)
     assert restored.current_learning_iteration == 1
+
+
+def test_runner_marks_rank_local_adaptive_sampler_checkpoint_as_uncheckpointed(tmp_path) -> None:
+    runner = SonicPPORunner(_RankLocalAdaptiveEnv(), _checkpoint_config(), device="cpu")
+    checkpoint = tmp_path / "rank-local.pt"
+
+    with pytest.warns(RuntimeWarning, match="rank-local bins"):
+        runner.save(checkpoint)
+
+    state = torch.load(checkpoint, weights_only=False)
+    assert "sonic_adaptive_sampling" not in state
+    assert state["sonic_adaptive_sampling_checkpoint_variant"] == "rank_local_uncheckpointed.v1"
+
+
+def test_runner_checkpoint_does_not_add_global_sampler_collective(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    import unilab.algos.torch.sonic_ppo.runner as runner_module
+
+    env = _RankLocalAdaptiveEnv()
+    env._cfg.motion_global_mmap_sidecar = "/tmp/global-mmap/metadata.json"
+    env._cfg.motion_shard_clips = False
+    runner = SonicPPORunner(env, _checkpoint_config(), device="cpu")
+    monkeypatch.setattr(
+        runner_module,
+        "sync_sampler_state",
+        lambda *_args, **_kwargs: pytest.fail("checkpoint must not synchronize sampler"),
+    )
+
+    runner.save(tmp_path / "global-mmap.pt")
+
+
+def test_runner_never_adds_adaptive_collective_for_rank_local_sampler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import unilab.algos.torch.sonic_ppo.runner as runner_module
+
+    runner = SonicPPORunner(_RankLocalAdaptiveEnv(), _checkpoint_config(), device="cpu")
+    monkeypatch.setattr(
+        runner_module,
+        "sync_sampler_state",
+        lambda **_kwargs: pytest.fail("rank-local sampler must not synchronize"),
+    )
+
+    assert runner._sync_adaptive_sampler_for_iteration(200) is False
 
 
 def test_runner_always_saves_last_checkpoint_outside_periodic_interval(tmp_path) -> None:
@@ -489,6 +644,72 @@ def test_runner_always_saves_last_checkpoint_outside_periodic_interval(tmp_path)
 
     assert (tmp_path / "last.pt").is_file()
     assert not (tmp_path / "model_1.pt").exists()
+
+
+@pytest.mark.parametrize("resample", [True, False])
+def test_runner_resamples_motion_pool_at_iteration_boundary(
+    monkeypatch: pytest.MonkeyPatch, resample: bool
+) -> None:
+    class LifecycleEnv:
+        num_envs = 1
+
+        def __init__(self) -> None:
+            self.reset_count = 0
+            self.completed_steps: list[int] = []
+
+        @staticmethod
+        def _observations(actor: float, critic: float, tokenizer: float) -> dict[str, np.ndarray]:
+            return {
+                "policy": np.full((1, 1), actor, dtype=np.float32),
+                "privileged": np.full((1, 1), critic, dtype=np.float32),
+                "tokens": np.full((1, 1), tokenizer, dtype=np.float32),
+            }
+
+        def reset(self) -> dict[str, np.ndarray]:
+            self.reset_count += 1
+            if self.reset_count == 1:
+                return self._observations(1.0, 2.0, 3.0)
+            return self._observations(10.0, 20.0, 30.0)
+
+        def step(self, actions: np.ndarray):
+            assert actions.shape == (1, 1)
+            return self._observations(4.0, 5.0, 6.0), np.zeros(1), np.zeros(1, bool)
+
+        def maybe_resample_motion_pool(self, completed_step: int) -> bool:
+            self.completed_steps.append(completed_step)
+            return resample and completed_step == 1
+
+    config = {
+        **_checkpoint_config(),
+        "max_iterations": 2,
+    }
+    env = LifecycleEnv()
+    runner = SonicPPORunner(env, config, device="cpu")
+    rollout_observations: list[tuple[float, float, float]] = []
+
+    def distribution(actor_obs, critic_obs, token_obs):
+        rollout_observations.append(
+            (float(actor_obs[0, 0]), float(critic_obs[0, 0]), float(token_obs[0, 0]))
+        )
+        batch_size = actor_obs.shape[0]
+        policy = torch.distributions.Normal(
+            torch.zeros((batch_size, 1)), torch.ones((batch_size, 1))
+        )
+        return policy, torch.zeros(batch_size)
+
+    def update(storage) -> dict[str, float]:
+        storage.clear()
+        return {"loss": 0.0}
+
+    monkeypatch.setattr(runner.model, "distribution", distribution)
+    monkeypatch.setattr(runner.algorithm, "update", update)
+
+    runner.learn(2)
+
+    assert env.completed_steps == [1, 2]
+    assert env.reset_count == (2 if resample else 1)
+    assert rollout_observations[0] == (1.0, 2.0, 3.0)
+    assert rollout_observations[2] == ((10.0, 20.0, 30.0) if resample else (4.0, 5.0, 6.0))
 
 
 def test_cuda_timing_sync_only_runs_for_cuda(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1018,9 +1239,15 @@ def test_runner_bootstraps_timeout_from_final_observation(monkeypatch) -> None:
     }
     runner = SonicPPORunner(_TimeoutEnv(), config, device="cpu")
 
+    distribution_batch_sizes: list[int] = []
+
     def distribution(actor_obs, critic_obs, token_obs):
         del actor_obs, token_obs
-        policy = torch.distributions.Normal(torch.zeros((2, 1)), torch.ones((2, 1)))
+        batch_size = int(critic_obs.shape[0])
+        distribution_batch_sizes.append(batch_size)
+        policy = torch.distributions.Normal(
+            torch.zeros((batch_size, 1)), torch.ones((batch_size, 1))
+        )
         return policy, critic_obs[:, 0]
 
     captured: dict[str, torch.Tensor] = {}
@@ -1042,6 +1269,7 @@ def test_runner_bootstraps_timeout_from_final_observation(monkeypatch) -> None:
     assert torch.equal(captured["dones"], torch.tensor([[True, True]]))
     assert torch.allclose(captured["rewards"], torch.tensor([[2.7, 0.0]]))
     assert torch.allclose(captured["returns"], torch.tensor([[2.7, 0.0]]))
+    assert distribution_batch_sizes == [2, 1, 2]
 
 
 def test_runner_rejects_wrong_observation_batch() -> None:

@@ -3974,7 +3974,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "etils" },
+    { name = "etils", extras = ["epath"] },
     { name = "gymnasium" },
     { name = "huggingface-hub", specifier = ">=0.25" },
     { name = "hydra-core", specifier = ">=1.3" },

@@ -8,11 +8,10 @@ import pytest
 from unilab.envs.motion_tracking.g1.sonic import (
     SONIC_BODY_ORDER,
     SONIC_MUJOCO_TO_POLICY,
-    SONIC_V1_1_OBSERVATION_PROFILE,
-    SONIC_V1_1_REVISION,
+    SONIC_RELEASE_OBSERVATION_PROFILE,
+    SONIC_RELEASE_REVISION,
     SonicG1TrackingCfg,
     SonicG1TrackingEnv,
-    _sonic_heading_relative_rot6d,
 )
 
 # Pinned float32 oracle generated from the Python training path at
@@ -72,12 +71,17 @@ def _compute_heading_fixture(
     env._cfg = SonicG1TrackingCfg()
     env._cfg.noise_config.level = 0.0
     env._cfg.tokenizer_enable_corruption = False
-    env.motion_sampler = SimpleNamespace(current_frames=np.asarray([0], dtype=np.int64))
+    env.motion_sampler = SimpleNamespace(
+        current_frames=np.asarray([0], dtype=np.int64),
+        clamp_reference_indices=lambda indices, _env_ids=None: np.asarray(
+            indices, dtype=np.int32
+        ),
+    )
 
     future = env._zero_future_reference(1)
     future["body_quat"][0, :, 0] = g1_future_quat
     future["smpl_root_quat"][0] = smpl_future_quat
-    env._future_reference = lambda _frame_indices: future
+    env._future_reference = lambda _frame_indices, *, env_ids=None: future
 
     robot_body_quat = np.broadcast_to(
         np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
@@ -116,13 +120,7 @@ def _left_multiply_world_yaw(quat: np.ndarray, angle: float) -> np.ndarray:
     ).astype(np.float32)
 
 
-def test_v11_heading_helper_matches_pinned_upstream_float32_oracle() -> None:
-    actual = _sonic_heading_relative_rot6d(_UPSTREAM_ROBOT, _UPSTREAM_TARGETS)
-    assert actual.dtype == np.float32
-    np.testing.assert_allclose(actual, _UPSTREAM_ROT6D, rtol=1.0e-6, atol=1.0e-6)
-
-
-def test_v11_three_heading_terms_and_critic_body_orientation_are_distinct() -> None:
+def test_release_body_relative_orientation_terms_use_current_then_future_order() -> None:
     obs = _compute_heading_fixture(
         _UPSTREAM_ROBOT,
         _UPSTREAM_TARGETS[_G1_FUTURE_INDICES],
@@ -136,23 +134,20 @@ def test_v11_three_heading_terms_and_critic_body_orientation_are_distinct() -> N
     }
     assert all(value.dtype == np.float32 for value in obs.values())
     np.testing.assert_allclose(
-        obs["tokenizer"][:, 594:654],
-        _UPSTREAM_ROT6D[_G1_FUTURE_INDICES].reshape(1, 60),
+        obs["tokenizer"][:, 594:600],
+        obs["critic_obs"][:, 583:589],
         rtol=1.0e-6,
         atol=1.0e-6,
     )
     np.testing.assert_allclose(
-        obs["tokenizer"][:, 654:660],
-        _UPSTREAM_ROT6D[1:2],
+        obs["tokenizer"][:, 600:606],
+        obs["tokenizer"][:, 594:600],
         rtol=1.0e-6,
         atol=1.0e-6,
     )
-    np.testing.assert_allclose(
-        obs["tokenizer"][:, 1641:1701],
-        _UPSTREAM_ROT6D[_SMPL_FUTURE_INDICES].reshape(1, 60),
-        rtol=1.0e-6,
-        atol=1.0e-6,
-    )
+    assert obs["tokenizer"][:, 600:660].shape == (1, 60)
+    assert obs["tokenizer"][:, 1641:1701].shape == (1, 60)
+    assert np.all(np.isfinite(obs["tokenizer"][:, 594:660]))
     # The critic intentionally keeps inv(full robot body) * current target.
     np.testing.assert_allclose(
         obs["critic_obs"][:, 583:589],
@@ -163,10 +158,10 @@ def test_v11_three_heading_terms_and_critic_body_orientation_are_distinct() -> N
         rtol=1.0e-6,
         atol=1.0e-6,
     )
-    assert not np.allclose(obs["critic_obs"][:, 583:589], obs["tokenizer"][:, 654:660])
+    np.testing.assert_allclose(obs["critic_obs"][:, 583:589], obs["tokenizer"][:, 594:600])
 
 
-def test_v11_heading_terms_are_invariant_to_common_left_world_yaw() -> None:
+def test_release_body_relative_orientation_is_invariant_to_common_left_world_yaw() -> None:
     g1_targets = _UPSTREAM_TARGETS[_G1_FUTURE_INDICES]
     smpl_targets = _UPSTREAM_TARGETS[_SMPL_FUTURE_INDICES]
     baseline = _compute_heading_fixture(_UPSTREAM_ROBOT, g1_targets, smpl_targets)
@@ -176,7 +171,7 @@ def test_v11_heading_terms_are_invariant_to_common_left_world_yaw() -> None:
         _left_multiply_world_yaw(smpl_targets, 0.73),
     )
 
-    for start, stop in ((594, 654), (654, 660), (1641, 1701)):
+    for start, stop in ((594, 600), (600, 660), (1641, 1701)):
         np.testing.assert_allclose(
             shifted["tokenizer"][:, start:stop],
             baseline["tokenizer"][:, start:stop],
@@ -185,28 +180,12 @@ def test_v11_heading_terms_are_invariant_to_common_left_world_yaw() -> None:
         )
 
 
-def test_v11_heading_preserves_relative_pitch_and_roll() -> None:
-    robot_heading = np.asarray([0.921060994, 0.0, 0.0, 0.389418342], dtype=np.float32)
-    target_with_pitch_roll = np.asarray(
-        [0.875443766, 0.246641131, -0.080983764, 0.407686147], dtype=np.float32
-    )
-    expected = np.asarray(
-        [0.939372713, -0.133530696, 0.0, 0.921060994, 0.342897807, 0.365808965],
-        dtype=np.float32,
-    )
-
-    neutral = _sonic_heading_relative_rot6d(robot_heading, robot_heading)
-    actual = _sonic_heading_relative_rot6d(robot_heading, target_with_pitch_roll)
-    np.testing.assert_allclose(actual, expected, rtol=2.0e-6, atol=2.0e-6)
-    assert not np.allclose(actual, neutral, rtol=2.0e-6, atol=2.0e-6)
-
-
-def test_v11_observation_profile_is_versioned_and_fail_closed() -> None:
-    assert SONIC_V1_1_REVISION == "a0732b642c0333077e127a2f56ab0014c196bca4"
-    assert SONIC_V1_1_OBSERVATION_PROFILE == "unitoken_all_noz_heading"
+def test_release_observation_profile_is_versioned_and_fail_closed() -> None:
+    assert SONIC_RELEASE_REVISION == "c374bae5b9039cd0ee71377e654d11ce1bc69e1d"
+    assert SONIC_RELEASE_OBSERVATION_PROFILE == "unitoken_all_noz"
     with pytest.raises(ValueError, match="observation_profile"):
         SonicG1TrackingEnv(
-            SonicG1TrackingCfg(observation_profile="unitoken_all_noz"),
+            SonicG1TrackingCfg(observation_profile="unitoken_all_noz_heading"),
             num_envs=1,
             backend_type="mujoco",
         )

@@ -49,6 +49,10 @@ class DomainRand:
     randomize_base_mass: bool = False
     added_mass_range: list[float] = field(default_factory=lambda: [-1.5, 1.5])
 
+    randomize_body_mass: bool = False
+    body_mass_multiplier_range: list[float] = field(default_factory=lambda: [0.9, 1.1])
+    body_mass_body_names: tuple[str, ...] = field(default_factory=tuple)
+
     random_com: bool = False
     com_offset_x: list[float] = field(default_factory=lambda: [-0.05, 0.05])
     com_offset_y: list[float] = field(default_factory=lambda: [-0.05, 0.05])
@@ -163,6 +167,7 @@ class MotionTrackingCfg(G1BaseCfg):
         "left_wrist_yaw_link",
         "right_wrist_yaw_link",
     )
+    undesired_contact_body_names: tuple[str, ...] | None = None
     undesired_contact_z_threshold: float = 0.05
     terminate_on_undesired_contacts: bool = False
 

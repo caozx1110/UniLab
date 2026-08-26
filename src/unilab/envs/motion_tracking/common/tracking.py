@@ -70,10 +70,14 @@ class MotionTrackingEnv(G1BaseEnv):
         )
         self._has_ee_body_indices = bool(self.ee_body_indices.size)
 
-        # Get non-EE body indices for undesired contact penalty
-        ee_set = set(cfg.ee_body_names)
+        undesired_contact_body_names = cfg.undesired_contact_body_names
+        if undesired_contact_body_names is None:
+            ee_set = set(cfg.ee_body_names)
+            undesired_contact_body_names = tuple(
+                name for name in cfg.body_names if name not in ee_set
+            )
         self.undesired_contact_body_indices = np.array(
-            [i for i, name in enumerate(cfg.body_names) if name not in ee_set],
+            [cfg.body_names.index(name) for name in undesired_contact_body_names],
             dtype=np.int32,
         )
         self._has_undesired_contact_body_indices = bool(self.undesired_contact_body_indices.size)
@@ -91,10 +95,21 @@ class MotionTrackingEnv(G1BaseEnv):
             start_ratio=cfg.sampling_start_ratio,
         )
         needs_kp_kd = cfg.domain_rand.randomize_kp or cfg.domain_rand.randomize_kd
+        needs_body_mass = getattr(cfg.domain_rand, "randomize_body_mass", False)
         needs_friction = getattr(cfg.domain_rand, "randomize_geom_friction", False)
         base_kp = base_kd = None
         if needs_kp_kd:
             base_kp, base_kd = backend.get_actuator_gains()
+        base_body_mass = None
+        body_mass_body_ids = None
+        if needs_body_mass:
+            base_body_mass = backend.get_body_mass()
+            target_names = tuple(getattr(cfg.domain_rand, "body_mass_body_names", ()))
+            if not target_names:
+                raise ValueError(
+                    "randomize_body_mass=True requires domain_rand.body_mass_body_names"
+                )
+            body_mass_body_ids = backend.get_body_ids(target_names)
         base_geom_friction = None
         foot_geom_ids = None
         if needs_friction:
@@ -115,6 +130,8 @@ class MotionTrackingEnv(G1BaseEnv):
         dr_provider = MotionTrackingDomainRandomizationProvider(
             base_kp=base_kp,
             base_kd=base_kd,
+            base_body_mass=base_body_mass,
+            body_mass_body_ids=body_mass_body_ids,
             base_geom_friction=base_geom_friction,
             foot_geom_ids=foot_geom_ids,
         )

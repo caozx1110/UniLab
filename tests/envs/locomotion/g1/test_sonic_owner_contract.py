@@ -9,6 +9,8 @@ import pytest
 from unilab.algos.torch.sonic_ppo import SonicPPORunner
 from unilab.assets import ASSETS_ROOT_PATH
 from unilab.base import registry
+from unilab.base.np_env import NpEnv, NpEnvState
+from unilab.envs.motion_tracking.common.tracking import MotionTrackingEnv
 from unilab.envs.motion_tracking.g1.sonic import (
     SONIC_ACTION_SCALE,
     SONIC_ACTOR_OBSERVATION_TERMS,
@@ -25,6 +27,7 @@ from unilab.envs.motion_tracking.g1.sonic import (
     SONIC_WRIST_JOINT_INDICES,
     SonicG1TrackingCfg,
     SonicG1TrackingEnv,
+    _SonicReleaseMotionSampler,
 )
 from unilab.training.sonic_motion import materialize_motion_store
 from unilab.training.sonic_store import SonicMotionLoader
@@ -32,9 +35,9 @@ from unilab.training.sonic_store import SonicMotionLoader
 mujoco = pytest.importorskip("mujoco")
 
 # These expected layouts are transcribed from
-# GR00T-WholeBodyControl@a0732b642c0333077e127a2f56ab0014c196bca4:
+# GR00T-WholeBodyControl@c374bae5b9039cd0ee71377e654d11ce1bc69e1d:
 # gear_sonic/config/manager_env/observations/{policy/local_dir_hist,
-# critic/privileged_mf_hist,tokenizer/unitoken_all_noz_heading}.yaml and the
+# critic/privileged_mf_hist,tokenizer/unitoken_all_noz}.yaml and the
 # PolicyCfg/PrivilegedCfg/TokenizerCfg declarations in observations.py.
 # IsaacLab v2.3.2 ObservationManager iterates those configclass declarations.
 
@@ -65,6 +68,317 @@ def _write_clip(path: Path, *, body_order: list[str], joint_order: list[str]) ->
         body_lin_vel_w=zeros,
         body_ang_vel_w=zeros,
     )
+
+
+class _ClipLocalSamplerLoader:
+    """Small immutable loader surface used by the owner-only sampler test."""
+
+    clip_lengths = np.asarray([100, 150], dtype=np.int32)
+    clip_offsets = np.asarray([0, 100], dtype=np.int32)
+    clip_end_frames = np.asarray([99, 249], dtype=np.int32)
+
+    def get_clip_indices(self, frame_idx: np.ndarray) -> np.ndarray:
+        return np.searchsorted(self.clip_offsets, frame_idx, side="right").astype(np.int32) - 1
+
+
+class _ActivePoolSamplerLoader:
+    """Configurable immutable loader for release active-pool tests."""
+
+    def __init__(self, clip_lengths: tuple[int, ...]) -> None:
+        self.clip_lengths = np.asarray(clip_lengths, dtype=np.int32)
+        self.clip_offsets = np.zeros(len(self.clip_lengths), dtype=np.int32)
+        if len(self.clip_offsets) > 1:
+            np.cumsum(self.clip_lengths[:-1], out=self.clip_offsets[1:])
+        self.clip_end_frames = self.clip_offsets + self.clip_lengths - 1
+
+    def get_clip_indices(self, frame_idx: np.ndarray) -> np.ndarray:
+        return np.searchsorted(self.clip_offsets, frame_idx, side="right").astype(np.int32) - 1
+
+
+class _FreezeFutureStore:
+    """Frame-valued store that makes reference-index clamping observable."""
+
+    def future_indices(self, frames: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+        return np.asarray(frames, dtype=np.int64)[:, None] + np.asarray(offsets, dtype=np.int64)
+
+    def gather_fields(self, fields: tuple[str, ...], indices: np.ndarray) -> dict[str, np.ndarray]:
+        values = np.asarray(indices, dtype=np.float32).reshape(-1)
+        count = len(values)
+        result: dict[str, np.ndarray] = {}
+        for field in fields:
+            if field in {"joint_pos", "joint_vel"}:
+                result[field] = np.broadcast_to(values[:, None], (count, 29)).copy()
+            elif field == "body_pos_w":
+                result[field] = np.broadcast_to(values[:, None, None], (count, 14, 3)).copy()
+            elif field == "body_quat_w":
+                quat = np.zeros((count, 14, 4), dtype=np.float32)
+                quat[..., 0] = 1.0
+                result[field] = quat
+            elif field == "smpl_joints":
+                result[field] = np.broadcast_to(values[:, None, None], (count, 24, 3)).copy()
+            elif field == "smpl_root_quat_w":
+                quat = np.zeros((count, 4), dtype=np.float32)
+                quat[:, 0] = 1.0
+                result[field] = quat
+            else:  # pragma: no cover - protects the fixture against owner drift.
+                raise AssertionError(f"unexpected field {field!r}")
+        return result
+
+
+def test_sonic_release_sampler_uses_clip_local_bins_and_ignores_clip_timeout_failures() -> None:
+    sampler = _SonicReleaseMotionSampler(
+        _ClipLocalSamplerLoader(),
+        num_envs=2,
+        bin_size=50,
+        init_num_failures=1.0,
+        uniform_sampling_rate=0.1,
+        failure_rate_max_over_mean=200.0,
+        pre_failure_sample_window=200,
+        sequence_length_agnostic=True,
+        probability_refresh_interval_steps=24,
+    )
+    assert sampler.bin_count == 5
+    np.testing.assert_allclose(
+        [
+            sampler._sampling_prob[:2].sum(),
+            sampler._sampling_prob[2:].sum(),
+        ],
+        [0.5, 0.5],
+    )
+
+    sampler._set_sampled_frames(
+        np.asarray([0, 1], dtype=np.int32), np.asarray([99, 249], dtype=np.int32)
+    )
+    # Reaching a final clip frame is a resampling point, not a termination.
+    sampler.update_failure_stats(np.asarray([False, False]))
+    np.testing.assert_allclose(sampler.bin_episode_count, [1.0, 1.02, 1.0, 1.0, 1.02])
+    np.testing.assert_allclose(sampler.bin_failed_count, np.ones(5))
+
+    sampler._set_sampled_frames(
+        np.asarray([0, 1], dtype=np.int32), np.asarray([50, 100], dtype=np.int32)
+    )
+    sampler.update_failure_stats(np.asarray([True, False]))
+    assert sampler.bin_episode_count[1] == pytest.approx(1.04)
+    assert sampler.bin_episode_count[2] == pytest.approx(1.02)
+    assert sampler.bin_failed_count[1] == pytest.approx(2.0)
+    sampled = sampler.sample_frames(np.asarray([0, 1], dtype=np.int32))
+    assert np.all((0 <= sampled) & (sampled <= 249))
+
+
+def test_sonic_release_sampler_refreshes_cached_cdf_at_owner_interval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sampler = _SonicReleaseMotionSampler(
+        _ClipLocalSamplerLoader(),
+        num_envs=2,
+        bin_size=50,
+        init_num_failures=1.0,
+        uniform_sampling_rate=0.1,
+        failure_rate_max_over_mean=200.0,
+        pre_failure_sample_window=0,
+        sequence_length_agnostic=True,
+        probability_refresh_interval_steps=2,
+    )
+    initial_cdf = sampler._sampling_cdf.copy()
+    sampler._set_sampled_frames(
+        np.asarray([0, 1], dtype=np.int32), np.asarray([50, 100], dtype=np.int32)
+    )
+
+    # Exposure and failure counts remain per-step, but their sampling view is
+    # held constant until a complete PPO-collection cadence has elapsed.
+    sampler.update_failure_stats(np.asarray([True, False]))
+    np.testing.assert_array_equal(sampler._sampling_cdf, initial_cdf)
+    sampler.update_failure_stats(np.asarray([True, False]))
+    assert sampler._sampling_cdf[-1] == 1.0
+    assert np.all(np.diff(sampler._sampling_cdf) >= 0.0)
+    assert sampler._sampling_prob[1] > initial_cdf[1] - initial_cdf[0]
+
+    def _choice_must_not_run(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise AssertionError("reset must sample the cached CDF, not np.random.choice(p=...)")
+
+    monkeypatch.setattr(np.random, "choice", _choice_must_not_run)
+    sampled = sampler.sample_frames(np.asarray([0, 1], dtype=np.int32))
+    assert sampled.shape == (2,)
+
+
+def test_sonic_release_active_pool_uses_replacement_and_only_active_bins(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    random_draws = iter(
+        (
+            np.asarray([0.01, 0.01]),  # initial active slots: clip 0 twice
+            np.asarray([0.1, 0.9]),  # reset samples two active-bin positions
+            np.asarray([0.5, 0.5]),  # frames within those bins
+            np.asarray([0.9, 0.9]),  # callback reloads clip 2 twice
+            np.asarray([0.4, 0.4]),  # checkpoint restore reloads clip 1 twice
+        )
+    )
+
+    def random(size: int | None = None) -> np.ndarray:
+        value = next(random_draws)
+        assert size == 2
+        return value
+
+    monkeypatch.setattr(np.random, "random", random)
+    sampler = _SonicReleaseMotionSampler(
+        _ActivePoolSamplerLoader((100, 100, 100)),
+        num_envs=2,
+        bin_size=50,
+        init_num_failures=1.0,
+        uniform_sampling_rate=0.1,
+        failure_rate_max_over_mean=200.0,
+        pre_failure_sample_window=0,
+        sequence_length_agnostic=True,
+        probability_refresh_interval_steps=24,
+        active_motion_pool_size=2,
+    )
+    np.testing.assert_array_equal(sampler.active_clip_indices, [0, 0])
+    np.testing.assert_array_equal(
+        sampler._bin_clip_indices[sampler._active_bin_ids], np.zeros(4, dtype=np.int32)
+    )
+    # Counters retain the global six-bin coordinate even though only clip 0 is
+    # currently reachable by reset sampling.
+    assert sampler.bin_count == 6
+    sampled = sampler.sample_frames(np.asarray([0, 1], dtype=np.int32))
+    assert np.all(sampled < 100)
+    np.testing.assert_array_equal(sampler.current_clip_indices, [0, 0])
+
+    assert sampler.maybe_resample_active_motion_pool(249) is False
+    assert sampler.maybe_resample_active_motion_pool(250) is True
+    np.testing.assert_array_equal(sampler.active_clip_indices, [2, 2])
+    assert sampler.reload_active_motion_pool_after_restore() is True
+    np.testing.assert_array_equal(sampler.active_clip_indices, [1, 1])
+
+
+def test_sonic_release_active_pool_freezes_each_duplicate_slot_independently(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    random_draws = iter((np.asarray([0.01, 0.01]), 0.0, 0.0))
+
+    def random(size: int | None = None) -> float | np.ndarray:
+        value = next(random_draws)
+        if size is not None:
+            assert size == 2
+        return value
+
+    cutoff_draws = iter((10, 20))
+    monkeypatch.setattr(np.random, "random", random)
+    monkeypatch.setattr(np.random, "randint", lambda low, high: next(cutoff_draws))
+    sampler = _SonicReleaseMotionSampler(
+        _ActivePoolSamplerLoader((100, 100, 100)),
+        num_envs=2,
+        bin_size=50,
+        init_num_failures=1.0,
+        uniform_sampling_rate=0.1,
+        failure_rate_max_over_mean=200.0,
+        pre_failure_sample_window=0,
+        sequence_length_agnostic=True,
+        probability_refresh_interval_steps=24,
+        active_motion_pool_size=2,
+        freeze_frame_aug=True,
+        freeze_frame_prob=0.1,
+    )
+    np.testing.assert_array_equal(sampler.active_clip_indices, [0, 0])
+    np.testing.assert_array_equal(sampler.active_slot_freeze_frames, [10, 20])
+    sampler._set_sampled_frames(
+        np.asarray([0, 1], dtype=np.int32),
+        np.asarray([50, 50], dtype=np.int32),
+        active_slots=np.asarray([0, 1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(sampler.current_frames, [10, 20])
+    clamped = sampler.clamp_reference_indices(
+        np.asarray([[50, 51], [50, 51]], dtype=np.int32),
+        env_ids=np.asarray([0, 1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(clamped, [[10, 10], [20, 20]])
+
+
+def test_sonic_release_small_corpus_loads_once_without_duplicates_or_callback_reset() -> None:
+    sampler = _SonicReleaseMotionSampler(
+        _ClipLocalSamplerLoader(),
+        num_envs=4096,
+        bin_size=50,
+        init_num_failures=1.0,
+        uniform_sampling_rate=0.1,
+        failure_rate_max_over_mean=200.0,
+        pre_failure_sample_window=0,
+        sequence_length_agnostic=True,
+        probability_refresh_interval_steps=24,
+        active_motion_pool_size=1024,
+    )
+    np.testing.assert_array_equal(sampler.active_clip_indices, [0, 1])
+    assert sampler.maybe_resample_active_motion_pool(250) is False
+    assert sampler.reload_active_motion_pool_after_restore() is False
+    np.testing.assert_array_equal(sampler.active_clip_indices, [0, 1])
+
+
+def test_sonic_freeze_frame_is_sampled_once_per_clip_and_keeps_timeline_progressing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    random_values = iter([0.0, 1.0])
+    monkeypatch.setattr(np.random, "random", lambda *args, **kwargs: next(random_values))
+    monkeypatch.setattr(np.random, "randint", lambda low, high: 1)
+    sampler = _SonicReleaseMotionSampler(
+        _ClipLocalSamplerLoader(),
+        num_envs=2,
+        bin_size=50,
+        init_num_failures=1.0,
+        uniform_sampling_rate=0.1,
+        failure_rate_max_over_mean=200.0,
+        pre_failure_sample_window=0,
+        sequence_length_agnostic=True,
+        probability_refresh_interval_steps=24,
+        freeze_frame_aug=True,
+        freeze_frame_prob=0.5,
+    )
+    # The full small corpus has one active slot per clip. The first slot is
+    # frozen at absolute frame 1; the second is not.
+    np.testing.assert_array_equal(sampler._clip_freeze_frames, [1, 249])
+    sampled = sampler._set_sampled_frames(
+        np.asarray([0, 1], dtype=np.int32), np.asarray([50, 100], dtype=np.int32)
+    )
+    del sampled
+    np.testing.assert_array_equal(sampler.current_frames, [1, 100])
+    sampler.step()
+    np.testing.assert_array_equal(sampler.timeline_frames, [51, 101])
+    np.testing.assert_array_equal(sampler.current_frames, [1, 101])
+
+
+def test_sonic_freeze_clamps_g1_and_smpl_future_references() -> None:
+    sampler = _SonicReleaseMotionSampler(
+        _ClipLocalSamplerLoader(),
+        num_envs=2,
+        bin_size=50,
+        init_num_failures=1.0,
+        uniform_sampling_rate=0.1,
+        failure_rate_max_over_mean=200.0,
+        pre_failure_sample_window=0,
+        sequence_length_agnostic=True,
+        probability_refresh_interval_steps=24,
+        freeze_frame_aug=False,
+    )
+    sampler.active_slot_freeze_frames[:] = [3, 249]
+    sampler._clip_freeze_frames[:] = [3, 249]
+    sampler.current_active_slots[:] = [0, 1]
+    env = object.__new__(SonicG1TrackingEnv)
+    env._cfg = SimpleNamespace(
+        num_future_frames=3,
+        smpl_num_future_frames=3,
+        body_names=SONIC_BODY_ORDER,
+    )
+    env._sonic_store = _FreezeFutureStore()
+    env._sonic_has_smpl = True
+    env._future_offsets = np.asarray([0, 1, 2], dtype=np.int64)
+    env._smpl_future_offsets = np.asarray([0, 1, 2], dtype=np.int64)
+    env._sonic_num_bodies = len(SONIC_BODY_ORDER)
+    env.motion_sampler = sampler
+    future = env._future_reference(
+        np.asarray([2, 100], dtype=np.int32), env_ids=np.asarray([0, 1], dtype=np.int32)
+    )
+    np.testing.assert_array_equal(future["joint_pos"][0, :, 0], [2, 3, 3])
+    np.testing.assert_array_equal(future["smpl_joints"][0, :, 0, 0], [2, 3, 3])
+    np.testing.assert_array_equal(future["joint_pos"][1, :, 0], [100, 101, 102])
+    np.testing.assert_array_equal(future["smpl_joints"][1, :, 0, 0], [100, 101, 102])
 
 
 def test_registry_and_scene_own_sonic_contract() -> None:
@@ -113,6 +427,192 @@ def test_sonic_antishake_includes_fixed_head_body() -> None:
         "right_wrist_yaw_link",
         "head_link",
     )
+
+
+def test_sonic_undesired_contact_bodies_match_release_contract() -> None:
+    assert SonicG1TrackingCfg().undesired_contact_body_names == (
+        "pelvis",
+        "left_hip_roll_link",
+        "left_knee_link",
+        "right_hip_roll_link",
+        "right_knee_link",
+        "torso_link",
+        "left_shoulder_roll_link",
+        "right_shoulder_roll_link",
+    )
+
+
+def test_sonic_release_termination_defaults_are_owner_configured() -> None:
+    cfg = SonicG1TrackingCfg()
+
+    # Direct construction stays opt-in, while the release owner enables the
+    # immutable per-clip augmentation explicitly for training.
+    assert cfg.freeze_frame_aug is False
+    assert cfg.freeze_frame_prob == pytest.approx(0.1)
+    assert cfg.truncate_on_clip_end is True
+    assert cfg.root_height_ema_alpha == pytest.approx(0.1)
+    assert cfg.root_height_threshold == pytest.approx(0.5)
+    assert cfg.down_height_termination_threshold == pytest.approx(0.75)
+    assert cfg.foot_pos_threshold == pytest.approx(0.2)
+    assert cfg.active_motion_pool_size == 1024
+    assert cfg.motion_resample_frequency == 250
+
+    owner_config = (
+        Path(__file__).resolve().parents[4]
+        / "conf"
+        / "sonic"
+        / "task"
+        / "sonic_g1_tracking"
+        / "mujoco.yaml"
+    ).read_text(encoding="utf-8")
+    for entry in (
+        "freeze_frame_aug: true",
+        "freeze_frame_prob: 0.1",
+        "truncate_on_clip_end: true",
+        "root_height_ema_alpha: 0.1",
+        "root_height_threshold: 0.5",
+        "down_height_termination_threshold: 0.75",
+        "foot_pos_threshold: 0.2",
+        "active_motion_pool_size: 1024",
+        "motion_resample_frequency: 250",
+    ):
+        assert entry in owner_config
+
+
+class _RootHeightLoader:
+    def __init__(self, *, fail_after: int | None = None) -> None:
+        self.fail_after = fail_after
+        self.requests: list[np.ndarray] = []
+
+    def get_motion_at_frame(self, frames: np.ndarray) -> SimpleNamespace:
+        frame_values = np.asarray(frames, dtype=np.int32)
+        if self.fail_after is not None and np.any(frame_values > self.fail_after):
+            raise AssertionError(f"attempted to read invalid reference frame {frame_values}")
+        self.requests.append(frame_values.copy())
+        body_pos_w = np.zeros((len(frame_values), 1, 3), dtype=np.float32)
+        body_pos_w[:, 0, 2] = frame_values
+        return SimpleNamespace(body_pos_w=body_pos_w)
+
+
+def test_sonic_running_reference_height_initializes_and_uses_release_ema() -> None:
+    env = object.__new__(SonicG1TrackingEnv)
+    env.anchor_body_idx = 0
+    env.motion_loader = _RootHeightLoader()
+    env.motion_sampler = SimpleNamespace(current_frames=np.asarray([1, 4], dtype=np.int32))
+    env._running_ref_root_height = np.zeros((2,), dtype=np.float32)
+    env._cfg = SimpleNamespace(root_height_ema_alpha=0.1)
+
+    env._initialize_running_ref_root_height(np.asarray([0, 1], dtype=np.int32))
+    np.testing.assert_array_equal(env._running_ref_root_height, [1.0, 4.0])
+
+    env.motion_sampler.current_frames[:] = [5, 2]
+    env._update_running_ref_root_height(np.asarray([0, 1], dtype=np.int32))
+    np.testing.assert_allclose(env._running_ref_root_height, [1.4, 3.8])
+
+
+def test_sonic_adaptive_height_termination_uses_ema_not_current_reference_height() -> None:
+    env = object.__new__(SonicG1TrackingEnv)
+    env._cfg = SonicG1TrackingCfg()
+    env.anchor_body_idx = 0
+    env._running_ref_root_height = np.asarray([0.4, 0.8], dtype=np.float32)
+    env._terminated = np.zeros((2,), dtype=bool)
+    env._env_error = np.empty((2,), dtype=np.float32)
+    env._env_bool = np.empty((2,), dtype=bool)
+    env._has_ee_body_indices = False
+    env._sonic_foot_body_indices = np.empty((0,), dtype=np.int32)
+    env.body_pos_relative_w = np.empty((2, 0, 3), dtype=np.float32)
+    env._body_vec_error = np.empty((2, 0, 3), dtype=np.float32)
+    env._ee_pos_error_z = np.empty((2, 0), dtype=np.float32)
+    env._ee_terminated = np.empty((2, 0), dtype=bool)
+    env._has_undesired_contact_body_indices = False
+
+    motion_pos = np.zeros((2, 1, 3), dtype=np.float32)
+    motion_pos[:, 0, 2] = [0.8, 0.4]
+    robot_pos = motion_pos.copy()
+    robot_pos[:, 0, 2] -= 0.2
+    identity_quat = np.tile(np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32), (2, 1, 1))
+    motion_data = SimpleNamespace(body_pos_w=motion_pos, body_quat_w=identity_quat)
+
+    terminated = env._compute_terminations(motion_data, robot_pos, identity_quat)
+
+    # Row 0 has a high current root but a low H, so the 0.75 relaxed
+    # threshold applies. Row 1 has the inverse and must use the 0.15 threshold.
+    np.testing.assert_array_equal(terminated, [False, True])
+
+
+def test_sonic_clip_end_skips_invalid_ema_frame_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = object.__new__(SonicG1TrackingEnv)
+    env._cfg = SimpleNamespace(root_height_ema_alpha=0.1, truncate_on_clip_end=True)
+    env.motion_loader = _RootHeightLoader(fail_after=5)
+    env.motion_sampler = SimpleNamespace(
+        current_frames=np.asarray([4, 5], dtype=np.int32),
+        timeline_frames=np.asarray([4, 5], dtype=np.int32),
+        current_clip_end_frames=np.asarray([5, 5], dtype=np.int32),
+    )
+    env._running_ref_root_height = np.asarray([1.0, 1.0], dtype=np.float32)
+    env._clip_end_truncated = np.zeros((2,), dtype=bool)
+    env.anchor_body_idx = 0
+    state = NpEnvState(
+        obs={},
+        reward=np.zeros((2,), dtype=np.float32),
+        terminated=np.zeros((2,), dtype=bool),
+        truncated=np.zeros((2,), dtype=bool),
+        info={},
+    )
+
+    def _common_update(instance: SonicG1TrackingEnv, current_state: NpEnvState) -> NpEnvState:
+        instance.motion_sampler.current_frames += 1
+        instance._clip_end_truncated[:] = [False, True]
+        return current_state
+
+    monkeypatch.setattr(MotionTrackingEnv, "update_state", _common_update)
+
+    env.update_state(state)
+
+    # Frame 4 advances to valid frame 5 and updates H. Frame 5 advances to
+    # invalid frame 6, so it is truncated without being read by the EMA path.
+    np.testing.assert_allclose(env._running_ref_root_height, [1.4, 1.0])
+    assert len(env.motion_loader.requests) == 1
+    np.testing.assert_array_equal(env.motion_loader.requests[0], [5])
+
+
+def test_sonic_clip_autoreset_reinitializes_running_reference_height(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    env = object.__new__(SonicG1TrackingEnv)
+    env._num_envs = 2
+    env.anchor_body_idx = 0
+    env._sonic_reset_ids = None
+    env._sample_encoder_indices = lambda env_ids: None
+    env._running_ref_root_height = np.asarray([1.0, 9.0], dtype=np.float32)
+    env.motion_loader = _RootHeightLoader()
+    env.motion_sampler = SimpleNamespace(current_frames=np.asarray([0, 5], dtype=np.int32))
+    env._dr_manager = None
+    env._final_observation_scratch = None
+    env._state = NpEnvState(
+        obs={"actor_obs": np.asarray([[1.0], [2.0]], dtype=np.float32)},
+        reward=np.zeros((2,), dtype=np.float32),
+        terminated=np.zeros((2,), dtype=bool),
+        truncated=np.asarray([False, True]),
+        info={"steps": np.asarray([3, 4], dtype=np.uint32)},
+    )
+
+    def _common_reset(
+        instance: SonicG1TrackingEnv, env_ids: np.ndarray
+    ) -> tuple[dict[str, np.ndarray], dict]:
+        instance.motion_sampler.current_frames[env_ids] = 3
+        return {"actor_obs": np.full((len(env_ids), 1), 7.0, dtype=np.float32)}, {}
+
+    monkeypatch.setattr(MotionTrackingEnv, "reset", _common_reset)
+
+    NpEnv._reset_done_envs(env)
+
+    np.testing.assert_array_equal(env._state.obs["actor_obs"], [[1.0], [7.0]])
+    np.testing.assert_allclose(env._running_ref_root_height, [1.0, 3.0])
+    assert env._state.final_observation is not None
+    np.testing.assert_array_equal(env._state.final_observation["actor_obs"][1], [2.0])
 
 
 def test_sonic_policy_joint_abi_matches_fixed_upstream_mapping() -> None:
@@ -175,13 +675,13 @@ def test_sonic_observation_layouts_are_immutable_and_contiguous() -> None:
             ("command_multi_future_nonflat", (10, 58), 3, 583),
             ("command_z_multi_future_nonflat", (10, 1), 583, 593),
             ("command_z", (1,), 593, 594),
-            ("motion_anchor_ori_heading_mf_nonflat", (10, 6), 594, 654),
-            ("motion_anchor_ori_heading", (6,), 654, 660),
+            ("motion_anchor_ori_b", (6,), 594, 600),
+            ("motion_anchor_ori_b_mf_nonflat", (10, 6), 600, 660),
             ("command_multi_future_lower_body", (240,), 660, 900),
             ("vr_3point_local_target", (9,), 900, 909),
             ("vr_3point_local_orn_target", (12,), 909, 921),
             ("smpl_joints_multi_future_local_nonflat", (10, 72), 921, 1641),
-            ("smpl_root_ori_heading_multi_future", (10, 6), 1641, 1701),
+            ("smpl_root_ori_b_multi_future", (10, 6), 1641, 1701),
             ("joint_pos_multi_future_wrist_for_smpl", (10, 6), 1701, 1761),
         ),
     }
@@ -288,8 +788,8 @@ def test_sonic_vr_offsets_and_training_deploy_width_provenance() -> None:
         SONIC_VR_BODY_OFFSETS,
         ((0.18, -0.025, 0.0), (0.18, 0.025, 0.0), (0.0, 0.0, 0.35)),
     )
-    # unitoken_all_noz_heading.yaml is the 1761-wide v1.1 training group.  The release
-    # encoder export observation_config_sonic_v1_1.yaml selects 1750 active
+    # unitoken_all_noz.yaml is the 1761-wide release training group. The deploy
+    # encoder export observation config selects 1750 active
     # tokenizer dimensions plus one scalar mode, omitting the two command-z
     # terms (11 dimensions total).
     assert SONIC_TOKENIZER_OBS_DIM == 1761
@@ -375,9 +875,10 @@ def test_sonic_compute_obs_matches_independent_upstream_reset_and_step_fixture()
     instance.motion_sampler = SimpleNamespace(
         current_frames=np.asarray([0], dtype=np.int64),
         current_clip_end_frames=np.asarray([1], dtype=np.int64),
+        clamp_reference_indices=lambda indices, env_ids=None: indices,
     )
     futures = [_synthetic_upstream_future(phase) for phase in range(2)]
-    instance._future_reference = lambda frame: futures[int(frame[0])]
+    instance._future_reference = lambda frame, **kwargs: futures[int(frame[0])]
     # Deterministic stand-in for upstream AdditiveUniformNoiseCfg. This proves
     # which terms are corrupted without coupling the golden values to RNG code.
     instance._obs_noise = lambda data, scale: np.asarray(data) + scale
@@ -475,8 +976,8 @@ def test_sonic_compute_obs_matches_independent_upstream_reset_and_step_fixture()
                 (3, 583, command.reshape(1, 10, 58)),
                 (583, 593, command_z),
                 (593, 594, command_z[:, 0]),
-                (594, 654, future_ori + 0.05),
-                (654, 660, anchor_ori_b + 0.05),
+                (594, 600, anchor_ori_b + 0.05),
+                (600, 660, future_ori + 0.05),
                 (660, 900, lower),
                 (900, 909, vr_pos),
                 (909, 921, vr_quat),

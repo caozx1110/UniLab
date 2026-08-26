@@ -207,7 +207,32 @@ def test_materializer_accepts_scalar_fps_metadata(tmp_path: Path):
     assert store.num_frames == 2
 
 
-def test_store_can_load_disjoint_rank_local_clip_shards(tmp_path: Path):
+def test_preflight_rejects_archive_fps_that_disagrees_with_manifest(tmp_path: Path) -> None:
+    source = tmp_path / "wrong_fps.npz"
+    np.savez(
+        source,
+        fps=np.asarray(50, dtype=np.int32),
+        joint_pos=np.zeros((2, 1), dtype=np.float32),
+    )
+    report = materialize_motion_store(
+        [source],
+        tmp_path / "wrong_fps_store",
+        fps=50,
+        joint_order=["j0"],
+        body_order=["pelvis"],
+    )
+    with np.load(report.manifest_path.parent / "clips" / "000000_wrong_fps.npz") as archive:
+        arrays = {name: archive[name] for name in archive.files}
+    arrays["fps"] = np.asarray(30, dtype=np.int32)
+    np.savez(report.manifest_path.parent / "clips" / "000000_wrong_fps.npz", **arrays)
+
+    with pytest.raises(MotionManifestError, match="archive fps=30.*manifest fps=50"):
+        preflight_motion_manifest(report.manifest_path, verify_checksums=False)
+
+
+def test_store_can_load_disjoint_rank_local_clip_shards(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     sources = []
     for index, frames in enumerate((2, 3, 4, 5)):
         source = tmp_path / f"clip_{index}.npz"
@@ -230,6 +255,20 @@ def test_store_can_load_disjoint_rank_local_clip_shards(tmp_path: Path):
         body_order=["pelvis"],
     )
 
+    import unilab.training.sonic_store as sonic_store_module
+
+    original_preflight = sonic_store_module.preflight_motion_manifest
+    preflight_clip_counts: list[int] = []
+
+    def record_rank_preflight(manifest, **kwargs):
+        preflight_clip_counts.append(len(manifest.clips))
+        return original_preflight(manifest, **kwargs)
+
+    monkeypatch.setattr(
+        sonic_store_module,
+        "preflight_motion_manifest",
+        record_rank_preflight,
+    )
     rank_zero = load_sonic_motion_store(
         report.manifest_path, rank=0, world_size=2, shard_clips=True
     )
@@ -241,6 +280,7 @@ def test_store_can_load_disjoint_rank_local_clip_shards(tmp_path: Path):
     assert rank_one.num_frames == 8
     assert set(np.unique(rank_zero.arrays["joint_pos"])) == {0.0, 2.0}
     assert set(np.unique(rank_one.arrays["joint_pos"])) == {1.0, 3.0}
+    assert preflight_clip_counts == [2, 2]
 
 
 def test_store_rejects_more_sharded_ranks_than_clips(tmp_path: Path):

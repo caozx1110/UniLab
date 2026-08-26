@@ -75,9 +75,9 @@ SONIC_ROLLOUT_HORIZON = SONIC_RELEASE_SPEC.horizon
 # ``training.sim_backend`` override must not silently select another env.
 SONIC_OWNER_TASK = "SonicG1Tracking"
 SONIC_OWNER_BACKEND = "mujoco"
-SONIC_OWNER_RECIPE = "sonic_v1_1"
-SONIC_OWNER_REVISION = "a0732b642c0333077e127a2f56ab0014c196bca4"
-SONIC_OWNER_OBSERVATION_PROFILE = "unitoken_all_noz_heading"
+SONIC_OWNER_RECIPE = "sonic_release"
+SONIC_OWNER_REVISION = "c374bae5b9039cd0ee71377e654d11ce1bc69e1d"
+SONIC_OWNER_OBSERVATION_PROFILE = "unitoken_all_noz"
 
 
 @dataclass(frozen=True)

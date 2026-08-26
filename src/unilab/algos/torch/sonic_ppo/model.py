@@ -13,13 +13,13 @@ from torch.nn import functional as F
 
 
 class RunningMeanStd(nn.Module):
-    """SONIC v1.1 critic observation normalizer.
+    """SONIC release critic observation normalizer.
 
     The released trainer normalizes with the statistics visible at the start
     of a critic forward, then updates those statistics from that PPO batch.
     Rollout collection runs the model in eval mode and therefore leaves the
     normalizer frozen.  Keeping that ordering is important: updating once from
-    the completed rollout is not equivalent to the twenty v1.1 PPO forwards.
+    the completed rollout is not equivalent to the twenty release PPO forwards.
     """
 
     def __init__(self, width: int, epsilon: float = 1e-5) -> None:
@@ -113,7 +113,7 @@ class FSQ(nn.Module):
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         reshaped, original_shape, flattened = self._reshape(values)
-        half_level = (self.levels - 1) * (1.0 - 1.0e-3) / 2.0
+        half_level = (self.levels - 1) * (1.0 + 1.0e-3) / 2.0
         offset = 0.5 if self.levels % 2 == 0 else 0.0
         shift = torch.atanh(
             torch.as_tensor(
@@ -137,20 +137,20 @@ class FSQ(nn.Module):
         return (quantized * (self.levels // 2) + self.levels // 2).round().long()
 
 
-SONIC_V11_MODEL_CONTRACT_VERSION = "sonic_v1_1_named_universal_token.v1"
+SONIC_RELEASE_MODEL_CONTRACT_VERSION = "sonic_release_named_universal_token.v1"
 _DENSE_TEST_MODEL_CONTRACT_VERSION = "unilab_sonic_dense_test.v1"
 
 
-_SONIC_V11_TOKENIZER_FIELDS: dict[str, dict[str, object]] = {
+_SONIC_RELEASE_TOKENIZER_FIELDS: dict[str, dict[str, object]] = {
     "encoder_index": {"slice": (0, 3), "shape": (3,)},
     "command_multi_future_nonflat": {"slice": (3, 583), "shape": (10, 58)},
     "command_z_multi_future_nonflat": {"slice": (583, 593), "shape": (10, 1)},
     "command_z": {"slice": (593, 594), "shape": (1,)},
-    "motion_anchor_ori_heading_mf_nonflat": {
-        "slice": (594, 654),
+    "motion_anchor_ori_b": {"slice": (594, 600), "shape": (6,)},
+    "motion_anchor_ori_b_mf_nonflat": {
+        "slice": (600, 660),
         "shape": (10, 6),
     },
-    "motion_anchor_ori_heading": {"slice": (654, 660), "shape": (6,)},
     "command_multi_future_lower_body": {"slice": (660, 900), "shape": (240,)},
     "vr_3point_local_target": {"slice": (900, 909), "shape": (9,)},
     "vr_3point_local_orn_target": {"slice": (909, 921), "shape": (12,)},
@@ -158,7 +158,7 @@ _SONIC_V11_TOKENIZER_FIELDS: dict[str, dict[str, object]] = {
         "slice": (921, 1641),
         "shape": (10, 72),
     },
-    "smpl_root_ori_heading_multi_future": {
+    "smpl_root_ori_b_multi_future": {
         "slice": (1641, 1701),
         "shape": (10, 6),
     },
@@ -168,11 +168,11 @@ _SONIC_V11_TOKENIZER_FIELDS: dict[str, dict[str, object]] = {
     },
 }
 
-_SONIC_V11_ENCODERS: dict[str, dict[str, object]] = {
+_SONIC_RELEASE_ENCODERS: dict[str, dict[str, object]] = {
     "g1": {
         "inputs": (
             "command_multi_future_nonflat",
-            "motion_anchor_ori_heading_mf_nonflat",
+            "motion_anchor_ori_b_mf_nonflat",
         ),
         "temporal": True,
         "hidden_dims": (2048, 1024, 512, 512),
@@ -182,7 +182,7 @@ _SONIC_V11_ENCODERS: dict[str, dict[str, object]] = {
             "command_multi_future_lower_body",
             "vr_3point_local_target",
             "vr_3point_local_orn_target",
-            "motion_anchor_ori_heading",
+            "motion_anchor_ori_b",
         ),
         "temporal": False,
         "hidden_dims": (2048, 1024, 512, 512),
@@ -190,7 +190,7 @@ _SONIC_V11_ENCODERS: dict[str, dict[str, object]] = {
     "smpl": {
         "inputs": (
             "smpl_joints_multi_future_local_nonflat",
-            "smpl_root_ori_heading_multi_future",
+            "smpl_root_ori_b_multi_future",
             "joint_pos_multi_future_wrist_for_smpl",
         ),
         "temporal": True,
@@ -198,17 +198,17 @@ _SONIC_V11_ENCODERS: dict[str, dict[str, object]] = {
     },
 }
 
-_SONIC_V11_DECODERS: dict[str, dict[str, object]] = {
+_SONIC_RELEASE_DECODERS: dict[str, dict[str, object]] = {
     "g1_dyn": {
         "inputs": ("token_flattened", "actor_obs"),
         "outputs": {"action": (29,)},
-        "hidden_dims": (4096, 4096, 2048, 2048, 1024, 1024, 512, 512),
+        "hidden_dims": (2048, 2048, 1024, 1024, 512, 512),
     },
     "g1_kin": {
         "inputs": ("token_flattened",),
         "outputs": {
             "command_multi_future_nonflat": (10, 58),
-            "motion_anchor_ori_heading_mf_nonflat": (10, 6),
+            "motion_anchor_ori_b_mf_nonflat": (10, 6),
         },
         "hidden_dims": (2048, 1024, 512, 512),
     },
@@ -294,7 +294,7 @@ class _DenseUniversalToken(nn.Module):
 
 
 class UniversalToken(nn.Module):
-    """SONIC v1.1 named encoders, shared FSQ and named decoders.
+    """SONIC release named encoders, shared FSQ and named decoders.
 
     The flat 1761-wide environment/storage ABI stays unchanged.  Parsing and
     architecture are supplied by the composed owner config; this module owns
@@ -322,7 +322,7 @@ class UniversalToken(nn.Module):
             32,
         ):
             raise ValueError(
-                "sonic_v1_1 requires tokenizer/actor/action/token/level dimensions 1761/930/29/2/32"
+                "sonic_release requires tokenizer/actor/action/token/level dimensions 1761/930/29/2/32"
             )
         self.input_dim = int(input_dim)
         self.actor_obs_dim = int(actor_obs_dim)
@@ -369,7 +369,7 @@ class UniversalToken(nn.Module):
 
         self.encoder_names = tuple(str(name) for name in encoders)
         if self.encoder_names != ("g1", "teleop", "smpl"):
-            raise ValueError("sonic_v1_1 encoders must be ordered [g1, teleop, smpl]")
+            raise ValueError("sonic_release encoders must be ordered [g1, teleop, smpl]")
         if self.field_shapes.get("encoder_index") != (len(self.encoder_names),):
             raise ValueError("encoder_index must have one column per named encoder")
         self.encoder_inputs: dict[str, tuple[str, ...]] = {}
@@ -401,7 +401,7 @@ class UniversalToken(nn.Module):
         self.decoder_outputs: dict[str, dict[str, tuple[int, ...]]] = {}
         self.decoders = nn.ModuleDict()
         if tuple(str(name) for name in decoders) != ("g1_dyn", "g1_kin"):
-            raise ValueError("sonic_v1_1 decoders must be ordered [g1_dyn, g1_kin]")
+            raise ValueError("sonic_release decoders must be ordered [g1_dyn, g1_kin]")
         available_inputs = {
             "token_flattened": self.token_total_dim,
             "actor_obs": self.actor_obs_dim,
@@ -434,12 +434,12 @@ class UniversalToken(nn.Module):
             raise ValueError("g1_dyn must return the 29D action field")
         expected_kin = {
             "command_multi_future_nonflat": (10, 58),
-            "motion_anchor_ori_heading_mf_nonflat": (10, 6),
+            "motion_anchor_ori_b_mf_nonflat": (10, 6),
         }
         if self.decoder_inputs["g1_kin"] != ("token_flattened",):
             raise ValueError("g1_kin input must be [token_flattened]")
         if self.decoder_outputs["g1_kin"] != expected_kin:
-            raise ValueError("g1_kin outputs do not match the v1.1 heading fields")
+            raise ValueError("g1_kin outputs do not match the release orientation fields")
 
     def parse(self, observations: torch.Tensor) -> dict[str, torch.Tensor]:
         if observations.ndim < 2 or observations.shape[-1] != self.input_dim:
@@ -475,7 +475,7 @@ class UniversalToken(nn.Module):
         if (~torch.stack(tuple(masks.values()), dim=-1).any(dim=-1)).any():
             raise ValueError("every SONIC sample must activate at least one named encoder")
         # Pair masks use each source encoder's compact row space, matching the
-        # pinned v1.1 implementation rather than the full flattened batch.
+        # pinned release implementation rather than the full flattened batch.
         masks.update(
             {
                 "g1_has_smpl": masks["smpl"][masks["g1"]],
@@ -541,13 +541,33 @@ class UniversalToken(nn.Module):
             )
             raw_output = decoder(decoder_input)
             outputs: dict[str, torch.Tensor] = {}
-            cursor = 0
-            for output_name, shape in self.decoder_outputs[decoder_name].items():
-                width = prod(shape)
-                outputs[output_name] = raw_output[..., cursor : cursor + width].reshape(
-                    *raw_output.shape[:-1], *shape
+            if decoder_name == "g1_kin":
+                # The released BaseModule materializes its kinematic head as
+                # ``(..., 10, 64)`` before UniversalToken splits its final
+                # feature axis into the 58D command and 6D orientation terms.
+                # Splitting the flat 640D MLP output first would instead pack
+                # all command frames before all orientation frames.
+                temporal_shapes = tuple(self.decoder_outputs[decoder_name].values())
+                frame_count = temporal_shapes[0][0]
+                frame_width = sum(prod(shape[1:]) for shape in temporal_shapes)
+                temporal_output = raw_output.reshape(
+                    *raw_output.shape[:-1], frame_count, frame_width
                 )
-                cursor += width
+                cursor = 0
+                for output_name, shape in self.decoder_outputs[decoder_name].items():
+                    width = prod(shape[1:])
+                    outputs[output_name] = temporal_output[..., cursor : cursor + width].reshape(
+                        *raw_output.shape[:-1], *shape
+                    )
+                    cursor += width
+            else:
+                cursor = 0
+                for output_name, shape in self.decoder_outputs[decoder_name].items():
+                    width = prod(shape)
+                    outputs[output_name] = raw_output[..., cursor : cursor + width].reshape(
+                        *raw_output.shape[:-1], *shape
+                    )
+                    cursor += width
             decoded_outputs[decoder_name] = outputs
         return {
             **details,
@@ -574,7 +594,7 @@ class UniversalToken(nn.Module):
         return F.mse_loss(left, right)
 
     def auxiliary_losses(self, outputs: Mapping[str, object]) -> dict[str, torch.Tensor]:
-        """Compute the five MSE terms executed by the pinned v1.1 recipe."""
+        """Compute the five MSE terms executed by the pinned release recipe."""
 
         parsed = cast(Mapping[str, torch.Tensor], outputs["tokenizer_obs"])
         masks = cast(Mapping[str, torch.Tensor], outputs["encoder_masks"])
@@ -584,14 +604,14 @@ class UniversalToken(nn.Module):
         reconstruction_target = torch.cat(
             (
                 parsed["command_multi_future_nonflat"],
-                parsed["motion_anchor_ori_heading_mf_nonflat"],
+                parsed["motion_anchor_ori_b_mf_nonflat"],
             ),
             dim=-1,
         )
         reconstruction = torch.cat(
             (
                 decoded["g1_kin"]["command_multi_future_nonflat"],
-                decoded["g1_kin"]["motion_anchor_ori_heading_mf_nonflat"],
+                decoded["g1_kin"]["motion_anchor_ori_b_mf_nonflat"],
             ),
             dim=-1,
         )
@@ -707,18 +727,18 @@ class SonicActorCritic(nn.Module):
             has_named_config = any(
                 value is not None for value in (tokenizer_fields, encoders, decoders)
             )
-            requested_profile = "sonic_v1_1" if has_named_config else "dense_test"
-        if requested_profile not in {"sonic_v1_1", "dense_test"}:
+            requested_profile = "sonic_release" if has_named_config else "dense_test"
+        if requested_profile not in {"sonic_release", "dense_test"}:
             raise ValueError(f"unknown SONIC model profile: {requested_profile!r}")
         self.model_profile = requested_profile
 
         shared_widths = (
             tuple(int(width) for width in hidden_dims) if hidden_dims is not None else None
         )
-        if self.model_profile == "sonic_v1_1":
-            raw_fields = tokenizer_fields or _SONIC_V11_TOKENIZER_FIELDS
-            raw_encoders = encoders or _SONIC_V11_ENCODERS
-            raw_decoders = decoders or _SONIC_V11_DECODERS
+        if self.model_profile == "sonic_release":
+            raw_fields = tokenizer_fields or _SONIC_RELEASE_TOKENIZER_FIELDS
+            raw_encoders = encoders or _SONIC_RELEASE_ENCODERS
+            raw_decoders = decoders or _SONIC_RELEASE_DECODERS
             encoder_widths = encoder_hidden_dims or shared_widths
             dynamic_widths = actor_hidden_dims or shared_widths
             kinematic_widths = kinematic_hidden_dims or shared_widths
@@ -745,10 +765,8 @@ class SonicActorCritic(nn.Module):
                 num_tokens=token_count,
                 levels=token_levels,
             )
-            self.model_contract_version = SONIC_V11_MODEL_CONTRACT_VERSION
+            self.model_contract_version = SONIC_RELEASE_MODEL_CONTRACT_VERSION
             critic_fallback = (
-                4096,
-                4096,
                 2048,
                 2048,
                 1024,
@@ -786,7 +804,7 @@ class SonicActorCritic(nn.Module):
 
     @property
     def actor(self) -> nn.Sequential:
-        if self.model_profile == "sonic_v1_1":
+        if self.model_profile == "sonic_release":
             tokenizer = cast(UniversalToken, self.tokenizer)
             return cast(nn.Sequential, tokenizer.decoders["g1_dyn"])
         return self._dense_actor
@@ -812,7 +830,7 @@ class SonicActorCritic(nn.Module):
                 device=actor_obs.device,
                 dtype=actor_obs.dtype,
             )
-            if self.model_profile == "sonic_v1_1":
+            if self.model_profile == "sonic_release":
                 token_obs[..., 0] = 1.0
         tokens = self.tokenizer(token_obs)
         flat_tokens = tokens.reshape(*tokens.shape[:-2], -1)
@@ -829,10 +847,10 @@ class SonicActorCritic(nn.Module):
         actor_obs: torch.Tensor,
         token_obs: torch.Tensor,
     ) -> dict[str, object]:
-        """Return v1.1 action, named g1_kin reconstruction and route details."""
+        """Return release action, named g1_kin reconstruction and route details."""
 
-        if self.model_profile != "sonic_v1_1":
-            raise RuntimeError("named_outputs requires model_profile='sonic_v1_1'")
+        if self.model_profile != "sonic_release":
+            raise RuntimeError("named_outputs requires model_profile='sonic_release'")
         return cast(UniversalToken, self.tokenizer).decode(token_obs, actor_obs)
 
     def distribution(
@@ -854,9 +872,9 @@ class SonicActorCritic(nn.Module):
         critic_obs: torch.Tensor,
         token_obs: torch.Tensor,
     ) -> tuple[torch.distributions.Normal, torch.Tensor, dict[str, torch.Tensor]]:
-        """Run one shared policy forward for PPO and v1.1 auxiliary losses."""
+        """Run one shared policy forward for PPO and release auxiliary losses."""
 
-        if self.model_profile != "sonic_v1_1":
+        if self.model_profile != "sonic_release":
             distribution, value = self.distribution(actor_obs, critic_obs, token_obs)
             return distribution, value, self.auxiliary_losses(token_obs)
         if critic_obs.shape[-1] != self.critic_obs_dim:
@@ -898,7 +916,7 @@ class SonicActorCritic(nn.Module):
         )
 
     def auxiliary_losses(self, token_obs: torch.Tensor) -> dict[str, torch.Tensor]:
-        if self.model_profile == "sonic_v1_1":
+        if self.model_profile == "sonic_release":
             # The pinned five-loss recipe is owned by its subsequent child;
             # Issue #4 only replaces the named architecture and routing.
             return {}
@@ -911,7 +929,7 @@ class SonicActorCritic(nn.Module):
 
     @torch.no_grad()
     def begin_normalizer_update(self) -> None:
-        """Compatibility no-op; v1.1 updates RMS inside critic forwards."""
+        """Compatibility no-op; the release updates RMS inside critic forwards."""
 
     @torch.no_grad()
     def synchronize_normalizers(self) -> None:
@@ -935,7 +953,7 @@ class SonicActorCritic(nn.Module):
 __all__ = [
     "FSQ",
     "RunningMeanStd",
-    "SONIC_V11_MODEL_CONTRACT_VERSION",
+    "SONIC_RELEASE_MODEL_CONTRACT_VERSION",
     "SonicActorCritic",
     "UniversalToken",
 ]

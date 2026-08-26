@@ -1,9 +1,11 @@
-"""Cold-path conversion for the released SONIC v1.1 checkpoint."""
+"""Cold-path conversion for the original SONIC release checkpoint."""
 
 from __future__ import annotations
 
 import hashlib
 import os
+import pickle
+import types
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,43 @@ import torch
 from .algorithm import SonicPPO
 from .model import SonicActorCritic
 
-OFFICIAL_SONIC_V11_FORMAT = "nvlabs.sonic_v1_1.trl"
+OFFICIAL_SONIC_RELEASE_FORMAT = "nvlabs.sonic_release.trl"
+
+_OFFICIAL_SONIC_RELEASE_SHIM_GLOBALS = frozenset(
+    {
+        ("trl.trainer.utils", "OnlineTrainerState"),
+        ("trl.trainer.ppo_config", "PPOConfig"),
+        ("transformers.trainer_utils", "IntervalStrategy"),
+        ("transformers.trainer_utils", "SchedulerType"),
+        ("transformers.trainer_utils", "SaveStrategy"),
+        ("transformers.trainer_utils", "HubStrategy"),
+        ("transformers.trainer_pt_utils", "AcceleratorConfig"),
+        ("transformers.training_args", "OptimizerNames"),
+        ("accelerate.state", "PartialState"),
+        ("accelerate.utils.dataclasses", "DistributedType"),
+    }
+)
+
+
+class _OfficialSonicReleasePickleShim:
+    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+        instance = super().__new__(cls)
+        if args:
+            instance.value = args[0]
+        return instance
+
+
+class _OfficialSonicReleaseUnpickler(pickle.Unpickler):
+    def find_class(self, module: str, name: str) -> Any:
+        if (module, name) in _OFFICIAL_SONIC_RELEASE_SHIM_GLOBALS:
+            return _OfficialSonicReleasePickleShim
+        return super().find_class(module, name)
+
+
+def _official_sonic_release_pickle_module() -> types.ModuleType:
+    module = types.ModuleType("pickle")
+    module.Unpickler = _OfficialSonicReleaseUnpickler
+    return module
 
 
 def _checkpoint_sha256(path: Path) -> str:
@@ -32,7 +70,7 @@ def _mapped_policy_key(key: str) -> str:
         return ".".join(("tokenizer", "encoders", parts[2], *parts[4:]))
     if len(parts) >= 5 and parts[:2] == ["actor_module", "decoders"] and parts[3] == "module":
         return ".".join(("tokenizer", "decoders", parts[2], *parts[4:]))
-    raise ValueError(f"unsupported official SONIC v1.1 policy key: {key!r}")
+    raise ValueError(f"unsupported official SONIC release policy key: {key!r}")
 
 
 def _mapped_value_key(key: str) -> str:
@@ -46,15 +84,17 @@ def _mapped_value_key(key: str) -> str:
     }
     if key in normalizer_keys:
         return normalizer_keys[key]
-    raise ValueError(f"unsupported official SONIC v1.1 value key: {key!r}")
+    raise ValueError(f"unsupported official SONIC release value key: {key!r}")
 
 
-def map_official_sonic_v11_model_state(checkpoint: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+def map_official_sonic_release_model_state(
+    checkpoint: Mapping[str, Any],
+) -> dict[str, torch.Tensor]:
     policy_state = checkpoint.get("policy_state_dict")
     value_state = checkpoint.get("value_state_dict")
     if not isinstance(policy_state, Mapping) or not isinstance(value_state, Mapping):
         raise ValueError(
-            "official SONIC v1.1 checkpoint requires policy_state_dict and value_state_dict"
+            "official SONIC release checkpoint requires policy_state_dict and value_state_dict"
         )
     mapped: dict[str, torch.Tensor] = {}
     for source_state, key_mapper in (
@@ -64,9 +104,9 @@ def map_official_sonic_v11_model_state(checkpoint: Mapping[str, Any]) -> dict[st
         for raw_key, raw_value in source_state.items():
             key = key_mapper(str(raw_key))
             if key in mapped:
-                raise ValueError(f"official SONIC v1.1 keys collide at {key!r}")
+                raise ValueError(f"official SONIC release keys collide at {key!r}")
             if not isinstance(raw_value, torch.Tensor):
-                raise ValueError(f"official SONIC v1.1 state {raw_key!r} is not a tensor")
+                raise ValueError(f"official SONIC release state {raw_key!r} is not a tensor")
             mapped[key] = raw_value
     return mapped
 
@@ -80,7 +120,9 @@ def _trainer_iteration(checkpoint: Mapping[str, Any]) -> int:
     )
     iteration = int(value)
     if iteration < 0:
-        raise ValueError(f"official SONIC v1.1 global_step must be non-negative, got {iteration}")
+        raise ValueError(
+            f"official SONIC release global_step must be non-negative, got {iteration}"
+        )
     return iteration
 
 
@@ -100,10 +142,10 @@ def _validate_optimizer_state(
     groups = optimizer_state.get("param_groups")
     states = optimizer_state.get("state")
     if not isinstance(groups, list) or not isinstance(states, Mapping):
-        raise ValueError("official SONIC v1.1 optimizer_state_dict is malformed")
+        raise ValueError("official SONIC release optimizer_state_dict is malformed")
     if len(groups) != len(optimizer.param_groups):
         raise ValueError(
-            "official SONIC v1.1 optimizer group count does not match the UniLab owner"
+            "official SONIC release optimizer group count does not match the UniLab owner"
         )
     for group_index, (source_group, target_group) in enumerate(
         zip(groups, optimizer.param_groups, strict=True)
@@ -111,18 +153,22 @@ def _validate_optimizer_state(
         if not isinstance(source_group, Mapping) or not isinstance(
             source_group.get("params"), list
         ):
-            raise ValueError(f"official SONIC v1.1 optimizer group {group_index} is malformed")
+            raise ValueError(
+                f"official SONIC release optimizer group {group_index} is malformed"
+            )
         source_parameters = source_group["params"]
         target_parameters = target_group["params"]
         if len(source_parameters) != len(target_parameters):
             raise ValueError(
-                f"official SONIC v1.1 optimizer group {group_index} has "
+                f"official SONIC release optimizer group {group_index} has "
                 f"{len(source_parameters)} parameters; expected {len(target_parameters)}"
             )
         for source_id, target_parameter in zip(source_parameters, target_parameters, strict=True):
             parameter_state = states.get(source_id)
             if not isinstance(parameter_state, Mapping):
-                raise ValueError(f"official SONIC v1.1 optimizer has no state for {source_id}")
+                raise ValueError(
+                    f"official SONIC release optimizer has no state for {source_id}"
+                )
             for moment_name in ("exp_avg", "exp_avg_sq"):
                 moment = parameter_state.get(moment_name)
                 if not isinstance(moment, torch.Tensor) or moment.shape != target_parameter.shape:
@@ -130,12 +176,12 @@ def _validate_optimizer_state(
                         None if not isinstance(moment, torch.Tensor) else tuple(moment.shape)
                     )
                     raise ValueError(
-                        f"official SONIC v1.1 optimizer {moment_name} shape {actual_shape} "
+                        f"official SONIC release optimizer {moment_name} shape {actual_shape} "
                         f"does not match parameter shape {tuple(target_parameter.shape)}"
                     )
 
 
-def convert_official_sonic_v11_checkpoint(
+def convert_official_sonic_release_checkpoint(
     checkpoint: Mapping[str, Any],
     *,
     source_sha256: str | None = None,
@@ -144,8 +190,8 @@ def convert_official_sonic_v11_checkpoint(
 ) -> dict[str, Any]:
     if horizon < 1:
         raise ValueError(f"horizon must be positive, got {horizon}")
-    model = SonicActorCritic(model_profile="sonic_v1_1", critic_obs_normalization=True)
-    mapped_model_state = map_official_sonic_v11_model_state(checkpoint)
+    model = SonicActorCritic(model_profile="sonic_release", critic_obs_normalization=True)
+    mapped_model_state = map_official_sonic_release_model_state(checkpoint)
     model.load_state_dict(mapped_model_state, strict=True)
     token_info = model.tokenizer.get_token_info()
     iteration = _trainer_iteration(checkpoint)
@@ -169,7 +215,7 @@ def convert_official_sonic_v11_checkpoint(
             "token_info": token_info,
         },
         "conversion": {
-            "source_format": OFFICIAL_SONIC_V11_FORMAT,
+            "source_format": OFFICIAL_SONIC_RELEASE_FORMAT,
             "source_sha256": source_sha256,
             "source_iteration": iteration,
         },
@@ -177,7 +223,7 @@ def convert_official_sonic_v11_checkpoint(
     optimizer_state = checkpoint.get("optimizer_state_dict")
     if include_optimizer:
         if not isinstance(optimizer_state, Mapping):
-            raise ValueError("official SONIC v1.1 checkpoint has no optimizer_state_dict")
+            raise ValueError("official SONIC release checkpoint has no optimizer_state_dict")
         algorithm = SonicPPO(model, {"learning_rate": 2.0e-5})
         _validate_optimizer_state(algorithm.optimizer, optimizer_state)
         algorithm.optimizer.load_state_dict(dict(optimizer_state))
@@ -186,25 +232,32 @@ def convert_official_sonic_v11_checkpoint(
     return converted
 
 
-def convert_official_sonic_v11_checkpoint_file(
+def convert_official_sonic_release_checkpoint_file(
     source: str | Path,
     output: str | Path,
     *,
     horizon: int = 24,
     include_optimizer: bool = True,
     overwrite: bool = False,
+    trust_source: bool = False,
 ) -> dict[str, Any]:
     source_path = Path(source).expanduser().resolve()
     output_path = Path(output).expanduser().resolve()
     if not source_path.is_file():
-        raise ValueError(f"official SONIC v1.1 checkpoint is not a file: {source_path}")
+        raise ValueError(f"official SONIC release checkpoint is not a file: {source_path}")
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"converted checkpoint already exists: {output_path}")
     source_sha256 = _checkpoint_sha256(source_path)
-    checkpoint = torch.load(source_path, map_location="cpu", weights_only=False)
+    pickle_module = _official_sonic_release_pickle_module() if trust_source else None
+    checkpoint = torch.load(
+        source_path,
+        map_location="cpu",
+        weights_only=False,
+        pickle_module=pickle_module,
+    )
     if not isinstance(checkpoint, Mapping):
-        raise ValueError("official SONIC v1.1 checkpoint must contain a mapping")
-    converted = convert_official_sonic_v11_checkpoint(
+        raise ValueError("official SONIC release checkpoint must contain a mapping")
+    converted = convert_official_sonic_release_checkpoint(
         checkpoint,
         source_sha256=source_sha256,
         horizon=horizon,
@@ -229,8 +282,8 @@ def convert_official_sonic_v11_checkpoint_file(
 
 
 __all__ = [
-    "OFFICIAL_SONIC_V11_FORMAT",
-    "convert_official_sonic_v11_checkpoint",
-    "convert_official_sonic_v11_checkpoint_file",
-    "map_official_sonic_v11_model_state",
+    "OFFICIAL_SONIC_RELEASE_FORMAT",
+    "convert_official_sonic_release_checkpoint",
+    "convert_official_sonic_release_checkpoint_file",
+    "map_official_sonic_release_model_state",
 ]

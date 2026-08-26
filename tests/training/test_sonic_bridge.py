@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from hydra import compose, initialize_config_dir
@@ -35,18 +36,32 @@ def test_default_plan_uses_configured_eight_rank_budget(tmp_path: Path):
     assert plan.report.global_samples == 786432
     assert plan.report.local_minibatch_size == 1024
     assert plan.resources is not None
-    assert plan.resources.worker_count == 6
+    assert plan.resources.worker_count == 7
     assert cfg.training.task_name == "SonicG1Tracking"
     assert cfg.training.sim_backend == "mujoco"
-    assert cfg.sonic.target_recipe == "sonic_v1_1"
-    assert cfg.sonic.target_revision == "a0732b642c0333077e127a2f56ab0014c196bca4"
-    assert cfg.sonic.observation_profile == "unitoken_all_noz_heading"
+    assert cfg.sonic.target_recipe == "sonic_release"
+    assert cfg.sonic.target_revision == "c374bae5b9039cd0ee71377e654d11ce1bc69e1d"
+    assert cfg.sonic.observation_profile == "unitoken_all_noz"
     assert cfg.sonic.owner.target_recipe == cfg.sonic.target_recipe
     assert cfg.sonic.owner.target_revision == cfg.sonic.target_revision
     assert cfg.sonic.owner.observation_profile == cfg.sonic.observation_profile
-    assert plan.env_cfg_override["observation_profile"] == "unitoken_all_noz_heading"
-    assert plan.env_cfg_override["cpu_ids"] == [0, 1, 2, 3, 4, 5]
+    assert cfg.algo.save_interval == 1000
+    assert cfg.sonic.sync_adaptive_sampling_all_gpus_freq == 200
+    assert cfg.env.motion_resample_frequency == 250
+    assert plan.env_cfg_override["observation_profile"] == "unitoken_all_noz"
+    assert plan.env_cfg_override["cpu_ids"] == [0, 1, 2, 3, 4, 5, 6]
     assert plan.env_cfg_override["reward_config"]["scales"]["motion_body_pos"] == 1.0
+    assert tuple(cfg.sonic.motion_hot_fields) == (
+        "joint_pos",
+        "joint_vel",
+        "body_pos_w",
+        "body_quat_w",
+        "body_lin_vel_w",
+        "body_ang_vel_w",
+        "smpl_joints",
+        "smpl_root_quat_w",
+    )
+    assert cfg.sonic.motion_cache_size == 2
     # IsaacLab calls this ``decimation``; the UniLab EnvCfg contract uses the
     # equivalent control period and rejects unknown fields at registry time.
     assert "decimation" not in plan.env_cfg_override
@@ -68,7 +83,7 @@ def test_plan_supports_two_gpu_scan_without_using_eight_rank_arithmetic(tmp_path
     assert plan.report.global_num_envs == 512
     assert plan.report.global_samples == 12288
     assert plan.resources is not None
-    assert plan.resources.cpu_ids == (6, 7, 8, 9, 10, 11)
+    assert plan.resources.cpu_ids == (7, 8, 9, 10, 11, 12, 13)
 
 
 def test_single_training_device_keeps_host_cuda_ordinal(tmp_path: Path) -> None:
@@ -149,7 +164,7 @@ def test_preflight_metadata_is_rank_zero_owned(tmp_path: Path):
     path = write_sonic_preflight(plan)
     loaded = json.loads(path.read_text(encoding="utf-8"))
     assert loaded["global_samples"] == 786432
-    assert loaded["resources"]["worker_count"] == 6
+    assert loaded["resources"]["worker_count"] == 7
     assert len(loaded["resources_by_rank"]) == 8
     assert loaded["logical_optimizer_steps_per_iteration"] == 20
 
@@ -172,6 +187,139 @@ def test_train_runtime_requires_versioned_motion_manifest(tmp_path: Path):
     plan = build_sonic_launch_plan(cfg, root_dir=tmp_path, rank=0, world_size=8)
     with pytest.raises(SonicBridgeError, match="requires sonic.motion_manifest"):
         run_sonic_runtime(cfg, plan, runtime=lambda **_: None)
+
+
+def test_train_plan_defers_full_clip_preflight_to_rank_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import unilab.training.sonic_bridge as sonic_bridge_module
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    manifest = SimpleNamespace(manifest_path=manifest_path, clips=())
+    monkeypatch.setattr(sonic_bridge_module, "load_motion_manifest", lambda _: manifest)
+
+    def reject_full_preflight(*args, **kwargs):
+        raise AssertionError("train bridge must not scan all clip payloads")
+
+    monkeypatch.setattr(
+        sonic_bridge_module,
+        "preflight_motion_manifest",
+        reject_full_preflight,
+    )
+    cfg = _cfg(
+        [
+            "training.log_dir=" + str(tmp_path / "logs"),
+            "sonic.mode=train",
+            "sonic.resources.gpu_numa_nodes=[0,0,0,1,1,1,1,1]",
+            "sonic.motion_manifest=" + str(manifest_path),
+            "sonic.require_motion_manifest=true",
+        ]
+    )
+
+    plan = build_sonic_launch_plan(cfg, root_dir=tmp_path, rank=0, world_size=8)
+
+    assert plan.motion_manifest is manifest
+    assert plan.env_cfg_override["motion_verify_checksums"] is True
+    assert plan.env_cfg_override["motion_verify_shapes"] is True
+    assert plan.env_cfg_override["motion_hot_fields"] == (
+        "joint_pos",
+        "joint_vel",
+        "body_pos_w",
+        "body_quat_w",
+        "body_lin_vel_w",
+        "body_ang_vel_w",
+        "smpl_joints",
+        "smpl_root_quat_w",
+    )
+    assert plan.env_cfg_override["motion_cache_size"] == 2
+
+
+def test_global_mmap_sidecar_requires_nonsharded_nonresident_bridge_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import unilab.training.sonic_bridge as sonic_bridge_module
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    manifest = SimpleNamespace(manifest_path=manifest_path, clips=())
+    monkeypatch.setattr(sonic_bridge_module, "load_motion_manifest", lambda _: manifest)
+    sidecar_path = tmp_path / "global_mmap" / "metadata.json"
+    receipt_path = tmp_path / "global_mmap" / "trusted-receipt.json"
+    cfg = _cfg(
+        [
+            "training.log_dir=" + str(tmp_path / "logs"),
+            "sonic.mode=train",
+            "sonic.resources.gpu_numa_nodes=[0,0,0,0,0,0,0,0]",
+            "sonic.motion_manifest=" + str(manifest_path),
+            "sonic.motion_global_mmap_sidecar=" + str(sidecar_path),
+            "sonic.motion_global_mmap_trusted_receipt=" + str(receipt_path),
+            "sonic.motion_shard_clips=false",
+            "sonic.motion_hot_fields=[]",
+        ]
+    )
+
+    plan = build_sonic_launch_plan(cfg, root_dir=tmp_path, rank=0, world_size=1)
+    assert plan.env_cfg_override["motion_global_mmap_sidecar"] == str(sidecar_path)
+    assert plan.env_cfg_override["motion_global_mmap_trusted_receipt"] == str(receipt_path)
+    assert plan.env_cfg_override["motion_shard_clips"] is False
+
+    invalid = _cfg(
+        [
+            "sonic.mode=train",
+            "sonic.resources.gpu_numa_nodes=[0,0,0,0,0,0,0,0]",
+            "sonic.motion_global_mmap_sidecar=" + str(sidecar_path),
+            "sonic.motion_hot_fields=[]",
+        ]
+    )
+    with pytest.raises(SonicBridgeError, match="motion_shard_clips=false"):
+        build_sonic_launch_plan(invalid, root_dir=tmp_path, rank=0, world_size=1)
+
+
+def test_global_mmap_checkpoint_cadence_must_align_with_sampler_sync(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import unilab.training.sonic_bridge as sonic_bridge_module
+
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    manifest = SimpleNamespace(manifest_path=manifest_path, clips=())
+    monkeypatch.setattr(sonic_bridge_module, "load_motion_manifest", lambda _: manifest)
+    sidecar_path = tmp_path / "global_mmap" / "metadata.json"
+    base = [
+        "training.log_dir=" + str(tmp_path / "logs"),
+        "sonic.mode=train",
+        "sonic.resources.gpu_numa_nodes=[0,0,0,1,1,1,1,1]",
+        "sonic.motion_manifest=" + str(manifest_path),
+        "sonic.motion_global_mmap_sidecar=" + str(sidecar_path),
+        "sonic.motion_shard_clips=false",
+        "sonic.motion_hot_fields=[]",
+    ]
+
+    aligned = _cfg(
+        base + ["algo.save_interval=1000", "sonic.sync_adaptive_sampling_all_gpus_freq=200"]
+    )
+    build_sonic_launch_plan(aligned, root_dir=tmp_path, rank=0, world_size=8)
+
+    disabled = _cfg(base + ["algo.save_interval=0"])
+    build_sonic_launch_plan(disabled, root_dir=tmp_path, rank=0, world_size=8)
+
+    misaligned = _cfg(
+        base + ["algo.save_interval=250", "sonic.sync_adaptive_sampling_all_gpus_freq=200"]
+    )
+    with pytest.raises(SonicBridgeError, match="must be a multiple"):
+        build_sonic_launch_plan(misaligned, root_dir=tmp_path, rank=0, world_size=8)
+
+    no_sync = _cfg(
+        base
+        + [
+            "training.devices=[0,1]",
+            "sonic.resources.gpu_numa_nodes=[0,0]",
+            "sonic.sync_adaptive_sampling_all_gpus_freq=0",
+        ]
+    )
+    with pytest.raises(SonicBridgeError, match="requires a positive"):
+        build_sonic_launch_plan(no_sync, root_dir=tmp_path, rank=0, world_size=2)
 
 
 def test_train_plan_requires_rank_ordered_gpu_numa_nodes(tmp_path: Path):
@@ -208,7 +356,7 @@ def test_runtime_receives_explicit_bridge_contract(tmp_path: Path):
 
     assert run_sonic_runtime(cfg, plan, runtime=runtime) == "ok"
     assert seen["plan"] is plan
-    assert seen["env_cfg_override"]["cpu_ids"] == [0, 1, 2, 3, 4, 5]
+    assert seen["env_cfg_override"]["cpu_ids"] == [0, 1, 2, 3, 4, 5, 6]
 
 
 def test_runtime_rejects_rsl_rl_style_callable(tmp_path: Path):
@@ -247,13 +395,13 @@ def test_owner_backend_cannot_be_switched_by_training_override(tmp_path: Path):
 @pytest.mark.parametrize(
     ("override", "field"),
     (
-        ("sonic.target_recipe=sonic_release", "target_recipe"),
+        ("sonic.target_recipe=sonic_v1_1", "target_recipe"),
         ("sonic.target_revision=deadbeef", "target_revision"),
-        ("sonic.observation_profile=unitoken_all_noz", "observation_profile"),
-        ("sonic.owner.target_recipe=sonic_release", "target_recipe"),
+        ("sonic.observation_profile=unitoken_all_noz_heading", "observation_profile"),
+        ("sonic.owner.target_recipe=sonic_v1_1", "target_recipe"),
         ("sonic.owner.target_revision=deadbeef", "target_revision"),
-        ("sonic.owner.observation_profile=unitoken_all_noz", "observation_profile"),
-        ("env.observation_profile=unitoken_all_noz", "observation_profile"),
+        ("sonic.owner.observation_profile=unitoken_all_noz_heading", "observation_profile"),
+        ("env.observation_profile=unitoken_all_noz_heading", "observation_profile"),
     ),
 )
 def test_owner_provenance_overrides_fail_closed(tmp_path: Path, override: str, field: str) -> None:

@@ -64,6 +64,10 @@ class SonicBridgeError(RuntimeError):
     """Raised when the SONIC/UniLab boundary cannot be satisfied."""
 
 
+_SONIC_DEFAULT_SAVE_INTERVAL = 1000
+_SONIC_DEFAULT_ADAPTIVE_SYNC_INTERVAL = 200
+
+
 @dataclass(frozen=True)
 class SonicLaunchPlan:
     """Everything resolved on the cold path before env/model construction."""
@@ -384,8 +388,12 @@ def _load_manifest_from_cfg(
         raise SonicBridgeError(f"sonic.motion_manifest is not a file: {path}")
     try:
         manifest = load_motion_manifest(path)
-        if bool(_select(cfg, "sonic.verify_motion_checksums", True)) or bool(
-            _select(cfg, "sonic.verify_motion_shapes", True)
+        # Explicit preflight audits the complete corpus. Train mode delegates
+        # file/hash/shape checks to the rank-local store after clip sharding,
+        # which preserves complete coverage without eight redundant scans.
+        if str(_select(cfg, "sonic.mode", "preflight")).strip().lower() != "train" and (
+            bool(_select(cfg, "sonic.verify_motion_checksums", True))
+            or bool(_select(cfg, "sonic.verify_motion_shapes", True))
         ):
             manifest = preflight_motion_manifest(
                 manifest,
@@ -433,6 +441,42 @@ def _build_env_override(
         ):
             raise SonicBridgeError("sonic.encoder_sample_probs must be a sequence")
         override["encoder_sample_probs"] = tuple(float(value) for value in configured_encoder_probs)
+    configured_hot_fields = _select(cfg, "sonic.motion_hot_fields", ())
+    if not isinstance(configured_hot_fields, Sequence) or isinstance(
+        configured_hot_fields, (str, bytes)
+    ):
+        raise SonicBridgeError("sonic.motion_hot_fields must be a sequence")
+    hot_fields = tuple(configured_hot_fields)
+    if any(not isinstance(name, str) or not name for name in hot_fields):
+        raise SonicBridgeError("sonic.motion_hot_fields must contain non-empty string names")
+    if len(set(hot_fields)) != len(hot_fields):
+        raise SonicBridgeError("sonic.motion_hot_fields contains duplicate field names")
+    configured_global_mmap_sidecar = _select(cfg, "sonic.motion_global_mmap_sidecar")
+    if configured_global_mmap_sidecar in (None, ""):
+        global_mmap_sidecar = None
+    elif not isinstance(configured_global_mmap_sidecar, (str, Path)):
+        raise SonicBridgeError("sonic.motion_global_mmap_sidecar must be a sidecar path")
+    else:
+        global_mmap_sidecar = str(configured_global_mmap_sidecar)
+    if global_mmap_sidecar is not None and bool(_select(cfg, "sonic.motion_shard_clips", True)):
+        raise SonicBridgeError("sonic.motion_global_mmap_sidecar requires motion_shard_clips=false")
+    if global_mmap_sidecar is not None and hot_fields:
+        raise SonicBridgeError(
+            "sonic.motion_global_mmap_sidecar cannot be combined with motion_hot_fields"
+        )
+    if global_mmap_sidecar is not None and manifest is None:
+        raise SonicBridgeError("sonic.motion_global_mmap_sidecar requires sonic.motion_manifest")
+    configured_global_mmap_receipt = _select(cfg, "sonic.motion_global_mmap_trusted_receipt")
+    if configured_global_mmap_receipt in (None, ""):
+        global_mmap_receipt = None
+    elif not isinstance(configured_global_mmap_receipt, (str, Path)):
+        raise SonicBridgeError("sonic.motion_global_mmap_trusted_receipt must be a receipt path")
+    else:
+        global_mmap_receipt = str(configured_global_mmap_receipt)
+    if global_mmap_receipt is not None and global_mmap_sidecar is None:
+        raise SonicBridgeError(
+            "sonic.motion_global_mmap_trusted_receipt requires motion_global_mmap_sidecar"
+        )
     if manifest is not None:
         source = manifest.manifest_path
         if source is None:
@@ -442,11 +486,71 @@ def _build_env_override(
         override["motion_world_size"] = int(os.environ.get("WORLD_SIZE", "1"))
         override["motion_shard_clips"] = bool(_select(cfg, "sonic.motion_shard_clips", True))
         override["motion_cache_size"] = int(_select(cfg, "sonic.motion_cache_size", 2))
+        override["motion_hot_fields"] = hot_fields
+        override["motion_global_mmap_sidecar"] = global_mmap_sidecar
+        override["motion_global_mmap_trusted_receipt"] = global_mmap_receipt
+        override["motion_verify_checksums"] = bool(
+            _select(cfg, "sonic.verify_motion_checksums", True)
+        )
+        override["motion_verify_shapes"] = bool(_select(cfg, "sonic.verify_motion_shapes", True))
         if bool(_select(cfg, "sonic.use_manifest_clips", False)):
             override["motion_file"] = [
                 str(resolve_manifest_clip_path(source, clip.path)) for clip in manifest.clips
             ]
     return override
+
+
+def _validate_global_mmap_cadence(
+    cfg: Mapping[str, Any],
+    *,
+    world_size: int,
+) -> None:
+    """Reject checkpoint cadences that would require an extra sampler sync.
+
+    The native runner synchronizes global-mmap adaptive counters only at the
+    configured iteration cadence.  Saving a checkpoint must be observational:
+    it cannot add a collective and thereby change future curriculum state.
+    """
+
+    sidecar = _select(cfg, "sonic.motion_global_mmap_sidecar")
+    if sidecar in (None, ""):
+        return
+    try:
+        sync_interval = int(
+            _select(
+                cfg,
+                "sonic.sync_adaptive_sampling_all_gpus_freq",
+                _SONIC_DEFAULT_ADAPTIVE_SYNC_INTERVAL,
+            )
+        )
+        save_interval = int(
+            _select(
+                cfg,
+                "algo.save_interval",
+                _select(cfg, "save_interval", _SONIC_DEFAULT_SAVE_INTERVAL),
+            )
+        )
+    except (TypeError, ValueError) as exc:
+        raise SonicBridgeError(
+            "SONIC global-mmap cadence values must be integers: "
+            "algo.save_interval and sonic.sync_adaptive_sampling_all_gpus_freq"
+        ) from exc
+    if sync_interval < 0:
+        raise SonicBridgeError("sonic.sync_adaptive_sampling_all_gpus_freq must be non-negative")
+    if save_interval < 0:
+        raise SonicBridgeError("algo.save_interval must be non-negative")
+    if world_size > 1 and sync_interval == 0:
+        raise SonicBridgeError(
+            "SONIC global-mmap distributed training requires a positive "
+            "sonic.sync_adaptive_sampling_all_gpus_freq"
+        )
+    if save_interval > 0 and sync_interval > 0 and save_interval % sync_interval:
+        raise SonicBridgeError(
+            "SONIC global-mmap algo.save_interval must be a multiple of "
+            "sonic.sync_adaptive_sampling_all_gpus_freq so checkpointing adds no "
+            f"sampler synchronization (save_interval={save_interval}, "
+            f"sync_interval={sync_interval})"
+        )
 
 
 def build_sonic_launch_plan(
@@ -499,6 +603,7 @@ def build_sonic_launch_plan(
         raise SonicBridgeError(
             f"training.devices has {len(devices)} entries but torchrun world_size={resolved_world}"
         )
+    _validate_global_mmap_cadence(plain, world_size=resolved_world)
     runtime_device = resolve_sonic_device(
         plain,
         devices=devices,

@@ -1,8 +1,8 @@
-# SONIC bridge profile targeting the v1.1 observation recipe.
+# SONIC bridge profile targeting the original release recipe.
 #
 # The observation ABI targets
 # GR00T-WholeBodyControl/gear_sonic/config/exp/manager/universal_token/
-# all_modes/sonic_v1_1.yaml at the pinned revision below.  This remains
+# all_modes/sonic_release.yaml at the pinned revision below.  This remains
 # intentionally an observation bridge profile, not a claim that named-model or
 # reward/task parity is complete.  `sonic.mode=preflight` is safe to run without
 # a CUDA driver; `sonic.mode=train` selects the built-in native SonicPPO owner
@@ -20,7 +20,9 @@ algo:
   num_envs: 4096
   num_steps_per_env: 24
   max_iterations: 100000
-  save_interval: 500
+  # Keep periodic checkpoints on the 200-step global-mmap sampler-sync
+  # cadence; saving itself must never add a collective.
+  save_interval: 1000
   num_learning_epochs: 5
   num_mini_batches: 4
   gamma: 0.99
@@ -43,8 +45,9 @@ training:
   logger: tensorboard
   log_root: null
   log_dir: null
-  # Warm-start checkpoint. Model, optimizer, normalizer, and iteration are
-  # restored; simulator/sampler state is intentionally not called seamless.
+  # Checkpoint to restore. Model, optimizer, normalizer, and iteration are
+  # restored. Unsharded global-mmap runs also restore adaptive counters;
+  # rank-local sampler counters and simulator/RNG state remain warm-start only.
   resume: null
 
 sonic:
@@ -61,14 +64,27 @@ sonic:
   motion_manifest: null
   require_motion_manifest: false
   use_manifest_clips: false
+  # Explicit opt-in to a separately published global mmap sidecar. It is
+  # fail-closed with clip sharding and resident hot fields; owner defaults
+  # remain on the bounded lazy/rank-local path until benchmarked.
+  motion_global_mmap_sidecar: null
+  # Optional trusted receipt emitted by the sidecar materializer after one
+  # complete cold-path audit. This is not a cryptographic re-audit after the
+  # filesystem changes; explicit opt-in requires full field coverage.
+  motion_global_mmap_trusted_receipt: null
   # Each torchrun rank loads a disjoint clip subset.  This bounds host RAM at
   # roughly one eighth of the corpus on the target 8-GPU workstation.
   motion_shard_clips: true
-  # Number of decoded clips retained per rank.  NPZ clips are bounded by this
-  # LRU; NPY members remain OS-backed mmap views.
+  # Safe fallback: no complete fields are resident and the lazy cache remains
+  # bounded. The release MuJoCo owner overrides the eight rollout-hot fields.
+  motion_hot_fields: []
   motion_cache_size: 2
   verify_motion_checksums: true
   verify_motion_shapes: true
+  # Upstream averages the full-corpus adaptive counters across ranks every
+  # 200 completed PPO iterations. Rank-local clip shards deliberately skip
+  # this collective because their bin coordinates differ.
+  sync_adaptive_sampling_all_gpus_freq: 200
   # The release leaves per_device_train_batch_size unset, so the rank-local
   # logical minibatch (4096/4=1024 environment sequences) is one optimizer
   # update.  Keep this strict default; use the documented accumulation variant
@@ -82,26 +98,26 @@ sonic:
     critic_obs_dim: 1645
     tokenizer_obs_dim: 1761
   model:
-    profile: sonic_v1_1
-    contract_version: sonic_v1_1_named_universal_token.v1
-    # Flat storage ABI parsed into the pinned v1.1 named fields on the model
+    profile: sonic_release
+    contract_version: sonic_release_named_universal_token.v1
+    # Flat storage ABI parsed into the pinned release fields on the model
     # cold path. command-z remains in the ABI but is not consumed by an encoder.
     tokenizer_fields:
       encoder_index: {slice: [0, 3], shape: [3]}
       command_multi_future_nonflat: {slice: [3, 583], shape: [10, 58]}
       command_z_multi_future_nonflat: {slice: [583, 593], shape: [10, 1]}
       command_z: {slice: [593, 594], shape: [1]}
-      motion_anchor_ori_heading_mf_nonflat: {slice: [594, 654], shape: [10, 6]}
-      motion_anchor_ori_heading: {slice: [654, 660], shape: [6]}
+      motion_anchor_ori_b: {slice: [594, 600], shape: [6]}
+      motion_anchor_ori_b_mf_nonflat: {slice: [600, 660], shape: [10, 6]}
       command_multi_future_lower_body: {slice: [660, 900], shape: [240]}
       vr_3point_local_target: {slice: [900, 909], shape: [9]}
       vr_3point_local_orn_target: {slice: [909, 921], shape: [12]}
       smpl_joints_multi_future_local_nonflat: {slice: [921, 1641], shape: [10, 72]}
-      smpl_root_ori_heading_multi_future: {slice: [1641, 1701], shape: [10, 6]}
+      smpl_root_ori_b_multi_future: {slice: [1641, 1701], shape: [10, 6]}
       joint_pos_multi_future_wrist_for_smpl: {slice: [1701, 1761], shape: [10, 6]}
     encoders:
       g1:
-        inputs: [command_multi_future_nonflat, motion_anchor_ori_heading_mf_nonflat]
+        inputs: [command_multi_future_nonflat, motion_anchor_ori_b_mf_nonflat]
         temporal: true
         hidden_dims: [2048, 1024, 512, 512]
       teleop:
@@ -109,13 +125,13 @@ sonic:
           - command_multi_future_lower_body
           - vr_3point_local_target
           - vr_3point_local_orn_target
-          - motion_anchor_ori_heading
+          - motion_anchor_ori_b
         temporal: false
         hidden_dims: [2048, 1024, 512, 512]
       smpl:
         inputs:
           - smpl_joints_multi_future_local_nonflat
-          - smpl_root_ori_heading_multi_future
+          - smpl_root_ori_b_multi_future
           - joint_pos_multi_future_wrist_for_smpl
         temporal: true
         hidden_dims: [2048, 1024, 512, 512]
@@ -124,25 +140,25 @@ sonic:
         inputs: [token_flattened, actor_obs]
         outputs:
           action: [29]
-        hidden_dims: [4096, 4096, 2048, 2048, 1024, 1024, 512, 512]
+        hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
       g1_kin:
         inputs: [token_flattened]
         outputs:
           command_multi_future_nonflat: [10, 58]
-          motion_anchor_ori_heading_mf_nonflat: [10, 6]
+          motion_anchor_ori_b_mf_nonflat: [10, 6]
         hidden_dims: [2048, 1024, 512, 512]
     critic:
-      hidden_dims: [4096, 4096, 2048, 2048, 1024, 1024, 512, 512]
+      hidden_dims: [2048, 2048, 1024, 1024, 512, 512]
     critic_obs_normalization: true
     token_count: 2
     token_levels: 32
     init_noise_std: 0.05
     std_clamp_min: 0.001
     std_clamp_max: 0.5
-  # sonic_v1_1.yaml samples G1, teleop and SMPL uniformly.
+  # sonic_release.yaml samples G1, teleop and SMPL uniformly.
   encoder_sample_probs: [1.0, 1.0, 1.0]
   optimizer_step_per_microbatch: true
-  # Pinned sonic_v1_1 auxiliary/cycle recipe.  All five are MSE in the
+  # Pinned sonic_release auxiliary/cycle recipe.  All five are MSE in the
   # upstream implementation; the configured teleop detach flag is not acted
   # upon by that pinned loss class, so UniLab preserves the executed gradient.
   aux_loss_coef:
@@ -154,13 +170,14 @@ sonic:
   resources:
     enabled: true
     profile: sonic-8x4090-76c-2numa
-    # Preflight may discover a best-effort PCI-BDF topology when NVML/driver
-    # access is unavailable. Train mode is fail-closed and requires an
-    # explicit rank-ordered list because PCI order is not a CUDA ordinal
-    # contract; set it after checking nvidia-smi on the target host.
+    # Train mode requires this rank-ordered mapping to be supplied explicitly
+    # on hosts with multiple NUMA nodes; the launch command for the validated
+    # 8x4090 workstation passes [0,0,0,1,1,1,1,1].
     detect_gpu_numa: true
     gpu_numa_nodes: null
-    workers_per_rank: 6
+    # NUMA1 owns five GPU ranks and 38 physical cores, so seven workers per
+    # rank is the largest uniform allocation without physical-core overlap.
+    workers_per_rank: 7
     torch_num_threads: 2
     torch_num_interop_threads: 1
     pin_process: false

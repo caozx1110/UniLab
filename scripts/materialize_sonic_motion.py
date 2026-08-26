@@ -25,6 +25,7 @@ from unilab.training.sonic_motion import (  # noqa: E402
     materialize_motion_store,
     materialize_paired_sonic_motion,
 )
+from unilab.training.sonic_store import materialize_sonic_global_mmap_store  # noqa: E402
 
 
 def main() -> None:
@@ -47,7 +48,35 @@ def main() -> None:
         "--smpl-root",
         help="SMPL PKL/joblib tree paired to --robot-root by unique basename",
     )
-    parser.add_argument("--output", required=True, help="Output motion-store directory")
+    parser.add_argument("--output", default=None, help="Output motion-store directory")
+    parser.add_argument(
+        "--global-mmap-manifest",
+        default=None,
+        help="Existing immutable manifest for direct global mmap materialization",
+    )
+    parser.add_argument(
+        "--global-mmap-output",
+        default=None,
+        help="Optional new directory for a global read-only mmap sidecar",
+    )
+    parser.add_argument(
+        "--global-mmap-field",
+        action="append",
+        default=[],
+        help="Frame field to materialize globally (repeatable; required with --global-mmap-output)",
+    )
+    parser.add_argument(
+        "--global-mmap-joint-order",
+        nargs="+",
+        default=None,
+        help="Effective joint order written into the global mmap sidecar",
+    )
+    parser.add_argument(
+        "--global-mmap-body-order",
+        nargs="+",
+        default=None,
+        help="Effective body order written into the global mmap sidecar",
+    )
     parser.add_argument("--fps", type=int, default=50)
     parser.add_argument(
         "--source-fps",
@@ -55,8 +84,8 @@ def main() -> None:
         default=None,
         help="FPS of raw sources when they do not carry an fps field",
     )
-    parser.add_argument("--joint-order", nargs="+", required=True)
-    parser.add_argument("--body-order", nargs="+", required=True)
+    parser.add_argument("--joint-order", nargs="+", default=None)
+    parser.add_argument("--body-order", nargs="+", default=None)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--hardlink", action="store_true", help="Use hardlinks when possible")
     parser.add_argument(
@@ -91,7 +120,42 @@ def main() -> None:
         help="Explicitly skip robot/SMPL basenames without a counterpart (paired mode only)",
     )
     args = parser.parse_args()
+    direct_global_mmap = args.global_mmap_manifest is not None
+    if direct_global_mmap:
+        if args.source or args.normalize_source or args.robot_root is not None or args.smpl_root is not None:
+            parser.error("--global-mmap-manifest cannot be combined with motion-source arguments")
+        if args.output is not None:
+            parser.error("--global-mmap-manifest does not use --output")
+        if args.global_mmap_output is None or not args.global_mmap_field:
+            parser.error(
+                "--global-mmap-manifest requires --global-mmap-output and at least one "
+                "--global-mmap-field"
+            )
+        global_mmap = materialize_sonic_global_mmap_store(
+            args.global_mmap_manifest,
+            args.global_mmap_output,
+            fields=args.global_mmap_field,
+            expected_joint_order=args.global_mmap_joint_order,
+            expected_body_order=args.global_mmap_body_order,
+        )
+        print(
+            json.dumps(
+                {
+                    "global_mmap_sidecar_path": str(global_mmap.sidecar_path),
+                    "global_mmap_trusted_receipt_path": str(global_mmap.trusted_receipt_path),
+                    "global_mmap_fields": list(global_mmap.fields),
+                    "global_mmap_total_bytes": global_mmap.total_bytes,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return
     paired = args.robot_root is not None or args.smpl_root is not None
+    if args.output is None:
+        parser.error("--output is required unless --global-mmap-manifest is used")
+    if args.joint_order is None or args.body_order is None:
+        parser.error("--joint-order and --body-order are required for motion-store materialization")
     if paired:
         if args.robot_root is None or args.smpl_root is None:
             parser.error("paired mode requires both --robot-root and --smpl-root")
@@ -105,6 +169,10 @@ def main() -> None:
         parser.error("provide --source, --normalize-source, or paired --robot-root/--smpl-root")
     elif args.allow_unmatched:
         parser.error("--allow-unmatched is only valid with --robot-root/--smpl-root")
+    if args.global_mmap_output is None and args.global_mmap_field:
+        parser.error("--global-mmap-field requires --global-mmap-output")
+    if args.global_mmap_output is not None and not args.global_mmap_field:
+        parser.error("--global-mmap-output requires at least one --global-mmap-field")
 
     sources = args.source
     if paired:
@@ -164,18 +232,25 @@ def main() -> None:
             overwrite=args.overwrite,
             copy_mode="hardlink" if args.hardlink else "copy",
         )
-    print(
-        json.dumps(
-            {
-                "manifest_path": str(report.manifest_path),
-                "clip_count": report.clip_count,
-                "total_frames": report.total_frames,
-                "total_bytes": report.total_bytes,
-            },
-            indent=2,
-            sort_keys=True,
+    result: dict[str, object] = {
+        "manifest_path": str(report.manifest_path),
+        "clip_count": report.clip_count,
+        "total_frames": report.total_frames,
+        "total_bytes": report.total_bytes,
+    }
+    if args.global_mmap_output is not None:
+        global_mmap = materialize_sonic_global_mmap_store(
+            report.manifest_path,
+            args.global_mmap_output,
+            fields=args.global_mmap_field,
+            expected_joint_order=args.global_mmap_joint_order,
+            expected_body_order=args.global_mmap_body_order,
         )
-    )
+        result["global_mmap_sidecar_path"] = str(global_mmap.sidecar_path)
+        result["global_mmap_trusted_receipt_path"] = str(global_mmap.trusted_receipt_path)
+        result["global_mmap_fields"] = list(global_mmap.fields)
+        result["global_mmap_total_bytes"] = global_mmap.total_bytes
+    print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
