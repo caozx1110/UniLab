@@ -7,6 +7,8 @@ UniLab 的多卡启动、native `SonicPPO` owner 和冷路径数据契约。训�
 
 这里的“已验证”只指下文列出的真实数据、真实 8 卡执行和 checkpoint 结果；不表示
 完整训练曲线、任务成功率或上游 SONIC v1 的科学结果已经等价。
+上游公开 recipe 与当前正式实验的逐项对比和带时间戳进度见
+{doc}`8-sonic_v1_experiment_report`。
 
 ## 先做 preflight
 
@@ -53,21 +55,10 @@ rank skew 决定，不在配置里预设“最优”链路。
 目标主机已经通过真实驱动 gate：8 张 RTX 4090（driver `580.178.04`、PyTorch
 `2.7.0+cu128`、NCCL `2.26.2`）均可见，8-rank NCCL all-reduce 校验通过；同
 NUMA 内 GPU 为 `PIX`、跨 NUMA 为 `SYS`，所以 profile 按 GPU0--2→NUMA0、
-GPU3--7→NUMA1 分配 CPU。下表是同一主机上真实 BONES-SEED G1/SMPL paired
-motion 的已完成续训证据；均为 4096 env/rank、horizon=24、5×4 PPO updates，
-即全局 32768 env、786432 transition/iteration。
-
-| 数据与运行 | 已完成的 checkpoint 路径 | 最后一次 iteration 指标 |
-| --- | --- | --- |
-| 100 clips、global-mmap benchmark layout、freeze-frame augmentation 和 active motion pool；sampler stats 每个 PPO iteration 强制同步；`model_7.pt → model_8.pt` | `sonic_release_v1_freeze_pool_global_mmap_smoke100_resume_7_to_8_v2/model_8.pt` | rollout `54000.4` FPS；iteration `36993.7` FPS；learner `117464.2` FPS；reward `0.075`；KL `0.0072`；单卡峰值 `8.174 GiB` |
-| 同一 100-clip benchmark 的 `model_8.pt → model_9.pt` strict sampler resume | `sonic_release_v1_freeze_pool_global_mmap_smoke100_resume_8_to_9/model_9.pt` | rollout `58777.6` FPS；iteration `42355.6` FPS；learner `151599.5` FPS；reward `0.074`；KL `0.0075`；单卡峰值 `8.167 GiB`。730-bin sampler layout hash 未变化，累积 counters 保持 finite。 |
-| 完整 131,418 clips、rank-shard resident-hot layout、freeze-frame augmentation 和 active motion pool；`model_7.pt → model_8.pt` | `sonic_release_v1_freeze_pool_rankshard_full_resume_7_to_8/model_8.pt` | rollout `52696.0` FPS；iteration `36896.5` FPS；learner `123060.2` FPS；reward `0.084`；KL `0.0080`；单卡峰值 `8.160 GiB` |
-
-100-clip global-mmap 结果验证了该 benchmark 的执行、sampler restore 和后续
-iteration；它不是长周期收敛证据，也不能代替全量 corpus 结果。全量 rank-shard
-结果验证了真实的 131,418 clips 数据和一次完整续训 iteration，但该布局中的
-adaptive counters 是 rank-local，既不跨 rank 同步，也不写入 rank-zero
-checkpoint；它不能作为上游全局 curriculum 的等价证据。
+GPU3--7→NUMA1 分配 CPU。完整 131,418-clip shared-global-mmap 正式实验已经从零
+持续运行并生成 iteration 1000、2000 和 3000 checkpoint；最新吞吐、资源占用、
+训练信号和科学 parity 边界统一记录在实验报告中，避免把不断变化的时点指标固化在
+本操作指南里。
 
 每个 rank 在构造模型和环境前应用 `algo.seed + rank`，保证同一 rank 可复现，
 同时避免八个环境采样器得到完全相同的随机流。
@@ -110,8 +101,10 @@ converter 默认对 duplicate basename、缺失配对 fail-closed；robot 与 SM
 fps/duration 重采样到共同 target grid，帧数仍不一致时拒绝。只有显式传入
 `--allow-unmatched` 才会跳过未配对 key。每次只规范化
 一个 pair，并在所有 clip 通过 checksum/shape preflight 后原子发布 store。这里的
-命令是小样本用法，不代表全量 corpus 已验证。step/reset 热路径不能读取 PKL、XML
-或重新解析 manifest。训练前将生成的
+命令是 materializer 用法示例；当前正式实验使用的 131,418 clips / 48,042,726
+frames 全量 store 已完成 checksum/shape 审计，具体 manifest 和 mmap 证据见
+{doc}`8-sonic_v1_experiment_report`。step/reset 热路径不能读取 PKL、XML 或重新
+解析 manifest。训练前将生成的
 `manifest.json` 设置到 `sonic.motion_manifest`，并保持 checksum/shape 校验
 开启。多卡默认 `sonic.motion_shard_clips=true`，每个 rank 只 materialize
 round-robin 的 clip 子集，避免 8 个进程各自复制完整 corpus。rank-local store
@@ -125,6 +118,12 @@ frame gather 直接使用 `np.take`。resident/cache 只改变驻留和 I/O 行�
 manifest、frame index 或 joint/body reorder contract。显式 preflight 对完整
 corpus 做 checksum/shape 审计；训练启动时八个 rank 各自严格验证并冷物化将消费
 的 1/8 clips，合计覆盖 corpus 一次，避免父进程和每个 rank 重复全量扫描。
+
+正式 parity run 显式选择另一个已发布布局：设置
+`sonic.motion_shard_clips=false`、`sonic.motion_hot_fields=[]`，并提供完整的
+`sonic.motion_global_mmap_sidecar` 与 trusted receipt。八个 rank 由此共享同一
+14-field 只读 mmap 和同一套 full-corpus adaptive bin 坐标；这不是默认低内存路径，
+也不能省略 sidecar/receipt 的 fail-closed 校验。
 
 ## 开始训练
 
@@ -144,8 +143,10 @@ normalization、adaptive learning-rate scheduler、分布式 advantage/normalize
 rank 会校验 checkpoint SHA256 一致性，新格式缺少维度/token contract 时直接
 失败。PPO 的 Gaussian KL、clipped value loss（无额外 `0.5` 因子）、FSQ
 normalized code 范围与 release 算术保持一致。checkpoint 恢复模型、optimizer、
-normalizer 和 iteration。上表的 global-mmap benchmark 已验证一次带 sampler
-state 的严格恢复；这个实验边界不能外推到别的 manifest、数据布局或长期训练。
+normalizer 和 iteration。完整 131,418-clip shared-global-mmap run 已通过
+`model_1000.pt`、`model_2000.pt` 和 `model_3000.pt` 的 load/finite 审计，并在
+checkpoint 中保存同一 layout 的全局 sampler counters；这个证据仍不能外推到另一个
+manifest 或数据布局，完整 full-corpus restart-and-advance 也尚未执行。
 rank-shard 布局不会保存其 rank-local adaptive counters，故该布局的 resume 仍是
 参数/optimizer/normalizer 的 warm-start，不能当作无缝、全局可复现的 resume。
 环境状态及 Python/NumPy/Torch RNG 也不在 checkpoint 中。
@@ -165,9 +166,10 @@ strict load；用 `training.resume=/abs/path/sonic_release_unilab.pt` 可做
 warm-start 或兼容性验证。从零复现 release 训练时不要设置 `training.resume`。
 
 默认的 rank-shard motion corpus 让每个 rank 的 adaptive counters 独立演进，不能
-将该路径的统计或 checkpoint resume 称为上游的全局同步 curriculum。100-clip
-global-mmap benchmark 的 sampler restore 仅是该固定数据布局上的执行证据，不是
-完整 corpus 的长期采样分布或 source-parity 证明。
+将该路径的统计或 checkpoint resume 称为上游的全局同步 curriculum。当前正式实验
+因此使用全量 shared-global-mmap；它已经验证完整 corpus sampler state 的写入、
+CPU load 和 layout 一致性，尚需 restart-and-advance 与固定评测才能证明恢复后的
+连续性或科学结果 parity。
 
 建议按 `512 → 1024 → 2048 → 4096 env/rank` 爬坡，再扫描 1/2/4/6/8 卡；
 扫描时固定全局 transition budget，而不是固定每卡环境数。例如目标预算为
@@ -175,9 +177,9 @@ global-mmap benchmark 的 sampler restore 仅是该固定数据布局上的执�
 `algo.num_envs=32768/16384/8192/4096`（保持 horizon=24）。每次记录
 TensorBoard 中的 `perf/rollout_fps`、`perf/learner_fps`、`perf/iteration_fps`、
 rank skew、显存峰值和 `policy/learning_rate`，同时记录 CPU worker 利用率。
-真实驱动和 8 卡 launcher gate 已通过；真实 SONIC motion corpus 的 checksum、
-I/O/RSS、clip 覆盖率和最终训练曲线仍需单独上线 gate，不能由合成 clip smoke 或
-preflight 结果代替。
+截至当前 run，目标主机已经完成上述爬坡、真实驱动、8 卡 launcher、全量 corpus
+checksum、I/O/RSS 和 clip 覆盖 gate。迁移到另一台主机时仍应重新执行资源扫描；
+最终训练曲线和评测指标不能由这些系统 gate 代替。
 
 ## Parity 边界
 
@@ -190,10 +192,10 @@ freeze-frame augmentation 路径。
 仍未等价的边界必须保留：domain randomization 目前只映射 joint default、动态
 friction 和指定 body mass；COM、interval push、static friction/restitution 和
 startup timing 仍不完整。terrain 仍是 plane，而非上游 trimesh。上游的
-upper-body/navigation motion 拼接尚未实现；本地 manifest 的 131,418 clips 也没有
-可识别的 nav prefix，不能强行标注或拼接。随机数流及其与上游 loader、环境、
-sampler 的消费顺序也未证明一致。
+upper-body motion 拼接尚未实现；本地 manifest 的 131,418 clips 也没有可证明等价的
+motion-key prefix 与 non-nav 数据集标注，不能强行标注或拼接。随机数流及其与上游
+loader、环境、sampler 的消费顺序也未证明一致。
 
-因此可以声称官方网络和完整 PPO 执行链兼容，并已在真实全量数据上完成一次 8 卡
-续训 iteration；在完整 corpus 的长周期收敛曲线、任务成功率和上述仿真/数据/RNG
-差异完成验证前，不能声称 SONIC v1 的科学结果 parity。
+因此可以声称官方网络和完整 PPO 执行链兼容，并已在真实全量数据上从零持续训练至
+iteration 3000 以上；在完整 corpus 的 100K 曲线、固定任务成功率/local MPJPE 和
+上述仿真/数据/RNG 差异完成验证前，不能声称 SONIC v1 的科学结果 parity。

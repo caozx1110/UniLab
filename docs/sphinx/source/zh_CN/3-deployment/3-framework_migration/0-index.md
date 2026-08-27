@@ -48,6 +48,13 @@
 迁移 SONIC release。
 :::
 
+:::{grid-item-card} SONIC v1 实验报告
+:link: 8-sonic_v1_experiment_report
+:link-type: doc
+对比上游公开 release recipe 与当前 8×4090 全量实验，并记录带时间戳的训练进度和
+parity 边界。
+:::
+
 ::::
 
 ```{toctree}
@@ -60,4 +67,5 @@
 5-task_config_translation
 6-reward_porting
 7-sonic_unilab
+8-sonic_v1_experiment_report
 ```
