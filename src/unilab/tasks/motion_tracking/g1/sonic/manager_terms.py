@@ -461,7 +461,7 @@ class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
         # Import here to avoid the package-level action/command import cycle.
         # This is construction-only configuration binding, never a rollout
         # path import or backend capability probe.
-        from .actions import SONIC_JOINT_TO_POLICY
+        from .actions import SONIC_POLICY_TO_JOINT
 
         if tuple(self.robot.joint_names) != SONIC_JOINT_ORDER:
             raise ValueError(
@@ -469,9 +469,9 @@ class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
                 f"order {SONIC_JOINT_ORDER}, got {tuple(self.robot.joint_names)}"
             )
         # Values read from the Entity/motion loader are in canonical joint
-        # order.  Selecting ``SONIC_JOINT_TO_POLICY`` therefore emits release
+        # order.  Selecting ``SONIC_POLICY_TO_JOINT`` therefore emits release
         # policy order (the inverse mapping is used by the action term).
-        self._policy_to_joint = np.asarray(SONIC_JOINT_TO_POLICY, dtype=np.intp)
+        self._policy_to_joint = np.asarray(SONIC_POLICY_TO_JOINT, dtype=np.intp)
         self._policy_to_joint.setflags(write=False)
         self._future_offsets = self._future_frame_offsets(
             cfg.params.num_future_frames,
