@@ -37,6 +37,9 @@ for _task_name in G1_MOTION_TASKS:
 # mujoco-warp + warp-lang remain optional deps and other motion tasks keep
 # mujoco/motrix until their mjwarp paths are validated.
 registry.register_env("G1MotionTrackingSAC", make_manager_based_rl_env, sim_backend="mjwarp")
+registry.register_env_config("SonicG1Tracking", ManagerBasedRlEnvCfg)
+registry.register_env("SonicG1Tracking", make_manager_based_rl_env, sim_backend="mujoco")
+registry.register_env("SonicG1Tracking", make_manager_based_rl_env, sim_backend="mjwarp")
 
 
 __all__ = ["BoxMotionData", "BoxMotionLoader", "G1_MOTION_TASKS"]

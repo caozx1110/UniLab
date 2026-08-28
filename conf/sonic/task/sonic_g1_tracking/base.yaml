@@ -1,0 +1,365 @@
+# @package _global_
+# SONIC v1 Manager-Based owner.
+#
+# This owner intentionally inherits the validated 29-DoF G1 MuJoCo contract
+# (scene, tracked-body layout and generic failure terms) and replaces only the
+# policy-facing managers with the SONIC release ABI.  The backend owner files
+# select MuJoCo or MJWarp; task semantics remain identical between them.
+defaults:
+  - _self_
+
+training:
+  task_name: SonicG1Tracking
+
+algo:
+  # Small defaults make this owner useful for a 1-2 env bring-up.  Full PPO
+  # runs should override these per rank (e.g. 2048 envs/rank on 8x4090).
+  num_envs: 2
+  num_steps_per_env: 8
+  max_iterations: 1
+  save_interval: 1
+  empirical_normalization: false
+  obs_groups:
+    actor:
+      - actor
+
+env:
+  sim_dt: 0.005
+  ctrl_dt: 0.02
+  max_episode_seconds: 10.0
+  scene:
+    # Model-12 assets are task-owned; the generic G1 motion owner remains on
+    # scene_flat.xml for backwards-compatible experiments.
+    model_file: src/unilab/assets/robots/g1/scene_sonic.xml
+    default_keyframe_name: stand
+    entities:
+      robot:
+        root_body_name: pelvis
+        joint_names: &g1_joints
+          - left_hip_pitch_joint
+          - left_hip_roll_joint
+          - left_hip_yaw_joint
+          - left_knee_joint
+          - left_ankle_pitch_joint
+          - left_ankle_roll_joint
+          - right_hip_pitch_joint
+          - right_hip_roll_joint
+          - right_hip_yaw_joint
+          - right_knee_joint
+          - right_ankle_pitch_joint
+          - right_ankle_roll_joint
+          - waist_yaw_joint
+          - waist_roll_joint
+          - waist_pitch_joint
+          - left_shoulder_pitch_joint
+          - left_shoulder_roll_joint
+          - left_shoulder_yaw_joint
+          - left_elbow_joint
+          - left_wrist_roll_joint
+          - left_wrist_pitch_joint
+          - left_wrist_yaw_joint
+          - right_shoulder_pitch_joint
+          - right_shoulder_roll_joint
+          - right_shoulder_yaw_joint
+          - right_elbow_joint
+          - right_wrist_roll_joint
+          - right_wrist_pitch_joint
+          - right_wrist_yaw_joint
+        actuator_names: *g1_joints
+        body_names: &tracked_bodies
+          - pelvis
+          - left_hip_roll_link
+          - left_knee_link
+          - left_ankle_roll_link
+          - right_hip_roll_link
+          - right_knee_link
+          - right_ankle_roll_link
+          - torso_link
+          - left_shoulder_roll_link
+          - left_elbow_link
+          - left_wrist_yaw_link
+          - right_shoulder_roll_link
+          - right_elbow_link
+          - right_wrist_yaw_link
+  terminations:
+    time_out:
+      func: unilab.envs.mdp.time_out
+      time_out: true
+    anchor_pos:
+      func: unilab.tasks.motion_tracking.common.manager_terms.bad_anchor_pos_z_only
+      params: {command_name: motion, threshold: 0.25}
+    anchor_ori:
+      func: unilab.tasks.motion_tracking.common.manager_terms.bad_anchor_ori
+      params:
+        command_name: motion
+        threshold: 0.8
+        asset_cfg:
+          _target_: unilab.managers.SceneEntityCfg
+          name: robot
+    ee_body_pos:
+      func: unilab.tasks.motion_tracking.common.manager_terms.bad_motion_body_pos_z_only
+      params:
+        command_name: motion
+        threshold: 0.25
+        body_names: [left_ankle_roll_link, right_ankle_roll_link, left_wrist_yaw_link, right_wrist_yaw_link]
+  observations:
+    actor:
+      terms:
+        command: null
+        motion_anchor_pos_b: null
+        motion_anchor_ori_b: null
+        base_lin_vel: null
+        base_ang_vel:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_base_ang_vel
+          params: {command_name: motion}
+          history_length: 10
+        joint_pos:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_joint_pos_rel
+          params: {command_name: motion}
+          history_length: 10
+        joint_vel:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_joint_vel_rel
+          params: {command_name: motion}
+          history_length: 10
+        actions:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_last_action
+          history_length: 10
+        gravity_dir:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_projected_gravity
+          params: {command_name: motion}
+          history_length: 10
+    critic:
+      terms:
+        command: null
+        motion_anchor_pos_b:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.motion_anchor_pos_b
+          params: {command_name: motion}
+        motion_anchor_ori_b:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.motion_anchor_ori_b
+          params: {command_name: motion}
+        base_lin_vel:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_base_lin_vel
+          params: {command_name: motion}
+          history_length: 10
+        base_ang_vel:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_base_ang_vel
+          params: {command_name: motion}
+          history_length: 10
+        joint_pos:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_joint_pos_rel
+          params: {command_name: motion}
+          history_length: 10
+        joint_vel:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_joint_vel_rel
+          params: {command_name: motion}
+          history_length: 10
+        actions:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_last_action
+          history_length: 10
+        body_pos:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.robot_body_pos_b
+          params: {command_name: motion}
+        body_ori:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.robot_body_ori_b
+          params: {command_name: motion}
+        future_command:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_future_command
+          params: {command_name: motion}
+    tokenizer:
+      # This group is deliberately not exported through NpEnvState.obs.  The
+      # SONIC command publishes it through its typed tokenizer provider.
+      terms:
+        tokenizer:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_tokenizer_observation
+          params: {command_name: motion}
+
+  actions:
+    joint_pos:
+      _target_: unilab.tasks.motion_tracking.g1.sonic.actions.SonicMotionJointPositionActionCfg
+      entity_name: robot
+      actuator_names:
+        - left_hip_pitch_joint
+        - left_hip_roll_joint
+        - left_hip_yaw_joint
+        - left_knee_joint
+        - left_ankle_pitch_joint
+        - left_ankle_roll_joint
+        - right_hip_pitch_joint
+        - right_hip_roll_joint
+        - right_hip_yaw_joint
+        - right_knee_joint
+        - right_ankle_pitch_joint
+        - right_ankle_roll_joint
+        - waist_yaw_joint
+        - waist_roll_joint
+        - waist_pitch_joint
+        - left_shoulder_pitch_joint
+        - left_shoulder_roll_joint
+        - left_shoulder_yaw_joint
+        - left_elbow_joint
+        - left_wrist_roll_joint
+        - left_wrist_pitch_joint
+        - left_wrist_yaw_joint
+        - right_shoulder_pitch_joint
+        - right_shoulder_roll_joint
+        - right_shoulder_yaw_joint
+        - right_elbow_joint
+        - right_wrist_roll_joint
+        - right_wrist_pitch_joint
+        - right_wrist_yaw_joint
+      scale:
+        left_hip_pitch_joint: 0.3506614565849304
+        left_hip_roll_joint: 0.3506614565849304
+        left_hip_yaw_joint: 0.5475464463233948
+        left_knee_joint: 0.3506614565849304
+        left_ankle_pitch_joint: 0.4385773241519928
+        left_ankle_roll_joint: 0.4385773241519928
+        right_hip_pitch_joint: 0.3506614565849304
+        right_hip_roll_joint: 0.3506614565849304
+        right_hip_yaw_joint: 0.5475464463233948
+        right_knee_joint: 0.3506614565849304
+        right_ankle_pitch_joint: 0.4385773241519928
+        right_ankle_roll_joint: 0.4385773241519928
+        waist_yaw_joint: 0.5475464463233948
+        waist_roll_joint: 0.4385773241519928
+        waist_pitch_joint: 0.4385773241519928
+        left_shoulder_pitch_joint: 0.4385773241519928
+        left_shoulder_roll_joint: 0.4385773241519928
+        left_shoulder_yaw_joint: 0.4385773241519928
+        left_elbow_joint: 0.4385773241519928
+        left_wrist_roll_joint: 0.4385773241519928
+        left_wrist_pitch_joint: 0.07450087368488312
+        left_wrist_yaw_joint: 0.07450087368488312
+        right_shoulder_pitch_joint: 0.4385773241519928
+        right_shoulder_roll_joint: 0.4385773241519928
+        right_shoulder_yaw_joint: 0.4385773241519928
+        right_elbow_joint: 0.4385773241519928
+        right_wrist_roll_joint: 0.4385773241519928
+        right_wrist_pitch_joint: 0.07450087368488312
+        right_wrist_yaw_joint: 0.07450087368488312
+      use_default_offset: true
+      command_name: motion
+      action_clip_value: 20.0
+      simulate_action_latency: false
+
+  commands:
+    motion:
+      _target_: unilab.tasks.motion_tracking.g1.sonic.manager_terms.SonicMotionCommandCfg
+      entity_name: robot
+      resampling_time_range: [1.0e9, 1.0e9]
+      params:
+        _target_: unilab.tasks.motion_tracking.g1.sonic.manager_terms.SonicMotionCommandParamsCfg
+        motion_file: ${oc.env:SONIC_MOTION_MANIFEST,/data/hdd/home/caozx/ws/datasets/bones-seed/g1_sonic_motion_store_benchmark100/manifest.json}
+        anchor_body_name: torso_link
+        body_names:
+          - pelvis
+          - left_hip_roll_link
+          - left_knee_link
+          - left_ankle_roll_link
+          - right_hip_roll_link
+          - right_knee_link
+          - right_ankle_roll_link
+          - torso_link
+          - left_shoulder_roll_link
+          - left_elbow_link
+          - left_wrist_yaw_link
+          - right_shoulder_roll_link
+          - right_elbow_link
+          - right_wrist_yaw_link
+        sampling_mode: adaptive
+        sampling_start_ratio: 0.0
+        truncate_on_clip_end: false
+        num_future_frames: 10
+        dt_future_ref_frames: 0.1
+        smpl_num_future_frames: 10
+        smpl_dt_future_ref_frames: 0.02
+        encoder_sample_probs: [1.0, 1.0, 1.0]
+        teleop_sample_prob_when_smpl: 0.5
+        tokenizer_enable_corruption: true
+        use_lazy_motion_loader: true
+        motion_cache_size: 2
+        # The checked-in benchmark manifest declares smpl_joints but not the
+        # optional SMPL root quaternion.  Full Bones-Seed runs can opt in to
+        # both fields with an owner override once using the full manifest.
+        motion_optional_fields: [smpl_joints]
+        motion_rank: ${oc.decode:${oc.env:LOCAL_RANK,0}}
+        motion_world_size: ${oc.decode:${oc.env:WORLD_SIZE,1}}
+        motion_shard_clips: true
+        pose_range:
+          x: [-0.05, 0.05]
+          y: [-0.05, 0.05]
+          z: [-0.01, 0.01]
+          roll: [-0.1, 0.1]
+          pitch: [-0.1, 0.1]
+          yaw: [-0.2, 0.2]
+        velocity_range:
+          x: [-0.5, 0.5]
+          y: [-0.5, 0.5]
+          z: [-0.2, 0.2]
+          roll: [-0.52, 0.52]
+          pitch: [-0.52, 0.52]
+          yaw: [-0.78, 0.78]
+        joint_position_range: [-0.1, 0.1]
+        joint_default_position_range: [0.0, 0.0]
+
+  policy_observation_group: actor
+  critic_observation_group: critic
+
+reward:
+  motion_global_root_pos:
+    func: unilab.tasks.motion_tracking.common.manager_terms.motion_global_anchor_position_error_exp
+    weight: 0.5
+    params: {command_name: motion, std: 0.3}
+  motion_global_root_ori:
+    func: unilab.tasks.motion_tracking.common.manager_terms.motion_global_anchor_orientation_error_exp
+    weight: 0.5
+    params: {command_name: motion, std: 0.4}
+  motion_body_pos:
+    func: unilab.tasks.motion_tracking.common.manager_terms.motion_relative_body_position_error_exp
+    weight: 1.0
+    params: {command_name: motion, std: 0.3}
+  motion_body_ori:
+    func: unilab.tasks.motion_tracking.common.manager_terms.motion_relative_body_orientation_error_exp
+    weight: 1.0
+    params: {command_name: motion, std: 0.4}
+  motion_body_lin_vel:
+    func: unilab.tasks.motion_tracking.common.manager_terms.motion_global_body_linear_velocity_error_exp
+    weight: 1.0
+    params: {command_name: motion, std: 1.0}
+  motion_body_ang_vel:
+    func: unilab.tasks.motion_tracking.common.manager_terms.motion_global_body_angular_velocity_error_exp
+    weight: 1.0
+    params: {command_name: motion, std: 3.14}
+  tracking_vr_5point:
+    func: unilab.tasks.motion_tracking.g1.sonic.reward_terms.tracking_vr_5point_local
+    weight: 2.0
+    params: {command_name: motion, std: 0.1}
+  anti_shake:
+    func: unilab.tasks.motion_tracking.g1.sonic.reward_terms.anti_shake_ang_vel
+    # The current compact 14-body motion contract has no head_link.  Keep the
+    # available wrist/torso proxy explicit until the task term can consume a
+    # separate head state; this is not claimed as release reward parity.
+    weight: -0.005
+    params:
+      command_name: motion
+      body_names: [left_wrist_yaw_link, right_wrist_yaw_link, torso_link]
+      threshold: 1.5
+  feet_acc:
+    func: unilab.tasks.motion_tracking.g1.sonic.reward_terms.sonic_feet_acc_l2
+    weight: -2.5e-6
+    params:
+      asset_cfg:
+        _target_: unilab.managers.SceneEntityCfg
+        name: robot
+        joint_names: [left_ankle_pitch_joint, left_ankle_roll_joint, right_ankle_pitch_joint, right_ankle_roll_joint]
+  action_rate_l2:
+    func: unilab.envs.mdp.action_rate_l2
+    weight: -0.1
+  joint_limit:
+    func: unilab.tasks.motion_tracking.common.manager_terms.joint_pos_limits
+    weight: -10.0
+    params:
+      asset_cfg:
+        _target_: unilab.managers.SceneEntityCfg
+        name: robot
+        joint_names: ".*"

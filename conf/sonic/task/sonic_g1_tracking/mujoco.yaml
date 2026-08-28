@@ -1,0 +1,10 @@
+# @package _global_
+# SONIC v1 Manager-Based MuJoCo owner.
+defaults:
+  - /task/sonic_g1_tracking/base
+  - _self_
+
+training:
+  task_name: SonicG1Tracking
+  sim_backend: mujoco
+

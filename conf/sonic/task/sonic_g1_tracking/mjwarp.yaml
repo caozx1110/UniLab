@@ -1,0 +1,16 @@
+# @package _global_
+# SONIC v1 Manager-Based MJWarp owner.
+# The task/observation/action/reward contract is inherited unchanged from the
+# MuJoCo owner; only the backend identity and explicit MJWarp capacities differ.
+defaults:
+  - /task/sonic_g1_tracking/mujoco
+  - _self_
+
+training:
+  task_name: SonicG1Tracking
+  sim_backend: mjwarp
+
+env:
+  mjwarp_nconmax: 512
+  mjwarp_njmax: 512
+
