@@ -300,6 +300,7 @@ class SonicManagerPPORunner:
             self.storage.compute_returns(last_values, self.algorithm.gamma, self.algorithm.lam)
             self.model.train()
             metrics = self.algorithm.update(self.storage)
+            self.model.synchronize_normalizers()
             self._synchronize_device()
             learning_seconds = time.perf_counter() - learning_start
             self.current_learning_iteration += 1
