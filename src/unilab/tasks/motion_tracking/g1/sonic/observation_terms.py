@@ -295,10 +295,14 @@ def _tokenizer_corruption(command, value: np.ndarray) -> np.ndarray:
 def _tokenizer_layout(
     command,
     reference: SonicFutureReference,
-    future_command: np.ndarray,
 ) -> np.ndarray:
     num_envs = command.num_envs
-    dtype = future_command.dtype
+    # ``reference`` is already materialized by the critic's future-command
+    # term in the normal manager group order.  The tokenizer layout only used
+    # the old ``future_command`` argument to recover its dtype; rebuilding and
+    # concatenating that 580-D array here duplicated a sizeable hot-path
+    # allocation for every environment step.
+    dtype = reference.joint_pos.dtype
     anchor_ori_b = _future_anchor_rot6d(command, reference)[:, 0]
     future_ori_b = _future_anchor_rot6d(command, reference)
     command_z = reference.body_pos_w[:, :, command.anchor_body_idx, 2:3]
@@ -379,8 +383,7 @@ def sonic_tokenizer_observation(
 
     command = _command(env, command_name)
     reference = _make_future_reference(command)
-    future_command = sonic_future_command(env, command_name)
-    result = _tokenizer_layout(command, reference, future_command)
+    result = _tokenizer_layout(command, reference)
     command.write_tokenizer_observations(result)
     return result
 
