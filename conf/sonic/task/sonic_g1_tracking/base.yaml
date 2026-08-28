@@ -104,38 +104,64 @@ env:
         body_names: [left_ankle_roll_link, right_ankle_roll_link, left_wrist_yaw_link, right_wrist_yaw_link]
   observations:
     actor:
+      enable_corruption: true
       terms:
-        command: null
-        motion_anchor_pos_b: null
-        motion_anchor_ori_b: null
-        base_lin_vel: null
-        base_ang_vel:
-          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_base_ang_vel
-          params: {command_name: motion}
-          history_length: 10
-        joint_pos:
-          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_joint_pos_rel
-          params: {command_name: motion}
-          history_length: 10
-        joint_vel:
-          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_joint_vel_rel
-          params: {command_name: motion}
-          history_length: 10
-        actions:
-          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_last_action
-          history_length: 10
+        # Keep this order identical to SONIC's local_dir_hist policy group:
+        # gravity, angular velocity, joint position/velocity, then actions.
+        # The flattened history is term-major, so ordering is part of the
+        # checkpoint ABI even though the total width remains 930.
         gravity_dir:
           func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_projected_gravity
           params: {command_name: motion}
           history_length: 10
+          noise:
+            _target_: unilab.managers._noise.UniformNoiseCfg
+            n_min: -0.05
+            n_max: 0.05
+        base_ang_vel:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_base_ang_vel
+          params: {command_name: motion}
+          history_length: 10
+          noise:
+            _target_: unilab.managers._noise.UniformNoiseCfg
+            n_min: -0.2
+            n_max: 0.2
+        joint_pos:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_joint_pos_rel
+          params: {command_name: motion}
+          history_length: 10
+          noise:
+            _target_: unilab.managers._noise.UniformNoiseCfg
+            n_min: -0.01
+            n_max: 0.01
+        joint_vel:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_joint_vel_rel
+          params: {command_name: motion}
+          history_length: 10
+          noise:
+            _target_: unilab.managers._noise.UniformNoiseCfg
+            n_min: -0.5
+            n_max: 0.5
+        actions:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_last_action
+          history_length: 10
     critic:
       terms:
-        command: null
+        # Privileged SONIC critic order (command first) is also ABI-significant.
+        future_command:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_future_command
+          params: {command_name: motion}
         motion_anchor_pos_b:
           func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.motion_anchor_pos_b
           params: {command_name: motion}
         motion_anchor_ori_b:
           func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.motion_anchor_ori_b
+          params: {command_name: motion}
+        body_pos:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.robot_body_pos_b
+          params: {command_name: motion}
+        body_ori:
+          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.robot_body_ori_b
           params: {command_name: motion}
         base_lin_vel:
           func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_base_lin_vel
@@ -156,15 +182,6 @@ env:
         actions:
           func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_last_action
           history_length: 10
-        body_pos:
-          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.robot_body_pos_b
-          params: {command_name: motion}
-        body_ori:
-          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.robot_body_ori_b
-          params: {command_name: motion}
-        future_command:
-          func: unilab.tasks.motion_tracking.g1.sonic.observation_terms.sonic_future_command
-          params: {command_name: motion}
     tokenizer:
       # This group is deliberately not exported through NpEnvState.obs.  The
       # SONIC command publishes it through its typed tokenizer provider.
@@ -250,7 +267,8 @@ env:
       params:
         _target_: unilab.tasks.motion_tracking.g1.sonic.manager_terms.SonicMotionCommandParamsCfg
         motion_file: ${oc.env:SONIC_MOTION_MANIFEST,/data/hdd/home/caozx/ws/datasets/bones-seed/g1_sonic_motion_store_benchmark100/manifest.json}
-        anchor_body_name: torso_link
+        # SONIC release uses pelvis as the motion anchor (not torso_link).
+        anchor_body_name: pelvis
         body_names:
           - pelvis
           - left_hip_roll_link
