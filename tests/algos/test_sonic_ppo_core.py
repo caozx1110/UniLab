@@ -3,7 +3,9 @@ from __future__ import annotations
 import pytest
 import torch
 
+from unilab.algos.torch.sonic_ppo.algorithm import SonicPPO
 from unilab.algos.torch.sonic_ppo.model import SonicActorCritic
+from unilab.algos.torch.sonic_ppo.storage import SonicRolloutStorage
 
 
 def test_value_is_critic_only_and_matches_distribution_value(
@@ -28,3 +30,36 @@ def test_value_is_critic_only_and_matches_distribution_value(
         lambda _tokens: pytest.fail("critic-only value must not call tokenizer"),
     )
     assert torch.allclose(model.value(critic), distribution_value)
+
+
+def test_storage_compute_returns_and_ppo_update() -> None:
+    model = SonicActorCritic(
+        actor_obs_dim=4,
+        critic_obs_dim=5,
+        tokenizer_obs_dim=6,
+        action_dim=2,
+        hidden_dims=(8,),
+        tokenizer_hidden_dim=8,
+    )
+    storage = SonicRolloutStorage(2, 3, 4, 5, 6, 2)
+    for _ in range(2):
+        actor = torch.randn(3, 4)
+        critic = torch.randn(3, 5)
+        tokens = torch.randn(3, 6)
+        distribution, values = model.distribution(actor, critic, tokens)
+        actions = distribution.sample()
+        storage.add(
+            actor,
+            critic,
+            tokens,
+            actions,
+            torch.randn(3),
+            torch.zeros(3),
+            values,
+            distribution.log_prob(actions).sum(-1),
+            distribution.mean,
+            distribution.stddev,
+        )
+    storage.compute_returns(torch.zeros(3))
+    metrics = SonicPPO(model, num_learning_epochs=1, num_mini_batches=1).update(storage)
+    assert metrics.keys() >= {"loss", "value_loss", "policy_loss"}
