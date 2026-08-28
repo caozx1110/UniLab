@@ -9,8 +9,9 @@ second learner protocol.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
-from typing import Protocol
+from typing import Any, Protocol
 
 import numpy as np
 import torch
@@ -95,6 +96,9 @@ class SonicManagerPPORunner:
             self.device,
         )
         self.current_learning_iteration = 0
+        self._actor_obs: torch.Tensor | None = None
+        self._critic_obs: torch.Tensor | None = None
+        self._tokenizer_obs: torch.Tensor | None = None
 
     def _reset_state(self) -> NpEnvState:
         self.env.reset()
@@ -105,9 +109,50 @@ class SonicManagerPPORunner:
 
     def _batch_to_torch(self, batch: SonicObservationBatch) -> tuple[torch.Tensor, ...]:
         return tuple(
-            torch.as_tensor(value, device=self.device, dtype=torch.float32).clone()
+            torch.as_tensor(value, device=self.device, dtype=torch.float32)
             for value in (batch.actor, batch.critic, batch.tokenizer)
         )
+
+    def _synchronize_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def reset_rollout_state(self) -> None:
+        """Reset the ordinary environment lifecycle before the next iteration."""
+
+        state = self._reset_state()
+        batch = self.observation_adapter.adapt(state)
+        self._actor_obs, self._critic_obs, self._tokenizer_obs = self._batch_to_torch(batch)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Return the checkpointed learner state at an iteration boundary."""
+
+        if self.storage.step != 0:
+            raise RuntimeError(
+                "SONIC checkpoints require an empty rollout at an iteration boundary"
+            )
+        return {
+            "model": self.model.state_dict(),
+            "algorithm": self.algorithm.state_dict(),
+            "iteration": self.current_learning_iteration,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any]) -> None:
+        """Restore model, optimizer, and completed iteration count."""
+
+        model_state = state.get("model")
+        algorithm_state = state.get("algorithm")
+        if not isinstance(model_state, Mapping) or not isinstance(algorithm_state, Mapping):
+            raise ValueError("SONIC checkpoint requires model and algorithm mappings")
+        self.model.load_state_dict(model_state, strict=True)
+        self.algorithm.load_state_dict(algorithm_state)
+        self.current_learning_iteration = int(state.get("iteration", 0))
+        self.storage.clear()
+        # Simulator and observation histories are intentionally reconstructed
+        # through their existing reset lifecycle after a warm-start restore.
+        self._actor_obs = None
+        self._critic_obs = None
+        self._tokenizer_obs = None
 
     def _timeout_correction(
         self,
@@ -118,7 +163,9 @@ class SonicManagerPPORunner:
             state.terminated, dtype=bool
         ).reshape(-1)
         if timeout.shape != (self.num_envs,):
-            raise ValueError(f"SONIC timeout mask expects {self.num_envs} values, got {timeout.shape}")
+            raise ValueError(
+                f"SONIC timeout mask expects {self.num_envs} values, got {timeout.shape}"
+            )
         correction = torch.zeros(self.num_envs, device=self.device, dtype=current_values.dtype)
         if not np.any(timeout):
             return correction
@@ -129,7 +176,8 @@ class SonicManagerPPORunner:
             final_critic = info_final.get("critic") if isinstance(info_final, Mapping) else None
         if final_critic is None:
             correction[torch.as_tensor(timeout, device=self.device)] = (
-                self.algorithm.gamma * current_values.detach()[torch.as_tensor(timeout, device=self.device)]
+                self.algorithm.gamma
+                * current_values.detach()[torch.as_tensor(timeout, device=self.device)]
             )
             return correction
         rows = np.flatnonzero(timeout)
@@ -141,18 +189,29 @@ class SonicManagerPPORunner:
         elif values.shape[0] != len(rows):
             raise ValueError("SONIC timeout final critic rows do not match timeout mask")
         with torch.no_grad():
-            bootstrap = self.model.value(torch.as_tensor(values, device=self.device, dtype=torch.float32))
-        correction[torch.as_tensor(rows, device=self.device)] = self.algorithm.gamma * bootstrap.detach()
+            bootstrap = self.model.value(
+                torch.as_tensor(values, device=self.device, dtype=torch.float32)
+            )
+        correction[torch.as_tensor(rows, device=self.device)] = (
+            self.algorithm.gamma * bootstrap.detach()
+        )
         return correction
 
     def learn(self, num_learning_iterations: int = 1) -> dict[str, float]:
         if num_learning_iterations < 1:
             raise ValueError("SONIC manager runner requires at least one learning iteration")
-        state = self._reset_state()
-        batch = self.observation_adapter.adapt(state)
-        actor_obs, critic_obs, tokenizer_obs = self._batch_to_torch(batch)
+        if self._actor_obs is None:
+            self.reset_rollout_state()
+        actor_obs = self._actor_obs
+        critic_obs = self._critic_obs
+        tokenizer_obs = self._tokenizer_obs
+        assert actor_obs is not None and critic_obs is not None and tokenizer_obs is not None
         metrics: dict[str, float] = {}
         for _ in range(int(num_learning_iterations)):
+            self._synchronize_device()
+            iteration_start = time.perf_counter()
+            collection_start = iteration_start
+            env_step_seconds = 0.0
             self.model.eval()
             with torch.no_grad():
                 for _step in range(self.horizon):
@@ -166,15 +225,20 @@ class SonicManagerPPORunner:
                     )
                     action = distribution.sample()
                     log_prob = distribution.log_prob(action).sum(-1)
+                    env_step_start = time.perf_counter()
                     state = self.env.step(action.detach().cpu().numpy())
+                    env_step_seconds += time.perf_counter() - env_step_start
                     if not isinstance(state, NpEnvState):
                         raise TypeError("SONIC manager environment step must return NpEnvState")
-                    rewards = torch.as_tensor(state.reward, device=self.device, dtype=torch.float32).reshape(-1)
+                    rewards = torch.as_tensor(
+                        state.reward, device=self.device, dtype=torch.float32
+                    ).reshape(-1)
                     if rewards.shape != (self.num_envs,):
                         raise ValueError("SONIC manager rewards must be a (num_envs,) vector")
                     rewards = rewards + self._timeout_correction(state, values)
                     dones = torch.as_tensor(
-                        np.asarray(state.terminated, dtype=bool) | np.asarray(state.truncated, dtype=bool),
+                        np.asarray(state.terminated, dtype=bool)
+                        | np.asarray(state.truncated, dtype=bool),
                         device=self.device,
                     )
                     self.storage.add(
@@ -193,10 +257,32 @@ class SonicManagerPPORunner:
                     actor_obs, critic_obs, tokenizer_obs = self._batch_to_torch(next_batch)
                 with torch.no_grad():
                     last_values = self.model.value(critic_obs)
+            self._synchronize_device()
+            collection_seconds = time.perf_counter() - collection_start
+            learning_start = time.perf_counter()
             self.storage.compute_returns(last_values, self.algorithm.gamma, self.algorithm.lam)
             self.model.train()
             metrics = self.algorithm.update(self.storage)
+            self._synchronize_device()
+            learning_seconds = time.perf_counter() - learning_start
             self.current_learning_iteration += 1
+            iteration_seconds = time.perf_counter() - iteration_start
+            transitions = self.num_envs * self.horizon
+            metrics.update(
+                {
+                    "time/collection_s": collection_seconds,
+                    "time/env_step_s": env_step_seconds,
+                    "time/learning_s": learning_seconds,
+                    "time/iteration_s": iteration_seconds,
+                    "throughput/collection_env_steps_s": transitions
+                    / max(collection_seconds, 1.0e-12),
+                    "throughput/iteration_env_steps_s": transitions
+                    / max(iteration_seconds, 1.0e-12),
+                }
+            )
+        self._actor_obs = actor_obs
+        self._critic_obs = critic_obs
+        self._tokenizer_obs = tokenizer_obs
         return metrics
 
 
