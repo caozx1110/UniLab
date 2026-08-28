@@ -1,0 +1,100 @@
+# Configuration-only SONIC v1 release profile.
+#
+# Values below are transcribed from
+# gear_sonic/config/exp/manager/universal_token/all_modes/sonic_release.yaml
+# at GR00T-WholeBodyControl revision c374bae5.  ``algo.num_envs`` is per
+# process in UniLab's torchrun launcher; therefore global rollout transitions
+# are ``world_size * algo.num_envs * algo.num_steps_per_env``.  Either value
+# can be overridden from the command line without changing the task contract.
+defaults:
+  - task: sonic_g1_tracking/mujoco
+  - _self_
+
+algo:
+  algo: sonic_ppo
+  algo_log_name: sonic_ppo
+  seed: 1
+  num_envs: 4096
+  num_steps_per_env: 24
+  max_iterations: 100000
+  save_interval: 500
+  empirical_normalization: false
+  obs_groups:
+    actor: [actor]
+  actor_obs_dim: 930
+  critic_obs_dim: 1645
+  tokenizer_obs_dim: 1761
+  action_dim: 29
+  model_profile: sonic_release
+  # null delegates to SonicActorCritic's named release architecture:
+  # encoders [2048,1024,512,512], g1_dyn [2048,2048,1024,1024,512,512],
+  # g1_kin [2048,1024,512,512], critic [2048,2048,1024,1024,512,512].
+  actor_hidden_dims: null
+  critic_hidden_dims: null
+  tokenizer_hidden_dim: 512
+  init_noise_std: 0.05
+  std_clamp_min: 0.001
+  std_clamp_max: 0.5
+  gamma: 0.99
+  lam: 0.95
+  clip_param: 0.2
+  value_loss_coef: 1.0
+  entropy_coef: 0.01
+  max_grad_norm: 0.1
+  num_learning_epochs: 5
+  num_mini_batches: 4
+  # Official release has separate actor=2e-5 and critic=1e-3 rates.  The
+  # current config-first SonicPPO owner exposes one optimizer LR, so retain
+  # the actor rate here and record the limitation explicitly.
+  learning_rate: 2.0e-5
+  actor_learning_rate: 2.0e-5
+  critic_learning_rate: 1.0e-3
+  schedule: adaptive
+  desired_kl: 0.01
+  adaptive_lr_min: 1.0e-5
+  adaptive_lr_max: 2.0e-4
+  use_clipped_value_loss: true
+  use_amp: true
+  amp_dtype: bf16
+  distributed_gradient_overlap: true
+  ddp_bucket_cap_mb: 25
+  optimizer_step_per_microbatch: true
+  aux_loss_coef:
+    g1_recon: 0.01
+    g1_smpl_latent: 1.0
+    g1_teleop_latent: 1.0
+    teleop_smpl_latent: 1.0
+    reencoded_smpl_g1_latent: 1.0
+
+training:
+  task_name: SonicG1Tracking
+  devices: null
+  device: null
+  logger: tensorboard
+  wandb_project: unilab
+  play_only: false
+  no_play: true
+  torch_num_threads: 2
+  torch_num_interop_threads: 1
+  log_root: null
+  log_dir: null
+  resume: null
+
+env:
+  commands:
+    motion:
+      params:
+        # Full Bones-Seed is 50 Hz, satisfying both 0.1 s G1 and 0.02 s SMPL
+        # future-frame contracts.  The path is intentionally external data.
+        motion_file: /data/hdd/home/caozx/ws/datasets/bones-seed/sonic_motion_store_full/manifest.json
+        motion_optional_fields: [smpl_joints, smpl_root_quat_w]
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  job:
+    chdir: false
+  job_logging:
+    root:
+      handlers: [console]

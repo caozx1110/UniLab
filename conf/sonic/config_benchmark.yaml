@@ -1,0 +1,22 @@
+# Small, repeatable 50 Hz SONIC release benchmark profile.
+# The subset contains eight symlinked full-dataset clips and is generated
+# outside the repository at sonic_motion_store_full_subset8/manifest.json.
+defaults:
+  - config_release
+  - _self_
+
+algo:
+  num_envs: 2
+  num_steps_per_env: 8
+  max_iterations: 1
+  save_interval: 1
+
+env:
+  commands:
+    motion:
+      params:
+        motion_file: /data/hdd/home/caozx/ws/datasets/bones-seed/sonic_motion_store_full_subset8/manifest.json
+
+training:
+  no_play: true
+
