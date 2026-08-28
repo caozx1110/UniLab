@@ -39,3 +39,17 @@ def test_sonic_release_uses_bounded_full_manifest_motion_cache() -> None:
     assert params.motion_cache_size == 4096
     assert params.motion_cache_max_size == 4096
     assert params.motion_cache_max_bytes == 4 * 1024**3
+
+
+def test_sonic_benchmark_keeps_conservative_motion_cache() -> None:
+    GlobalHydra.instance().clear()
+    with initialize_config_dir(config_dir=str(CONF_DIR), version_base="1.3"):
+        cfg = compose(
+            "config_benchmark",
+            overrides=["task=sonic_g1_tracking/mujoco"],
+        )
+
+    params = cfg.env.commands.motion.params
+    assert params.motion_cache_size == "auto"
+    assert params.motion_cache_max_size == 128
+    assert params.motion_cache_max_bytes == 512 * 1024**2

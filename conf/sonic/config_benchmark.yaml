@@ -16,7 +16,12 @@ env:
     motion:
       params:
         motion_file: /data/hdd/home/caozx/ws/datasets/bones-seed/sonic_motion_store_full_subset8/manifest.json
+        # Keep the repeatable benchmark's resident set small; the full
+        # release profile overrides these owner limits for its measured
+        # 3,618-clip working set.
+        motion_cache_size: auto
+        motion_cache_max_size: 128
+        motion_cache_max_bytes: 536870912
 
 training:
   no_play: true
-
