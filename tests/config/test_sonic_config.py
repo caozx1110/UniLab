@@ -38,4 +38,4 @@ def test_sonic_release_uses_bounded_full_manifest_motion_cache() -> None:
     params = cfg.env.commands.motion.params
     assert params.motion_cache_size == 4096
     assert params.motion_cache_max_size == 4096
-    assert params.motion_cache_max_bytes == 2 * 1024**3
+    assert params.motion_cache_max_bytes == 4 * 1024**3

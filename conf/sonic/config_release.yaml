@@ -91,16 +91,17 @@ env:
         motion_file: /data/hdd/home/caozx/ws/datasets/bones-seed/sonic_motion_store_full/manifest.json
         motion_optional_fields: [smpl_joints, smpl_root_quat_w]
         # Full Bones-Seed profiling (4096 envs/rank, 50 Hz) observes about
-        # 3,618 unique clips and 1.26 GiB of decoded fields in the active
-        # working set.  The release policy therefore uses a *fixed* 4,096
-        # entry/2 GiB budget: large enough to keep that set resident (and
-        # avoid re-opening compressed NPZ files every rollout), but still a
-        # per-rank, explicitly bounded CPU-memory reservation.  This is not
-        # derived from an unbounded environment count; benchmark config keeps
-        # the conservative 128-entry/512 MiB policy below.
+        # 3,618 unique clips and 2.18--2.21 GiB of decoded all-field data in
+        # the active working set.  The release policy therefore uses a fixed
+        # 4,096-entry/4 GiB budget: large enough to keep required + optional
+        # fields resident (and avoid re-opening compressed NPZ files every
+        # rollout), but still an explicitly bounded per-rank CPU-memory
+        # reservation.  This is not derived from an unbounded environment
+        # count; benchmark config keeps the conservative 128-entry/512 MiB
+        # policy below.
         motion_cache_size: 4096
         motion_cache_max_size: 4096
-        motion_cache_max_bytes: 2147483648
+        motion_cache_max_bytes: 4294967296
 
 hydra:
   run:
