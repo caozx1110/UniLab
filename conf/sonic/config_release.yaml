@@ -88,6 +88,12 @@ env:
         # future-frame contracts.  The path is intentionally external data.
         motion_file: /data/hdd/home/caozx/ws/datasets/bones-seed/sonic_motion_store_full/manifest.json
         motion_optional_fields: [smpl_joints, smpl_root_quat_w]
+        # Keep one active clip per environment up to a fixed per-rank bound;
+        # the byte cap prevents unusually long clips from growing the resident
+        # set beyond the owner contract.
+        motion_cache_size: auto
+        motion_cache_max_size: 128
+        motion_cache_max_bytes: 536870912
 
 hydra:
   run:

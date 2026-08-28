@@ -482,6 +482,7 @@ class UniversalToken(nn.Module):
                 "g1_has_teleop": masks["teleop"][masks["g1"]],
                 "teleop_has_g1": masks["g1"][masks["teleop"]],
                 "teleop_has_smpl": masks["smpl"][masks["teleop"]],
+                "smpl_has_g1": masks["g1"][masks["smpl"]],
                 "smpl_has_teleop": masks["teleop"][masks["smpl"]],
             }
         )
@@ -629,7 +630,9 @@ class UniversalToken(nn.Module):
         cycle_input = reconstruction.reshape(
             -1, reconstruction.shape[-2] * reconstruction.shape[-1]
         )
-        reencoded_smpl_g1 = self.encoders["g1"](cycle_input[masks["smpl"]]).reshape(
+        reencoded_smpl_g1 = self.encoders["g1"](
+            cycle_input[masks["smpl"]][masks["smpl_has_g1"]]
+        ).reshape(
             -1, self.num_tokens, self.token_dim
         )
 
@@ -637,7 +640,7 @@ class UniversalToken(nn.Module):
             "g1_recon": F.mse_loss(reconstruction, reconstruction_target),
             "g1_smpl_latent": self._paired_mse(
                 g1_smpl,
-                latents["smpl"],
+                latents["smpl"][masks["smpl_has_g1"]],
                 name="g1_smpl_latent",
             ),
             "g1_teleop_latent": self._paired_mse(

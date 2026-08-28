@@ -530,14 +530,21 @@ class BoundedLazySonicMotionLoader:
                 # fit the byte budget.  Keep the old entry in that case so the
                 # resident cache remains bounded; ``merged`` is a transient
                 # miss result and is released after the caller's gather.
-                if merged.nbytes <= self.cache_max_bytes:
+                total_without_clip = self._cached_bytes - cached.nbytes
+                if (
+                    merged.nbytes <= self.cache_max_bytes
+                    and total_without_clip + merged.nbytes <= self.cache_max_bytes
+                ):
                     cached = merged
                     self._cache[clip_index] = cached
                     self._cached_bytes += decoded.nbytes
                     self._peak_cached_bytes = max(self._peak_cached_bytes, self._cached_bytes)
                 else:
+                    # Retain the smaller old entry.  The merged result is
+                    # returned only for this gather and is not published.
                     cached = merged
-            self._cache.move_to_end(clip_index)
+            if clip_index in self._cache:
+                self._cache.move_to_end(clip_index)
             return cached
         decoded = self._decode_clip(clip_index, fields)
         self._loaded_clip_count += 1

@@ -253,6 +253,24 @@ def test_explicit_cache_size_must_fit_owner_ceiling(tmp_path: Path) -> None:
         _loader(manifest, cache_size=9, cache_max_size=8)
 
 
+def test_byte_budget_applies_when_optional_fields_extend_cached_clip(tmp_path: Path) -> None:
+    manifest = _write_store(tmp_path, clip_lengths=(2,))
+    loader = _loader(manifest, cache_size=2, cache_max_bytes=100)
+
+    loader.gather_fields(("joint_pos",), np.asarray([0], dtype=np.int32))
+    required_bytes = loader.cached_bytes
+    assert required_bytes > 0
+
+    loader.gather_fields(
+        ("joint_pos", "smpl_joints", "smpl_root_quat_w"),
+        np.asarray([0], dtype=np.int32),
+    )
+    # The optional fields are returned for this gather, but their merged clip
+    # is not retained because it exceeds the owner byte budget.
+    assert loader.cached_bytes == required_bytes
+    assert loader.peak_cached_bytes == required_bytes
+
+
 def test_zero_cache_mode_never_retains_a_decoded_clip(tmp_path: Path) -> None:
     loader = _loader(_write_store(tmp_path, clip_lengths=(2,)), cache_size=0)
     indices = np.asarray([0], dtype=np.int32)
