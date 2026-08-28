@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from unilab.algos.torch.sonic_ppo.algorithm import SonicPPO
+from unilab.algos.torch.sonic_ppo.checkpoint import map_official_sonic_release_model_state
 from unilab.algos.torch.sonic_ppo.model import SonicActorCritic
 from unilab.algos.torch.sonic_ppo.storage import SonicRolloutStorage
 
@@ -63,3 +64,17 @@ def test_storage_compute_returns_and_ppo_update() -> None:
     storage.compute_returns(torch.zeros(3))
     metrics = SonicPPO(model, num_learning_epochs=1, num_mini_batches=1).update(storage)
     assert metrics.keys() >= {"loss", "value_loss", "policy_loss"}
+
+
+def test_checkpoint_mapper_preserves_policy_and_critic_ownership() -> None:
+    g1_weight = torch.randn(2, 3)
+    critic_bias = torch.randn(1)
+    mapped = map_official_sonic_release_model_state(
+        {
+            "policy_state_dict": {"actor_module.encoders.g1.module.0.weight": g1_weight},
+            "value_state_dict": {"critic_module.module.0.bias": critic_bias},
+        }
+    )
+    assert set(mapped) == {"tokenizer.encoders.g1.0.weight", "critic.0.bias"}
+    assert mapped["tokenizer.encoders.g1.0.weight"] is g1_weight
+    assert mapped["critic.0.bias"] is critic_bias
