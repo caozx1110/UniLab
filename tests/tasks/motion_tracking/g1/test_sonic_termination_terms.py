@@ -23,6 +23,7 @@ def _env() -> tuple[SimpleNamespace, SimpleNamespace]:
     command.cfg = SimpleNamespace(body_names=names)
     command.anchor_pos_w = np.asarray([[0, 0, 1.0], [0, 0, 0.4], [0, 0, 1.0]], dtype=np.float32)
     command.reference_anchor_height = np.asarray([1.0, 0.4, 1.0], dtype=np.float32)
+    command.running_ref_root_height = command.reference_anchor_height.copy()
     command.robot_anchor_pos_w = command.anchor_pos_w.copy()
     command.robot_anchor_pos_w[:, 2] -= np.asarray([0.1, -0.6, 0.0], dtype=np.float32)
     command.anchor_quat_w = np.tile(np.asarray([1, 0, 0, 0], dtype=np.float32), (num_envs, 1))
@@ -47,6 +48,14 @@ def test_release_anchor_height_adaptive_thresholds(monkeypatch: pytest.MonkeyPat
         env, "motion", threshold=0.15, threshold_adaptive=True, down_threshold=0.75, root_height_threshold=0.5
     )
     np.testing.assert_array_equal(result, [False, False, False])
+    command.reference_anchor_height[0] = 0.4
+    command.robot_anchor_pos_w[0, 2] = 0.7
+    np.testing.assert_array_equal(
+        sonic_anchor_height_adaptive(
+            env, "motion", threshold=0.15, threshold_adaptive=True, down_threshold=0.75, root_height_threshold=0.5
+        ),
+        [True, False, False],
+    )
     command.robot_anchor_pos_w[0, 2] = 0.7
     np.testing.assert_array_equal(
         sonic_anchor_height_adaptive(

@@ -206,6 +206,8 @@ class MotionCommand(CommandTerm):
         self._robot_body_quat_w = np.empty((self.num_envs, num_bodies, 4), dtype=dtype)
         self._robot_body_lin_vel_w = np.empty_like(self._body_pos_w)
         self._robot_body_ang_vel_w = np.empty_like(self._body_pos_w)
+        self.running_ref_root_height = np.empty(self.num_envs, dtype=dtype)
+        self._running_ref_root_height_delta = np.empty_like(self.running_ref_root_height)
 
         for name in (
             "error_anchor_pos",
@@ -224,6 +226,7 @@ class MotionCommand(CommandTerm):
         ):
             self.metrics[name] = np.zeros(self.num_envs, dtype=dtype)
         self._refresh_motion()
+        np.copyto(self.running_ref_root_height, self.anchor_pos_w[:, 2])
         self._refresh_robot_state(force=True)
         # Configure and compile both fused kernels on the cold path so the first
         # measured manager step contains no Numba worker/JIT initialization.
@@ -377,7 +380,9 @@ class MotionCommand(CommandTerm):
         self.joint_default_bias[ids] = self._env.rng.uniform(
             lower, upper, size=(len(ids), self.motion.num_joints)
         )
-        return super().reset(ids)
+        extras = super().reset(ids)
+        np.copyto(self.running_ref_root_height[ids], self.anchor_pos_w[ids, 2])
+        return extras
 
     def _refresh_motion(self, env_ids: np.ndarray | None = None) -> None:
         """Refresh motion-reference buffers from the current frame indices.
@@ -587,6 +592,17 @@ class MotionCommand(CommandTerm):
         if len(wrap_ids) and not self.cfg.params.truncate_on_clip_end:
             self._resample_command(wrap_ids)
         self._refresh_motion()
+        np.subtract(
+            self.anchor_pos_w[:, 2],
+            self.running_ref_root_height,
+            out=self._running_ref_root_height_delta,
+        )
+        np.multiply(self._running_ref_root_height_delta, 0.1, out=self._running_ref_root_height_delta)
+        np.add(
+            self.running_ref_root_height,
+            self._running_ref_root_height_delta,
+            out=self.running_ref_root_height,
+        )
 
     def post_compute(self) -> None:
         # On the reset path only the reset rows changed (via the committed

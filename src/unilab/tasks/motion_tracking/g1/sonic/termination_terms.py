@@ -60,9 +60,11 @@ def sonic_anchor_height_adaptive(
     root_value = _threshold(root_height_threshold, name="anchor height root_height_threshold")
     error = np.abs(command.anchor_pos_w[:, 2] - command.robot_anchor_pos_w[:, 2])
     if threshold_adaptive:
-        # ``reference_anchor_height`` is motion-local (without env-origin
-        # offsets), equivalent to the release command's running root height.
-        limit = np.where(command.reference_anchor_height < root_value, down_value, threshold_value)
+        limit = np.where(
+            command.running_ref_root_height < root_value,
+            down_value,
+            threshold_value,
+        )
     else:
         limit = threshold_value
     return error > limit
@@ -128,7 +130,7 @@ class sonic_body_height_adaptive(ManagerTermBase):
         )
         if threshold_adaptive:
             limit = np.where(
-                command.reference_anchor_height[:, None] < root_value,
+                command.running_ref_root_height[:, None] < root_value,
                 down_value,
                 threshold_value,
             )
