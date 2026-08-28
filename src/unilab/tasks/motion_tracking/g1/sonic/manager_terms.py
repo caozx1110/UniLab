@@ -437,6 +437,10 @@ class SonicMotionCommandParamsCfg(MotionCommandParamsCfg):
     motion_rank: int = 0
     motion_world_size: int = 1
     motion_shard_clips: bool = False
+    # Optional fixed-layout Numba tokenizer assembly.  NumPy assembly remains
+    # the default because it is the reference path and preserves the public
+    # term contract for existing experiments.
+    use_numba_observation_assembly: bool = False
 
 
 @dataclass(kw_only=True)
@@ -478,6 +482,18 @@ class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
         # policy order (the inverse mapping is used by the action term).
         self._policy_to_joint = np.asarray(SONIC_POLICY_TO_JOINT, dtype=np.intp)
         self._policy_to_joint.setflags(write=False)
+        try:
+            vr_indices = [self.cfg.body_names.index(name) for name in (
+                "left_wrist_yaw_link",
+                "right_wrist_yaw_link",
+                "torso_link",
+            )]
+        except ValueError as exc:
+            raise ValueError(
+                "SONIC motion command body_names must include the three VR bodies"
+            ) from exc
+        self._vr_body_indices = np.asarray(vr_indices, dtype=np.intp)
+        self._vr_body_indices.setflags(write=False)
         self._future_offsets = self._future_frame_offsets(
             cfg.params.num_future_frames,
             cfg.params.dt_future_ref_frames,
@@ -506,6 +522,14 @@ class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
         self._encoder_index[:, 0] = 1.0
         self._tokenizer_cache = SonicTokenizerObservationCache(
             self.num_envs, dtype=self.motion.joint_pos.dtype
+        )
+        self._use_numba_observation_assembly = bool(
+            cfg.params.use_numba_observation_assembly
+        )
+        self._tokenizer_assembly_buffer = (
+            np.empty((self.num_envs, 1761), dtype=self.motion.joint_pos.dtype)
+            if self._use_numba_observation_assembly
+            else None
         )
         self._observation_update_env_ids: np.ndarray | None = None
         self._future_reference_cache: Any | None = None
@@ -554,12 +578,34 @@ class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
             raise ValueError("SONIC teleop_sample_prob_when_smpl must be within [0, 1]")
         if not isinstance(params.tokenizer_enable_corruption, bool):
             raise TypeError("SONIC tokenizer_enable_corruption must be bool")
+        if not isinstance(params.use_numba_observation_assembly, bool):
+            raise TypeError("SONIC use_numba_observation_assembly must be bool")
 
     @property
     def policy_to_joint(self) -> np.ndarray:
         """Immutable policy-column to canonical joint-column mapping."""
 
         return self._policy_to_joint
+
+    @property
+    def vr_body_indices(self) -> np.ndarray:
+        """Fixed dataset body columns used by the release VR targets."""
+
+        return self._vr_body_indices
+
+    @property
+    def use_numba_observation_assembly(self) -> bool:
+        """Whether the opt-in fixed-layout tokenizer kernel is enabled."""
+
+        return self._use_numba_observation_assembly
+
+    @property
+    def tokenizer_assembly_buffer(self) -> np.ndarray:
+        """Owner-owned output buffer used by the optional Numba assembler."""
+
+        if self._tokenizer_assembly_buffer is None:
+            raise RuntimeError("SONIC Numba tokenizer assembly is not enabled")
+        return self._tokenizer_assembly_buffer
 
     @property
     def encoder_index(self) -> np.ndarray:

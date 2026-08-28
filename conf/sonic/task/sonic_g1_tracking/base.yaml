@@ -276,6 +276,9 @@ env:
         encoder_sample_probs: [1.0, 1.0, 1.0]
         teleop_sample_prob_when_smpl: 0.5
         tokenizer_enable_corruption: true
+        # Optional fixed-layout Numba tokenizer assembly; NumPy remains the
+        # reference default. Release config opts in after parity validation.
+        use_numba_observation_assembly: false
         use_lazy_motion_loader: true
         # Auto caches the per-rank active clip working set up to 128 clips;
         # override with an integer for a measured deployment-specific policy.

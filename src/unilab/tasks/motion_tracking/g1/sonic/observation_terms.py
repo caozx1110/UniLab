@@ -296,6 +296,47 @@ def _tokenizer_layout(
     command,
     reference: SonicFutureReference,
 ) -> np.ndarray:
+    if command.use_numba_observation_assembly:
+        from .numba_assembly import assemble_sonic_tokenizer_observations_kernel
+
+        rows = command.observation_update_env_ids
+        if rows is None:
+            rows = np.arange(command.num_envs, dtype=np.int32)
+        assemble_sonic_tokenizer_observations_kernel(
+            np.asarray(rows, dtype=np.int32),
+            command.encoder_index,
+            reference.joint_pos,
+            reference.joint_vel,
+            reference.body_pos_w,
+            reference.body_quat_w,
+            reference.smpl_joint_pos,
+            reference.smpl_joints,
+            reference.smpl_root_quat_w,
+            command.robot_anchor_quat_w,
+            command.anchor_body_idx,
+            command.vr_body_indices,
+            SONIC_LOWER_BODY_POLICY_INDICES,
+            SONIC_WRIST_POLICY_INDICES,
+            SONIC_VR_BODY_OFFSETS,
+            command.tokenizer_assembly_buffer,
+        )
+        output = command.tokenizer_assembly_buffer
+        if command.cfg.params.tokenizer_enable_corruption:
+            # Keep corruption on the task RNG (and therefore reproducible with
+            # the NumPy reference path). Numba only performs deterministic
+            # arithmetic; random draws are intentionally not delegated to its
+            # process-global RNG.
+            rows_slice = output if command.observation_update_env_ids is None else output[rows]
+            for offset, width in ((594, 6), (600, 60), (921, 720), (1641, 60)):
+                values = rows_slice[:, offset : offset + width]
+                noise = command._env.rng.uniform(-0.05, 0.05, size=values.shape).astype(
+                    values.dtype
+                )
+                values += noise
+                if command.observation_update_env_ids is not None:
+                    output[rows, offset : offset + width] = values
+        return output
+
     num_envs = command.num_envs
     # ``reference`` is already materialized by the critic's future-command
     # term in the normal manager group order.  The tokenizer layout only used
@@ -313,9 +354,7 @@ def _tokenizer_layout(
         ),
         axis=1,
     )
-    vr_rows = np.asarray(
-        [command.cfg.body_names.index(name) for name in SONIC_VR_BODY_NAMES], dtype=np.intp
-    )
+    vr_rows = command.vr_body_indices
     future_body_pos = reference.body_pos_w[:, 0, vr_rows]
     future_body_quat = reference.body_quat_w[:, 0, vr_rows]
     anchor_pos = reference.body_pos_w[:, 0, command.anchor_body_idx]
