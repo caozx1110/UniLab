@@ -25,6 +25,16 @@ from .manager_terms import (
     SonicMotionCommandParamsCfg,
     SonicMotionManifestError,
 )
+from .observation_terms import (
+    sonic_base_ang_vel,
+    sonic_base_lin_vel,
+    sonic_future_command,
+    sonic_joint_pos_rel,
+    sonic_joint_vel_rel,
+    sonic_last_action,
+    sonic_projected_gravity,
+    sonic_tokenizer_observation,
+)
 from .observations import (
     SonicManagerObservationAdapter,
     SonicObservationBatch,
@@ -55,6 +65,14 @@ __all__ = [
     "SonicObservationBatch",
     "SonicTokenizerObservationCache",
     "SonicTokenizerObservationProvider",
+    "sonic_base_ang_vel",
+    "sonic_base_lin_vel",
+    "sonic_future_command",
+    "sonic_joint_pos_rel",
+    "sonic_joint_vel_rel",
+    "sonic_last_action",
+    "sonic_projected_gravity",
+    "sonic_tokenizer_observation",
     "sonic_action_scale",
     "sonic_action_scale_by_joint",
 ]

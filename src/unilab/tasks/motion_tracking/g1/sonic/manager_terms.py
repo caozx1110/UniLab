@@ -25,6 +25,8 @@ from unilab.tasks.motion_tracking.common.manager_terms import (
 )
 from unilab.tasks.motion_tracking.common.motion_loader import MotionLoader
 
+from .observations import SonicTokenizerObservationCache, SonicTokenizerObservationProvider
+
 if TYPE_CHECKING:
     from unilab.managers._types import ManagerBasedRlEnv
 
@@ -405,7 +407,21 @@ class CompactSonicMotionLoader(MotionLoader):
 
 @dataclass
 class SonicMotionCommandParamsCfg(MotionCommandParamsCfg):
-    """SONIC parameters whose ``motion_file`` names a v1 manifest."""
+    """SONIC parameters whose ``motion_file`` names a v1 manifest.
+
+    The future sampling contract is deliberately attached to the motion
+    command instead of an observation term.  A command owns clip-local frame
+    state, so it is the only layer that can clamp reference frames without
+    either reopening a motion asset or relying on backend details.
+    """
+
+    num_future_frames: int = 10
+    dt_future_ref_frames: float = 0.1
+    smpl_num_future_frames: int = 10
+    smpl_dt_future_ref_frames: float = 0.02
+    encoder_sample_probs: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    teleop_sample_prob_when_smpl: float = 0.5
+    tokenizer_enable_corruption: bool = True
 
 
 @dataclass(kw_only=True)
@@ -418,10 +434,217 @@ class SonicMotionCommandCfg(MotionCommandCfg):
         return SonicMotionCommand(self, env)
 
 
-class SonicMotionCommand(MotionCommand):
-    """Motion command that separates dataset columns from backend body IDs."""
+class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
+    """SONIC motion owner with clip-local future and tokenizer state.
+
+    The public manager emits only actor and critic observations.  The release
+    PPO additionally needs a tokenizer input, so this command owns its cache
+    and implements :class:`SonicTokenizerObservationProvider`.  Observation
+    terms only assemble numeric values from this owner; no term reads an asset
+    or a private observation-manager buffer on the rollout path.
+    """
 
     cfg: SonicMotionCommandCfg  # pyright: ignore[reportIncompatibleVariableOverride]
+
+    def __init__(self, cfg: SonicMotionCommandCfg, env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        # Import here to avoid the package-level action/command import cycle.
+        # This is construction-only configuration binding, never a rollout
+        # path import or backend capability probe.
+        from .actions import SONIC_POLICY_TO_JOINT
+
+        if tuple(self.robot.joint_names) != SONIC_JOINT_ORDER:
+            raise ValueError(
+                "SONIC motion command requires Entity joint_names in canonical "
+                f"order {SONIC_JOINT_ORDER}, got {tuple(self.robot.joint_names)}"
+            )
+        self._policy_to_joint = np.asarray(SONIC_POLICY_TO_JOINT, dtype=np.intp)
+        self._policy_to_joint.setflags(write=False)
+        self._future_offsets = self._future_frame_offsets(
+            cfg.params.num_future_frames,
+            cfg.params.dt_future_ref_frames,
+            self.motion.fps,
+            name="G1",
+        )
+        # The Bones-Seed benchmark subset is 30 Hz and intentionally omits
+        # the SMPL root quaternion.  In that case SMPL observations are the
+        # documented zero reference, so do not reject an otherwise valid G1
+        # owner merely because 0.02 s is not an integral 30 Hz frame step.
+        if {"smpl_joints", "smpl_root_quat_w"}.issubset(self.motion.available_fields):
+            self._smpl_future_offsets = self._future_frame_offsets(
+                cfg.params.smpl_num_future_frames,
+                cfg.params.smpl_dt_future_ref_frames,
+                self.motion.fps,
+                name="SMPL",
+            )
+        else:
+            self._smpl_future_offsets = np.zeros(cfg.params.smpl_num_future_frames, dtype=np.int64)
+            self._smpl_future_offsets.setflags(write=False)
+        self._validate_encoder_sampling(cfg.params)
+        self._encoder_index = np.zeros((self.num_envs, 3), dtype=self.motion.joint_pos.dtype)
+        # A manager constructs observation terms before the first reset.  Keep
+        # that construction-only probe deterministic; normal encoder sampling
+        # happens in reset() using env.rng.
+        self._encoder_index[:, 0] = 1.0
+        self._tokenizer_cache = SonicTokenizerObservationCache(
+            self.num_envs, dtype=self.motion.joint_pos.dtype
+        )
+        self._observation_update_env_ids: np.ndarray | None = None
+        self._future_reference_cache: Any | None = None
+
+    @staticmethod
+    def _future_frame_offsets(
+        count: int,
+        spacing: float,
+        fps: int,
+        *,
+        name: str,
+    ) -> np.ndarray:
+        if isinstance(count, bool) or not isinstance(count, int) or count != 10:
+            raise ValueError(
+                f"SONIC {name} future count must be the release value 10, got {count!r}"
+            )
+        if isinstance(spacing, bool) or not isinstance(spacing, (int, float)):
+            raise TypeError(f"SONIC {name} future spacing must be a finite real number")
+        steps = float(spacing) * int(fps)
+        rounded = int(round(steps))
+        if not math.isfinite(steps) or rounded < 1 or not math.isclose(steps, rounded):
+            raise ValueError(
+                f"SONIC {name} future spacing={spacing} is not an integral positive frame "
+                f"interval at motion fps={fps}"
+            )
+        offsets = np.arange(count, dtype=np.int64) * rounded
+        offsets.setflags(write=False)
+        return offsets
+
+    @staticmethod
+    def _validate_encoder_sampling(params: SonicMotionCommandParamsCfg) -> None:
+        probabilities = np.asarray(params.encoder_sample_probs, dtype=np.float64)
+        if probabilities.shape != (3,) or not np.isfinite(probabilities).all():
+            raise ValueError("SONIC encoder_sample_probs must be three finite values")
+        if np.any(probabilities < 0.0) or float(probabilities.sum()) <= 0.0:
+            raise ValueError(
+                "SONIC encoder_sample_probs must have positive total non-negative mass"
+            )
+        probability = params.teleop_sample_prob_when_smpl
+        if (
+            isinstance(probability, bool)
+            or not isinstance(probability, (int, float))
+            or not math.isfinite(float(probability))
+            or not 0.0 <= float(probability) <= 1.0
+        ):
+            raise ValueError("SONIC teleop_sample_prob_when_smpl must be within [0, 1]")
+        if not isinstance(params.tokenizer_enable_corruption, bool):
+            raise TypeError("SONIC tokenizer_enable_corruption must be bool")
+
+    @property
+    def policy_to_joint(self) -> np.ndarray:
+        """Immutable policy-column to canonical joint-column mapping."""
+
+        return self._policy_to_joint
+
+    @property
+    def encoder_index(self) -> np.ndarray:
+        """Current task-owned release encoder selection mask, shape ``(N, 3)``."""
+
+        return self._encoder_index
+
+    @property
+    def future_offsets(self) -> np.ndarray:
+        """G1 future offsets in frames, owned by the command's motion fps."""
+
+        return self._future_offsets
+
+    @property
+    def smpl_future_offsets(self) -> np.ndarray:
+        """SMPL future offsets in frames, owned by the command's motion fps."""
+
+        return self._smpl_future_offsets
+
+    @property
+    def observation_update_env_ids(self) -> np.ndarray | None:
+        """Rows whose tokenizer cache is being refreshed, or ``None`` for all rows."""
+
+        return self._observation_update_env_ids
+
+    @property
+    def has_smpl_reference(self) -> bool:
+        """Whether both optional SMPL fields are provided by the materialized loader."""
+
+        return {"smpl_joints", "smpl_root_quat_w"}.issubset(self.motion.available_fields)
+
+    def future_frame_indices(self, *, smpl: bool = False) -> np.ndarray:
+        """Return clip-clamped future indices without touching motion storage."""
+
+        offsets = self._smpl_future_offsets if smpl else self._future_offsets
+        indices = self.time_steps[:, None].astype(np.int64, copy=False) + offsets[None, :]
+        return np.minimum(indices, self.sampler.current_clip_end_frames[:, None])
+
+    def get_future_reference_cache(self) -> Any | None:
+        """Return the current numeric future-reference cache for observation terms."""
+
+        return self._future_reference_cache
+
+    def set_future_reference_cache(self, value: Any) -> None:
+        """Publish one per-lifecycle numeric future-reference cache entry."""
+
+        self._future_reference_cache = value
+
+    def get_tokenizer_observations(self) -> np.ndarray:
+        """Return the task-owned current tokenizer observation batch."""
+
+        return self._tokenizer_cache.get_tokenizer_observations()
+
+    def write_tokenizer_observations(self, values: np.ndarray) -> None:
+        """Store a full or reset-row tokenizer batch through the typed cache."""
+
+        env_ids = self._observation_update_env_ids
+        if env_ids is None:
+            self._tokenizer_cache.write(values)
+        else:
+            self._tokenizer_cache.write(values[env_ids], env_ids=env_ids)
+
+    def _sample_encoder_indices(self, env_ids: np.ndarray) -> None:
+        if not len(env_ids):
+            return
+        probabilities = np.asarray(self.cfg.params.encoder_sample_probs, dtype=np.float64)
+        if not self.has_smpl_reference:
+            probabilities[2] = 0.0
+        if float(probabilities.sum()) <= 0.0:
+            raise ValueError("SONIC motion data has no available encoder sampling mass")
+        probabilities /= probabilities.sum()
+        choices = self._env.rng.choice(3, size=len(env_ids), p=probabilities)
+        self._encoder_index[env_ids] = 0.0
+        self._encoder_index[env_ids, choices] = 1.0
+        smpl_ids = env_ids[choices == 2]
+        if len(smpl_ids):
+            # Release training activates the paired G1 encoder for an SMPL
+            # sample and optionally the teleop encoder as a second positive.
+            self._encoder_index[smpl_ids, 0] = 1.0
+            teleop = (
+                self._env.rng.random(len(smpl_ids)) < self.cfg.params.teleop_sample_prob_when_smpl
+            )
+            self._encoder_index[smpl_ids[teleop], 1] = 1.0
+
+    def reset(self, env_ids: np.ndarray | slice | None) -> dict[str, float]:
+        extras = super().reset(env_ids)
+        if env_ids is None:
+            ids = np.arange(self.num_envs, dtype=np.int32)
+        elif isinstance(env_ids, slice):
+            ids = np.arange(self.num_envs, dtype=np.int32)[env_ids]
+        else:
+            ids = np.asarray(env_ids, dtype=np.int32)
+        self._sample_encoder_indices(ids)
+        self._observation_update_env_ids = ids
+        self._future_reference_cache = None
+        return extras
+
+    def _update_command(self, env_ids: np.ndarray | None) -> None:
+        super()._update_command(env_ids)
+        # Command frame state changes before observations are computed.  Clear
+        # only the numeric cache; assets stay materialized in the loader.
+        self._observation_update_env_ids = env_ids
+        self._future_reference_cache = None
 
     def _make_motion_loader(
         self,
