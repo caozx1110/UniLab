@@ -30,6 +30,7 @@ from unilab.algos.rsl_rl import (
 from unilab.algos.rsl_rl_runtime import resolve_rsl_rl_ppo_runtime
 from unilab.base.backend import RenderClosedError, materialize_scene_visual_override
 from unilab.base.backend.base import log_playback_plan
+from unilab.base.backend.process_device import configure_backend_process_device
 from unilab.base.config_adapter import BackendAdapter, create_env
 from unilab.base.run_control import RunComplete
 from unilab.ipc.dp_launcher import (
@@ -369,6 +370,7 @@ def main(cfg: DictConfig) -> None:
         default_device=get_default_device(),
     )
     print(f"[rank {rank}/{world_size}] Using device: {device}")
+    configure_backend_process_device(str(cfg.training.sim_backend), device)
 
     # Compute effective max_iterations (supports num_timesteps override)
     max_iterations = cfg.algo.max_iterations

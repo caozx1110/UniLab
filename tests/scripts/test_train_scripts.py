@@ -1014,6 +1014,7 @@ def _build_rsl_lifecycle_case(
     captured: dict[str, Any] = {
         "env_create": 0,
         "env_close": 0,
+        "events": [],
         "distributed": [],
         "summaries": [],
         "tracker_finish": 0,
@@ -1078,12 +1079,18 @@ def _build_rsl_lifecycle_case(
     monkeypatch.setattr(mod, "build_ppo_env_cfg_override", lambda _cfg: {})
     monkeypatch.setattr(mod, "get_default_device", lambda: "cpu")
     monkeypatch.setattr(mod, "resolve_rsl_rl_device", lambda **kwargs: "cpu")
+    monkeypatch.setattr(
+        mod,
+        "configure_backend_process_device",
+        lambda backend, device: captured["events"].append(("bind", backend, device)),
+    )
     monkeypatch.setattr(mod, "resolve_ppo_log_dir", lambda _cfg, world_size: str(tmp_path))
     monkeypatch.setattr(mod, "ExperimentTracker", FakeTracker)
 
     def create_env(*args: Any, **kwargs: Any) -> FakeEnv:
         del args, kwargs
         captured["env_create"] += 1
+        captured["events"].append(("create_env",))
         return FakeEnv()
 
     monkeypatch.setattr(mod, "create_env", create_env)
@@ -1105,6 +1112,18 @@ def _build_rsl_lifecycle_case(
 
     monkeypatch.setattr(mod, "play_rsl_rl", playback)
     return mod, cfg, captured, learn_exception
+
+
+def test_train_rsl_rl_binds_backend_before_env_creation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    mod, cfg, captured, _ = _build_rsl_lifecycle_case(monkeypatch, tmp_path, None)
+
+    assert mod.main.__wrapped__(cfg) is None
+    assert captured["events"][:2] == [
+        ("bind", "mujoco", "cpu"),
+        ("create_env",),
+    ]
 
 
 def test_train_rsl_rl_run_complete_closes_resources_and_skips_playback(
