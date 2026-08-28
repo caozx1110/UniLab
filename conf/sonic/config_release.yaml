@@ -45,9 +45,10 @@ algo:
   max_grad_norm: 0.1
   num_learning_epochs: 5
   num_mini_batches: 4
-  # Official release has separate actor=2e-5 and critic=1e-3 rates.  The
-  # current config-first SonicPPO owner exposes one optimizer LR, so retain
-  # the actor rate here and record the limitation explicitly.
+  # The upstream release config also contains critic_learning_rate=1e-3,
+  # but its TRL trainer binds the effective optimizer LR to actor_learning_rate
+  # (2e-5) and never reads the critic field.  Keep both fields as provenance;
+  # SonicPPO intentionally uses the effective single optimizer rate.
   learning_rate: 2.0e-5
   actor_learning_rate: 2.0e-5
   critic_learning_rate: 1.0e-3
