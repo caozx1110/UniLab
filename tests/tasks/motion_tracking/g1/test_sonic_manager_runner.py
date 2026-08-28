@@ -119,3 +119,32 @@ def test_manager_runner_rollout_timeout_bootstrap_and_ppo_update(
     assert metrics.keys() >= {"loss", "value_loss", "policy_loss"}
     assert runner.storage.rewards[0, 0].item() == pytest.approx(1.0 + 0.9 * 5.0)
     assert any(torch.all(values == 7.0) for values in value_inputs)
+
+
+def test_manager_runner_loads_nested_and_legacy_optimizer_checkpoint() -> None:
+    cache = SonicTokenizerObservationCache(2, dtype=np.float32)
+    runner = SonicManagerPPORunner(
+        _FakeManagerEnv(cache),
+        SonicManagerObservationAdapter(cache, num_envs=2),
+        model=SonicActorCritic(hidden_dims=(4,), tokenizer_hidden_dim=4, model_profile="dense_test"),
+        config={"num_learning_epochs": 1, "num_mini_batches": 1},
+        device="cpu",
+        horizon=2,
+    )
+    checkpoint = runner.state_dict()
+    nested_optimizer = checkpoint["algorithm"]["optimizer"]
+    nested_optimizer["param_groups"][0]["lr"] = 0.123
+    runner.algorithm.optimizer.param_groups[0]["lr"] = 0.456
+
+    runner.load_state_dict(checkpoint)
+    assert runner.algorithm.optimizer.param_groups[0]["lr"] == pytest.approx(0.123)
+
+    legacy_algorithm = dict(checkpoint["algorithm"])
+    legacy_optimizer = legacy_algorithm.pop("optimizer")
+    legacy_checkpoint = dict(checkpoint)
+    legacy_checkpoint["algorithm"] = legacy_algorithm
+    legacy_checkpoint["optimizer"] = legacy_optimizer
+    runner.algorithm.optimizer.param_groups[0]["lr"] = 0.456
+
+    runner.load_state_dict(legacy_checkpoint)
+    assert runner.algorithm.optimizer.param_groups[0]["lr"] == pytest.approx(0.123)

@@ -196,12 +196,13 @@ def convert_official_sonic_release_checkpoint(
     token_info = model.tokenizer.get_token_info()
     iteration = _trainer_iteration(checkpoint)
 
+    converted_algorithm: dict[str, Any] = {
+        "update_count": iteration * 20,
+        "last_optimizer_steps": 20 if iteration else 0,
+    }
     converted: dict[str, Any] = {
         "model": mapped_model_state,
-        "algorithm": {
-            "update_count": iteration * 20,
-            "last_optimizer_steps": 20 if iteration else 0,
-        },
+        "algorithm": converted_algorithm,
         "iteration": iteration,
         "token_info": token_info,
         "contract": {
@@ -227,7 +228,7 @@ def convert_official_sonic_release_checkpoint(
         algorithm = SonicPPO(model, {"learning_rate": 2.0e-5})
         _validate_optimizer_state(algorithm.optimizer, optimizer_state)
         algorithm.optimizer.load_state_dict(dict(optimizer_state))
-        converted["optimizer"] = algorithm.optimizer.state_dict()
+        converted_algorithm["optimizer"] = algorithm.optimizer.state_dict()
         converted["algorithm"]["update_count"] = _optimizer_update_count(optimizer_state, iteration)
     return converted
 

@@ -158,6 +158,10 @@ class SonicManagerPPORunner:
         if not isinstance(model_state, Mapping) or not isinstance(algorithm_state, Mapping):
             raise ValueError("SONIC checkpoint requires model and algorithm mappings")
         self.model.load_state_dict(model_state, strict=True)
+        if "optimizer" not in algorithm_state:
+            legacy_optimizer = state.get("optimizer")
+            if isinstance(legacy_optimizer, Mapping):
+                algorithm_state = {**algorithm_state, "optimizer": legacy_optimizer}
         self.algorithm.load_state_dict(algorithm_state)
         self.current_learning_iteration = int(state.get("iteration", 0))
         self.storage.clear()
