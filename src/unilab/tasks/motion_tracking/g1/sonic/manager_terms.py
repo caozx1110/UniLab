@@ -80,6 +80,7 @@ class _CompactManifest:
     clip_paths: tuple[str, ...]
     clip_lengths: tuple[int, ...]
     fps: int
+    field_names: frozenset[str]
 
 
 def _name_order(value: Any, *, location: str) -> tuple[str, ...]:
@@ -122,7 +123,7 @@ def _validate_required_fields(
     *,
     num_joints: int,
     num_bodies: int,
-) -> None:
+) -> frozenset[str]:
     if not isinstance(value, list):
         raise SonicMotionManifestError("manifest.fields must be a list")
     fields: dict[str, dict[str, Any]] = {}
@@ -155,6 +156,22 @@ def _validate_required_fields(
             raise SonicMotionManifestError(
                 f"manifest field {name!r} has shape {shape!r}, expected {list(expected_shape)!r}"
             )
+    optional_shapes: dict[str, tuple[Any, ...]] = {
+        "smpl_joints": ("num_frames", 24, 3),
+        "smpl_root_quat_w": ("num_frames", 4),
+    }
+    for name, expected_shape in optional_shapes.items():
+        raw = fields.get(name)
+        if raw is None:
+            continue
+        if raw.get("dtype") != "float32":
+            raise SonicMotionManifestError(f"manifest field {name!r} must use dtype 'float32'")
+        shape = raw.get("shape")
+        if not isinstance(shape, list) or tuple(shape) != expected_shape:
+            raise SonicMotionManifestError(
+                f"manifest field {name!r} has shape {shape!r}, expected {list(expected_shape)!r}"
+            )
+    return frozenset(fields)
 
 
 def _resolve_clip_path(manifest_path: Path, value: Any, *, location: str) -> str:
@@ -212,7 +229,7 @@ def _load_compact_manifest(manifest_file: str) -> _CompactManifest:
 
     joint_order = _name_order(raw.get("joint_order"), location="manifest.joint_order")
     body_order = _name_order(raw.get("body_order"), location="manifest.body_order")
-    _validate_required_fields(
+    field_names = _validate_required_fields(
         raw.get("fields"),
         num_joints=len(joint_order),
         num_bodies=len(body_order),
@@ -253,6 +270,7 @@ def _load_compact_manifest(manifest_file: str) -> _CompactManifest:
         clip_paths=tuple(clip_paths),
         clip_lengths=tuple(clip_lengths),
         fps=clip_fps[0],
+        field_names=field_names,
     )
 
 
@@ -300,6 +318,48 @@ class CompactSonicMotionLoader(MotionLoader):
             raise SonicMotionManifestError(
                 f"motion files use fps={self.fps}, but manifest declares fps={manifest.fps}"
             )
+
+        optional_fields = tuple(
+            name for name in ("smpl_joints", "smpl_root_quat_w") if name in manifest.field_names
+        )
+        optional_chunks: dict[str, list[np.ndarray]] = {name: [] for name in optional_fields}
+        for clip_path, expected_length in zip(
+            manifest.clip_paths, manifest.clip_lengths, strict=True
+        ):
+            if not optional_fields:
+                break
+            with np.load(clip_path, allow_pickle=False) as archive:
+                for name in optional_fields:
+                    if name not in archive:
+                        raise SonicMotionManifestError(
+                            f"motion file {clip_path!r} is missing manifest field {name!r}"
+                        )
+                    values = np.asarray(archive[name], dtype=np.float32)
+                    if values.shape[0] != expected_length:
+                        raise SonicMotionManifestError(
+                            f"motion file {clip_path!r} field {name!r} has "
+                            f"{values.shape[0]} frames, expected {expected_length}"
+                        )
+                    optional_chunks[name].append(values)
+        self.smpl_joints = (
+            np.concatenate(optional_chunks["smpl_joints"], axis=0)
+            if "smpl_joints" in optional_chunks
+            else None
+        )
+        self.smpl_root_quat_w = (
+            np.concatenate(optional_chunks["smpl_root_quat_w"], axis=0)
+            if "smpl_root_quat_w" in optional_chunks
+            else None
+        )
+        required_fields = {
+            "joint_pos",
+            "joint_vel",
+            "body_pos_w",
+            "body_quat_w",
+            "body_lin_vel_w",
+            "body_ang_vel_w",
+        }
+        self.available_fields = frozenset((*required_fields, *optional_fields))
         expected_frames = int(expected_lengths.sum())
         expected_joints = len(tuple(expected_joint_order))
         expected_bodies = len(tuple(expected_body_order))
@@ -321,6 +381,26 @@ class CompactSonicMotionLoader(MotionLoader):
         self.manifest_path = manifest.path
         self.joint_order = tuple(expected_joint_order)
         self.body_order = tuple(expected_body_order)
+
+    def gather_fields(
+        self,
+        fields: Sequence[str],
+        frame_indices: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        """Gather already-materialized fields without reopening motion assets."""
+
+        names = tuple(dict.fromkeys(str(name) for name in fields))
+        unknown = sorted(set(names).difference(self.available_fields))
+        if unknown:
+            raise KeyError(f"compact SONIC loader does not expose fields {unknown}")
+        indices = np.asarray(frame_indices, dtype=np.int64)
+        result: dict[str, np.ndarray] = {}
+        for name in names:
+            source = getattr(self, name)
+            if not isinstance(source, np.ndarray):
+                raise RuntimeError(f"compact SONIC field {name!r} was not materialized")
+            result[name] = np.take(source, indices, axis=0)
+        return result
 
 
 @dataclass
