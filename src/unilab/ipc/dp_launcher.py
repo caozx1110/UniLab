@@ -213,6 +213,7 @@ def launch_torchrun_workers(
     script_path: str | os.PathLike[str],
     argv: Sequence[str],
     log_dir: str,
+    nccl_compat_defaults: bool = True,
 ) -> None:
     """Launch one local torchrun worker per configured CUDA device.
 
@@ -230,11 +231,12 @@ def launch_torchrun_workers(
         devices,
         current_visible_devices=os.environ.get("CUDA_VISIBLE_DEVICES"),
     )
-    # Keep the production transport defaults already used by DpParameterSync:
-    # current RTX 6000D hosts hang with NCCL P2P and can fault with SHM. An
-    # explicit user environment still wins over these compatibility defaults.
-    launch_env.setdefault("NCCL_P2P_DISABLE", "1")
-    launch_env.setdefault("NCCL_SHM_DISABLE", "1")
+    # Existing RTX 6000D deployments need compatibility defaults. Other
+    # owners may explicitly retain NCCL's native transport selection and
+    # benchmark overrides supplied in the user environment.
+    if nccl_compat_defaults:
+        launch_env.setdefault("NCCL_P2P_DISABLE", "1")
+        launch_env.setdefault("NCCL_SHM_DISABLE", "1")
     launch_env[UNILAB_DP_LOG_DIR] = str(log_dir)
     command = [
         sys.executable,
@@ -247,7 +249,7 @@ def launch_torchrun_workers(
         *argv,
     ]
     print(
-        f"Launching RSL-RL data parallel training on CUDA devices {list(devices)} "
+        f"Launching data-parallel training on CUDA devices {list(devices)} "
         f"with {len(devices)} workers.",
         flush=True,
     )
