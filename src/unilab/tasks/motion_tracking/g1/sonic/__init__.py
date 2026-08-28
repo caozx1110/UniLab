@@ -11,9 +11,12 @@ from .observations import (
     SonicTokenizerObservationCache,
     SonicTokenizerObservationProvider,
 )
+from .runner import ManagerBasedSonicEnv, SonicManagerPPORunner
 
 __all__ = [
     "SonicManagerObservationAdapter",
+    "ManagerBasedSonicEnv",
+    "SonicManagerPPORunner",
     "SonicObservationBatch",
     "SonicTokenizerObservationCache",
     "SonicTokenizerObservationProvider",

@@ -157,6 +157,12 @@ class SonicManagerObservationAdapter:
         self._tokenizer_provider = tokenizer_provider
         self._num_envs = num_envs
 
+    @property
+    def num_envs(self) -> int:
+        """Number of rows expected from the manager and tokenizer provider."""
+
+        return self._num_envs
+
     def adapt(self, state: NpEnvState) -> SonicObservationBatch:
         """Return zero-copy actor/critic/tokenizer arrays after ABI validation."""
 
