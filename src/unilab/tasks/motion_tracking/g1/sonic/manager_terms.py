@@ -13,7 +13,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import TYPE_CHECKING, Any, Sequence, cast
+from typing import TYPE_CHECKING, Any, Literal, Sequence, cast
 
 import numpy as np
 
@@ -427,7 +427,12 @@ class SonicMotionCommandParamsCfg(MotionCommandParamsCfg):
     # enables the bounded clip cache explicitly and requests SMPL columns via
     # ``motion_optional_fields``.
     use_lazy_motion_loader: bool = False
-    motion_cache_size: int = 2
+    # ``auto`` keeps one active clip per environment up to a fixed owner-level
+    # ceiling.  This avoids the pathological two-entry default without making
+    # the resident set grow without bound with rollout size.
+    motion_cache_size: int | Literal["auto"] = "auto"
+    motion_cache_max_size: int = 128
+    motion_cache_max_bytes: int = 512 * 1024 * 1024
     motion_optional_fields: tuple[str, ...] = ()
     motion_rank: int = 0
     motion_world_size: int = 1
@@ -679,7 +684,10 @@ class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
                 expected_joint_order=SONIC_JOINT_ORDER,
                 expected_body_order=self.cfg.body_names,
                 cache_size=params.motion_cache_size,
+                cache_max_size=params.motion_cache_max_size,
+                cache_max_bytes=params.motion_cache_max_bytes,
                 optional_fields=params.motion_optional_fields,
+                num_envs=self.num_envs,
                 rank=params.motion_rank,
                 world_size=params.motion_world_size,
                 shard_clips=params.motion_shard_clips,

@@ -107,8 +107,11 @@ def _write_store(
 def _loader(
     manifest_path: Path,
     *,
-    cache_size: int = 2,
+    cache_size: int | str = 2,
+    cache_max_size: int = 128,
+    cache_max_bytes: int = 512 * 1024 * 1024,
     optional_fields: tuple[str, ...] | None = (),
+    num_envs: int | None = None,
     rank: int = 0,
     world_size: int = 1,
     shard_clips: bool = False,
@@ -118,7 +121,10 @@ def _loader(
         expected_joint_order=JOINT_ORDER,
         expected_body_order=BODY_ORDER,
         cache_size=cache_size,
+        cache_max_size=cache_max_size,
+        cache_max_bytes=cache_max_bytes,
         optional_fields=optional_fields,
+        num_envs=num_envs,
         rank=rank,
         world_size=world_size,
         shard_clips=shard_clips,
@@ -228,6 +234,23 @@ def test_lru_clip_count_and_bytes_remain_bounded(tmp_path: Path) -> None:
     loader.clear_cache()
     assert loader.cached_clip_count == 0
     assert loader.cached_bytes == 0
+
+
+def test_auto_cache_tracks_active_working_set_with_fixed_ceiling(tmp_path: Path) -> None:
+    manifest = _write_store(tmp_path, clip_lengths=tuple([2] * 200))
+
+    small = _loader(manifest, cache_size="auto", num_envs=3)
+    assert small.cache_size == 3
+    assert small.requested_cache_size == "auto"
+
+    large = _loader(manifest, cache_size="auto", num_envs=512)
+    assert large.cache_size == 128
+
+
+def test_explicit_cache_size_must_fit_owner_ceiling(tmp_path: Path) -> None:
+    manifest = _write_store(tmp_path, clip_lengths=(2, 2))
+    with pytest.raises(ValueError, match="exceeds cache_max_size"):
+        _loader(manifest, cache_size=9, cache_max_size=8)
 
 
 def test_zero_cache_mode_never_retains_a_decoded_clip(tmp_path: Path) -> None:

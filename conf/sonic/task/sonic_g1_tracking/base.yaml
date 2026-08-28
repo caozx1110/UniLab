@@ -277,7 +277,11 @@ env:
         teleop_sample_prob_when_smpl: 0.5
         tokenizer_enable_corruption: true
         use_lazy_motion_loader: true
-        motion_cache_size: 2
+        # Auto caches the per-rank active clip working set up to 128 clips;
+        # override with an integer for a measured deployment-specific policy.
+        motion_cache_size: auto
+        motion_cache_max_size: 128
+        motion_cache_max_bytes: 536870912
         # The checked-in benchmark manifest declares smpl_joints but not the
         # optional SMPL root quaternion.  Full Bones-Seed runs can opt in to
         # both fields with an owner override once using the full manifest.

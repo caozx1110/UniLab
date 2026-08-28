@@ -13,7 +13,7 @@ from collections import OrderedDict
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path, PureWindowsPath
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 
@@ -43,6 +43,15 @@ _REQUIRED_FIELDS = (
 _OPTIONAL_FIELDS = ("smpl_joints", "smpl_root_quat_w")
 _JOINT_FIELDS = frozenset(("joint_pos", "joint_vel"))
 _BODY_FIELDS = frozenset(("body_pos_w", "body_quat_w", "body_lin_vel_w", "body_ang_vel_w"))
+
+# The automatic policy follows the per-rank active working set up to a fixed
+# ceiling.  It therefore grows for a small rollout (where keeping one clip per
+# environment is useful), but never allocates cache entries proportional to an
+# arbitrarily large environment count.  128 is deliberately above the 100-clip
+# benchmark subset while keeping the full-corpus resident set bounded.
+DEFAULT_AUTO_CACHE_SIZE = 128
+DEFAULT_CACHE_MAX_BYTES = 512 * 1024 * 1024
+CacheSize = int | Literal["auto"]
 
 
 @dataclass(frozen=True)
@@ -265,14 +274,42 @@ class BoundedLazySonicMotionLoader:
         *,
         expected_joint_order: Sequence[str],
         expected_body_order: Sequence[str],
-        cache_size: int = 2,
+        cache_size: CacheSize = "auto",
+        cache_max_size: int = DEFAULT_AUTO_CACHE_SIZE,
+        cache_max_bytes: int = DEFAULT_CACHE_MAX_BYTES,
         optional_fields: Sequence[str] | None = (),
+        num_envs: int | None = None,
         rank: int = 0,
         world_size: int = 1,
         shard_clips: bool = False,
     ) -> None:
-        if isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 0:
-            raise ValueError(f"cache_size must be a non-negative integer, got {cache_size!r}")
+        if cache_size != "auto" and (
+            isinstance(cache_size, bool) or not isinstance(cache_size, int) or cache_size < 0
+        ):
+            raise ValueError(
+                "cache_size must be 'auto' or a non-negative integer, "
+                f"got {cache_size!r}"
+            )
+        if (
+            isinstance(cache_max_size, bool)
+            or not isinstance(cache_max_size, int)
+            or cache_max_size < 1
+        ):
+            raise ValueError(
+                f"cache_max_size must be a positive integer, got {cache_max_size!r}"
+            )
+        if (
+            isinstance(cache_max_bytes, bool)
+            or not isinstance(cache_max_bytes, int)
+            or cache_max_bytes < 1
+        ):
+            raise ValueError(
+                f"cache_max_bytes must be a positive integer, got {cache_max_bytes!r}"
+            )
+        if num_envs is not None and (
+            isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs < 1
+        ):
+            raise ValueError(f"num_envs must be a positive integer or None, got {num_envs!r}")
         manifest = _load_lazy_manifest(
             manifest_file,
             rank=rank,
@@ -345,7 +382,26 @@ class BoundedLazySonicMotionLoader:
         self.body_lin_vel_w = LazyMotionFieldSpec((self.num_frames, self.num_bodies, 3), dtype)
         self.body_ang_vel_w = LazyMotionFieldSpec((self.num_frames, self.num_bodies, 3), dtype)
 
-        self.cache_size = cache_size
+        if cache_size == "auto":
+            # A gather can touch at most one current clip per environment.
+            # Bound that working-set estimate by the owner-level ceiling and
+            # by the number of clips available on this rank.
+            active_envs = DEFAULT_AUTO_CACHE_SIZE if num_envs is None else num_envs
+            self.cache_size = min(
+                self.num_clips,
+                cache_max_size,
+                max(1, active_envs),
+            )
+        else:
+            if cache_size > cache_max_size:
+                raise ValueError(
+                    f"cache_size={cache_size} exceeds cache_max_size={cache_max_size}; "
+                    "raise cache_max_size explicitly to opt into a larger resident set"
+                )
+            self.cache_size = cache_size
+        self.cache_max_size = cache_max_size
+        self.cache_max_bytes = cache_max_bytes
+        self.requested_cache_size = cache_size
         self._cache: OrderedDict[int, _DecodedClip] = OrderedDict()
         self._loaded_clip_count = 0
         self._cached_bytes = 0
@@ -466,22 +522,33 @@ class BoundedLazySonicMotionLoader:
             missing = tuple(name for name in fields if name not in cached.arrays)
             if missing:
                 decoded = self._decode_clip(clip_index, missing)
-                cached = _DecodedClip(
+                merged = _DecodedClip(
                     arrays={**cached.arrays, **decoded.arrays},
                     nbytes=cached.nbytes + decoded.nbytes,
                 )
-                self._cache[clip_index] = cached
-                self._cached_bytes += decoded.nbytes
-                self._peak_cached_bytes = max(self._peak_cached_bytes, self._cached_bytes)
+                # The merged field set is needed for this gather, but may not
+                # fit the byte budget.  Keep the old entry in that case so the
+                # resident cache remains bounded; ``merged`` is a transient
+                # miss result and is released after the caller's gather.
+                if merged.nbytes <= self.cache_max_bytes:
+                    cached = merged
+                    self._cache[clip_index] = cached
+                    self._cached_bytes += decoded.nbytes
+                    self._peak_cached_bytes = max(self._peak_cached_bytes, self._cached_bytes)
+                else:
+                    cached = merged
             self._cache.move_to_end(clip_index)
             return cached
-        if self.cache_size > 0 and len(self._cache) >= self.cache_size:
-            _, evicted = self._cache.popitem(last=False)
-            self._cached_bytes -= evicted.nbytes
         decoded = self._decode_clip(clip_index, fields)
         self._loaded_clip_count += 1
-        if self.cache_size == 0:
+        if self.cache_size == 0 or decoded.nbytes > self.cache_max_bytes:
             return decoded
+        while self._cache and (
+            len(self._cache) >= self.cache_size
+            or self._cached_bytes + decoded.nbytes > self.cache_max_bytes
+        ):
+            _, evicted = self._cache.popitem(last=False)
+            self._cached_bytes -= evicted.nbytes
         self._cache[clip_index] = decoded
         self._cached_bytes += decoded.nbytes
         self._peak_cached_clip_count = max(self._peak_cached_clip_count, len(self._cache))
