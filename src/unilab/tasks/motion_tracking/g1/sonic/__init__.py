@@ -16,6 +16,7 @@ from .actions import (
     sonic_action_scale,
     sonic_action_scale_by_joint,
 )
+from .lazy_motion_loader import BoundedLazySonicMotionLoader, LazySonicMotionData
 from .manager_terms import (
     SONIC_JOINT_ORDER,
     CompactSonicMotionLoader,
@@ -33,7 +34,9 @@ from .observations import (
 from .runner import ManagerBasedSonicEnv, SonicManagerPPORunner
 
 __all__ = [
+    "BoundedLazySonicMotionLoader",
     "CompactSonicMotionLoader",
+    "LazySonicMotionData",
     "ManagerBasedSonicEnv",
     "SONIC_ACTION_DIM",
     "SONIC_ACTION_SCALE",
