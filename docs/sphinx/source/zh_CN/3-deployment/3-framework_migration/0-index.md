@@ -41,6 +41,12 @@
 在不破坏 env/backend contract 的前提下移植 reward 项。
 :::
 
+:::{grid-item-card} SONIC v1 Manager-Based + MJWarp
+:link: 7-sonic_v1_manager_mjwarp
+:link-type: doc
+记录 SONIC v1 迁移设置、实测多卡吞吐、验证证据和科学 parity 边界。
+:::
+
 ::::
 
 ```{toctree}
@@ -52,4 +58,5 @@
 4-from_skrl
 5-task_config_translation
 6-reward_porting
+7-sonic_v1_manager_mjwarp
 ```
