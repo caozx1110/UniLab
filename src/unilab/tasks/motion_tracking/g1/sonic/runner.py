@@ -78,6 +78,17 @@ class SonicManagerPPORunner:
                 critic_hidden_dims=cfg.get("critic_hidden_dims"),
                 model_profile=str(cfg.get("model_profile", "dense_test")),
                 tokenizer_hidden_dim=int(cfg.get("tokenizer_hidden_dim", 512)),
+                encoder_hidden_dims=cfg.get("encoder_hidden_dims"),
+                kinematic_hidden_dims=cfg.get("kinematic_hidden_dims"),
+                tokenizer_fields=cfg.get("tokenizer_fields"),
+                encoders=cfg.get("encoders"),
+                decoders=cfg.get("decoders"),
+                token_levels=int(cfg.get("token_levels", 32)),
+                token_count=int(cfg.get("token_count", 2)),
+                critic_obs_normalization=bool(cfg.get("critic_obs_normalization", False)),
+                init_noise_std=float(cfg.get("init_noise_std", 0.05)),
+                std_clamp_min=float(cfg.get("std_clamp_min", 0.001)),
+                std_clamp_max=float(cfg.get("std_clamp_max", 0.5)),
             )
         if (
             model.actor_obs_dim != 930
