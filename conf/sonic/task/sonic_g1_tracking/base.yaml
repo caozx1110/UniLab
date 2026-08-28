@@ -83,25 +83,40 @@ env:
           - right_wrist_yaw_link
   terminations:
     time_out:
-      func: unilab.envs.mdp.time_out
+      func: unilab.tasks.motion_tracking.common.manager_terms.motion_clip_end
       time_out: true
+      params: {command_name: motion}
     anchor_pos:
-      func: unilab.tasks.motion_tracking.common.manager_terms.bad_anchor_pos_z_only
-      params: {command_name: motion, threshold: 0.25}
-    anchor_ori:
-      func: unilab.tasks.motion_tracking.common.manager_terms.bad_anchor_ori
+      func: unilab.tasks.motion_tracking.g1.sonic.termination_terms.sonic_anchor_height_adaptive
       params:
         command_name: motion
-        threshold: 0.8
+        threshold: 0.15
+        threshold_adaptive: true
+        down_threshold: 0.75
+        root_height_threshold: 0.5
+    anchor_ori_full:
+      func: unilab.tasks.motion_tracking.g1.sonic.termination_terms.sonic_anchor_ori_full
+      params:
+        command_name: motion
+        threshold: 0.2
         asset_cfg:
           _target_: unilab.managers.SceneEntityCfg
           name: robot
     ee_body_pos:
-      func: unilab.tasks.motion_tracking.common.manager_terms.bad_motion_body_pos_z_only
+      func: unilab.tasks.motion_tracking.g1.sonic.termination_terms.sonic_body_height_adaptive
       params:
         command_name: motion
-        threshold: 0.25
+        threshold: 0.15
+        threshold_adaptive: true
+        down_threshold: 0.75
+        root_height_threshold: 0.5
         body_names: [left_ankle_roll_link, right_ankle_roll_link, left_wrist_yaw_link, right_wrist_yaw_link]
+    foot_pos_xyz:
+      func: unilab.tasks.motion_tracking.g1.sonic.termination_terms.sonic_foot_pos_xyz
+      params:
+        command_name: motion
+        threshold: 0.2
+        body_names: [left_ankle_roll_link, right_ankle_roll_link]
   observations:
     actor:
       enable_corruption: true
@@ -286,7 +301,7 @@ env:
           - right_wrist_yaw_link
         sampling_mode: adaptive
         sampling_start_ratio: 0.0
-        truncate_on_clip_end: false
+        truncate_on_clip_end: true
         num_future_frames: 10
         dt_future_ref_frames: 0.1
         smpl_num_future_frames: 10

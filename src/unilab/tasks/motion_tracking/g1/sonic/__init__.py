@@ -42,6 +42,12 @@ from .observations import (
     SonicTokenizerObservationProvider,
 )
 from .runner import ManagerBasedSonicEnv, SonicManagerPPORunner
+from .termination_terms import (
+    sonic_anchor_height_adaptive,
+    sonic_anchor_ori_full,
+    sonic_body_height_adaptive,
+    sonic_foot_pos_xyz,
+)
 
 __all__ = [
     "BoundedLazySonicMotionLoader",
@@ -73,6 +79,10 @@ __all__ = [
     "sonic_last_action",
     "sonic_projected_gravity",
     "sonic_tokenizer_observation",
+    "sonic_anchor_height_adaptive",
+    "sonic_anchor_ori_full",
+    "sonic_body_height_adaptive",
+    "sonic_foot_pos_xyz",
     "sonic_action_scale",
     "sonic_action_scale_by_joint",
 ]

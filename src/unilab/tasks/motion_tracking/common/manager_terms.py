@@ -293,6 +293,16 @@ class MotionCommand(CommandTerm):
         return self._body_pos_w[:, self.anchor_body_idx]
 
     @property
+    def reference_anchor_height(self) -> np.ndarray:
+        """Motion-local anchor height used by adaptive tracking terms.
+
+        Unlike :attr:`anchor_pos_w`, this value excludes per-environment scene
+        origins.  It is therefore stable when a backend lays environments out
+        on a translated grid or terrain.
+        """
+        return self._motion_data.body_pos_w[:, self.anchor_body_idx, 2]
+
+    @property
     def anchor_quat_w(self) -> np.ndarray:
         return self._motion_data.body_quat_w[:, self.anchor_body_idx]
 
