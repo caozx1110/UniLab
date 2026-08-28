@@ -422,6 +422,16 @@ class SonicMotionCommandParamsCfg(MotionCommandParamsCfg):
     encoder_sample_probs: tuple[float, float, float] = (1.0, 1.0, 1.0)
     teleop_sample_prob_when_smpl: float = 0.5
     tokenizer_enable_corruption: bool = True
+    # Lazy store controls are owner-local and optional.  The compact eager
+    # loader remains the default for tiny contract fixtures; full training
+    # enables the bounded clip cache explicitly and requests SMPL columns via
+    # ``motion_optional_fields``.
+    use_lazy_motion_loader: bool = False
+    motion_cache_size: int = 2
+    motion_optional_fields: tuple[str, ...] = ()
+    motion_rank: int = 0
+    motion_world_size: int = 1
+    motion_shard_clips: bool = False
 
 
 @dataclass(kw_only=True)
@@ -451,14 +461,17 @@ class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
         # Import here to avoid the package-level action/command import cycle.
         # This is construction-only configuration binding, never a rollout
         # path import or backend capability probe.
-        from .actions import SONIC_POLICY_TO_JOINT
+        from .actions import SONIC_JOINT_TO_POLICY
 
         if tuple(self.robot.joint_names) != SONIC_JOINT_ORDER:
             raise ValueError(
                 "SONIC motion command requires Entity joint_names in canonical "
                 f"order {SONIC_JOINT_ORDER}, got {tuple(self.robot.joint_names)}"
             )
-        self._policy_to_joint = np.asarray(SONIC_POLICY_TO_JOINT, dtype=np.intp)
+        # Values read from the Entity/motion loader are in canonical joint
+        # order.  Selecting ``SONIC_JOINT_TO_POLICY`` therefore emits release
+        # policy order (the inverse mapping is used by the action term).
+        self._policy_to_joint = np.asarray(SONIC_JOINT_TO_POLICY, dtype=np.intp)
         self._policy_to_joint.setflags(write=False)
         self._future_offsets = self._future_frame_offsets(
             cfg.params.num_future_frames,
@@ -657,6 +670,20 @@ class SonicMotionCommand(MotionCommand, SonicTokenizerObservationProvider):
         del body_indices
         if not isinstance(motion_file, str):
             raise TypeError("SonicMotionCommand requires one manifest path")
+        params = self.cfg.params
+        if params.use_lazy_motion_loader:
+            from .lazy_motion_loader import BoundedLazySonicMotionLoader
+
+            return BoundedLazySonicMotionLoader(
+                motion_file,
+                expected_joint_order=SONIC_JOINT_ORDER,
+                expected_body_order=self.cfg.body_names,
+                cache_size=params.motion_cache_size,
+                optional_fields=params.motion_optional_fields,
+                rank=params.motion_rank,
+                world_size=params.motion_world_size,
+                shard_clips=params.motion_shard_clips,
+            )  # type: ignore[return-value]
         return CompactSonicMotionLoader(
             motion_file,
             expected_joint_order=SONIC_JOINT_ORDER,
