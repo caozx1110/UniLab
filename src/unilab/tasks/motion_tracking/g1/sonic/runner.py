@@ -9,8 +9,10 @@ second learner protocol.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Protocol
 
 import numpy as np
@@ -153,6 +155,30 @@ class SonicManagerPPORunner:
         self._actor_obs = None
         self._critic_obs = None
         self._tokenizer_obs = None
+
+    def save(self, path: str | os.PathLike[str]) -> None:
+        """Atomically save one complete iteration-boundary checkpoint."""
+
+        checkpoint = Path(path)
+        checkpoint.parent.mkdir(parents=True, exist_ok=True)
+        temporary = checkpoint.with_name(f".{checkpoint.name}.tmp-{os.getpid()}")
+        try:
+            torch.save(self.state_dict(), temporary)
+            os.replace(temporary, checkpoint)
+        finally:
+            if temporary.exists():
+                temporary.unlink()
+
+    def load(self, path: str | os.PathLike[str]) -> None:
+        """Restore a checkpoint onto this runner's rank-local learner device."""
+
+        checkpoint = Path(path).expanduser().resolve()
+        if not checkpoint.is_file():
+            raise FileNotFoundError(f"SONIC checkpoint does not exist: {checkpoint}")
+        state = torch.load(checkpoint, map_location=self.device, weights_only=False)
+        if not isinstance(state, Mapping):
+            raise ValueError("SONIC checkpoint root must be a mapping")
+        self.load_state_dict(state)
 
     def _timeout_correction(
         self,
