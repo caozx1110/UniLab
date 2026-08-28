@@ -289,7 +289,7 @@ class BoundedLazySonicMotionLoader:
             expected_body_order,
             field="body_order",
         )
-        selected_optional = _normalize_optional_fields(
+        _normalize_optional_fields(
             optional_fields,
             declared_fields=manifest.declared_fields,
         )
@@ -302,23 +302,31 @@ class BoundedLazySonicMotionLoader:
         self.fps = manifest.fps
         self.num_joints = len(self.joint_order)
         self.num_bodies = len(self.body_order)
-        self.clip_lengths = np.asarray(manifest.clip_lengths, dtype=np.int64)
+        num_frames = sum(manifest.clip_lengths)
+        if num_frames > np.iinfo(np.int32).max:
+            raise SonicMotionManifestError(
+                "rank-local SONIC frame count exceeds the int32 manager index contract"
+            )
+        self.clip_lengths = np.asarray(manifest.clip_lengths, dtype=np.int32)
         self.num_clips = int(self.clip_lengths.size)
-        self.clip_offsets = np.zeros(self.num_clips, dtype=np.int64)
+        self.clip_offsets = np.zeros(self.num_clips, dtype=np.int32)
         if self.num_clips > 1:
-            self.clip_offsets[1:] = np.cumsum(self.clip_lengths[:-1], dtype=np.int64)
+            self.clip_offsets[1:] = np.cumsum(self.clip_lengths[:-1], dtype=np.int32)
         # Explicit task-owned spelling consumed by the SONIC observation owner.
         # It is the same immutable array, not a second offsets allocation.
         self.clip_starts = self.clip_offsets
         self.clip_end_frames = self.clip_offsets + self.clip_lengths - 1
-        self.num_frames = int(self.clip_lengths.sum())
+        self.num_frames = num_frames
         for array in (self.clip_lengths, self.clip_offsets, self.clip_end_frames):
             array.setflags(write=False)
 
-        self.available_fields: frozenset[str] = frozenset((*_REQUIRED_FIELDS, *selected_optional))
-        self._field_names = tuple(
-            name for name in (*_REQUIRED_FIELDS, *_OPTIONAL_FIELDS) if name in self.available_fields
-        )
+        # Capabilities come from the manifest, not from the caller's optional
+        # preselection.  Observation owners discover SMPL columns here and
+        # explicitly gather them only when their terms need those references.
+        self.available_fields = manifest.declared_fields
+        # The constructor option remains validation-only compatibility input;
+        # it never hides manifest-declared fields or expands the default six-
+        # field MotionData gather.
         self._field_shapes: dict[str, tuple[int, ...]] = {
             "joint_pos": (self.num_joints,),
             "joint_vel": (self.num_joints,),
@@ -391,16 +399,6 @@ class BoundedLazySonicMotionLoader:
             body_quat_w=np.empty((num_frames, self.num_bodies, 4), dtype=np.float32),
             body_lin_vel_w=np.empty((num_frames, self.num_bodies, 3), dtype=np.float32),
             body_ang_vel_w=np.empty((num_frames, self.num_bodies, 3), dtype=np.float32),
-            smpl_joints=(
-                np.empty((num_frames, 24, 3), dtype=np.float32)
-                if "smpl_joints" in self.available_fields
-                else None
-            ),
-            smpl_root_quat_w=(
-                np.empty((num_frames, 4), dtype=np.float32)
-                if "smpl_root_quat_w" in self.available_fields
-                else None
-            ),
         )
 
     def get_motion_at_frame(
@@ -411,18 +409,13 @@ class BoundedLazySonicMotionLoader:
         indices = self._normalize_global_indices(frame_idx)
         if out is None:
             out = self.make_motion_data_buffer(int(indices.size))
-        gathered = self.gather_fields(self._field_names, indices)
+        gathered = self.gather_fields(_REQUIRED_FIELDS, indices)
         np.copyto(out.joint_pos, gathered["joint_pos"])
         np.copyto(out.joint_vel, gathered["joint_vel"])
         np.copyto(out.body_pos_w, gathered["body_pos_w"])
         np.copyto(out.body_quat_w, gathered["body_quat_w"])
         np.copyto(out.body_lin_vel_w, gathered["body_lin_vel_w"])
         np.copyto(out.body_ang_vel_w, gathered["body_ang_vel_w"])
-        if isinstance(out, LazySonicMotionData):
-            if out.smpl_joints is not None:
-                np.copyto(out.smpl_joints, gathered["smpl_joints"])
-            if out.smpl_root_quat_w is not None:
-                np.copyto(out.smpl_root_quat_w, gathered["smpl_root_quat_w"])
         return out
 
     def gather_fields(
@@ -430,7 +423,7 @@ class BoundedLazySonicMotionLoader:
         fields: Sequence[str],
         global_indices: np.ndarray,
     ) -> dict[str, np.ndarray]:
-        """Gather configured fields from the rank-local global-frame space."""
+        """Gather requested manifest fields from the rank-local frame space."""
 
         if isinstance(fields, (str, bytes)) or not isinstance(fields, Sequence):
             raise TypeError("fields must be a sequence of field names")
@@ -451,7 +444,7 @@ class BoundedLazySonicMotionLoader:
         for clip_index in np.unique(clip_indices):
             rows = np.flatnonzero(clip_indices == clip_index)
             local_indices = indices[rows] - self.clip_offsets[clip_index]
-            clip = self._get_clip(int(clip_index))
+            clip = self._get_clip(int(clip_index), names)
             for name in names:
                 results[name][rows] = clip.arrays[name][local_indices]
         return results
@@ -467,15 +460,25 @@ class BoundedLazySonicMotionLoader:
             raise IndexError("SONIC global frame index out of bounds")
         return indices
 
-    def _get_clip(self, clip_index: int) -> _DecodedClip:
-        cached = self._cache.pop(clip_index, None)
+    def _get_clip(self, clip_index: int, fields: tuple[str, ...]) -> _DecodedClip:
+        cached = self._cache.get(clip_index)
         if cached is not None:
-            self._cache[clip_index] = cached
+            missing = tuple(name for name in fields if name not in cached.arrays)
+            if missing:
+                decoded = self._decode_clip(clip_index, missing)
+                cached = _DecodedClip(
+                    arrays={**cached.arrays, **decoded.arrays},
+                    nbytes=cached.nbytes + decoded.nbytes,
+                )
+                self._cache[clip_index] = cached
+                self._cached_bytes += decoded.nbytes
+                self._peak_cached_bytes = max(self._peak_cached_bytes, self._cached_bytes)
+            self._cache.move_to_end(clip_index)
             return cached
         if self.cache_size > 0 and len(self._cache) >= self.cache_size:
             _, evicted = self._cache.popitem(last=False)
             self._cached_bytes -= evicted.nbytes
-        decoded = self._decode_clip(clip_index)
+        decoded = self._decode_clip(clip_index, fields)
         self._loaded_clip_count += 1
         if self.cache_size == 0:
             return decoded
@@ -485,12 +488,12 @@ class BoundedLazySonicMotionLoader:
         self._peak_cached_bytes = max(self._peak_cached_bytes, self._cached_bytes)
         return decoded
 
-    def _decode_clip(self, clip_index: int) -> _DecodedClip:
+    def _decode_clip(self, clip_index: int, fields: tuple[str, ...]) -> _DecodedClip:
         path = self.motion_files[clip_index]
         frame_count = int(self.clip_lengths[clip_index])
         arrays: dict[str, np.ndarray] = {}
         with np.load(path, allow_pickle=False) as archive:
-            missing = sorted(set(self._field_names).difference(archive.files))
+            missing = sorted(set(fields).difference(archive.files))
             if missing:
                 raise SonicMotionManifestError(f"clip {path!r} is missing fields {missing}")
             if "fps" not in archive.files:
@@ -500,7 +503,7 @@ class BoundedLazySonicMotionLoader:
                 raise SonicMotionManifestError(
                     f"clip {path!r} fps metadata differs from manifest fps={self.fps}"
                 )
-            for name in self._field_names:
+            for name in fields:
                 source = np.asarray(archive[name])
                 expected_shape = (frame_count, *self._source_field_shape(name))
                 if source.shape != expected_shape:

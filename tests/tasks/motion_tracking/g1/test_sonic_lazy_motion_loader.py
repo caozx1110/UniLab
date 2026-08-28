@@ -134,9 +134,12 @@ def test_motion_command_surface_and_optional_global_gather(tmp_path: Path) -> No
     assert loader.num_joints == 2
     assert loader.num_bodies == 2
     np.testing.assert_array_equal(loader.clip_offsets, [0, 2, 5])
+    assert loader.clip_lengths.dtype == np.dtype(np.int32)
+    assert loader.clip_offsets.dtype == np.dtype(np.int32)
     assert loader.clip_starts is loader.clip_offsets
     assert not loader.clip_starts.flags.writeable
     np.testing.assert_array_equal(loader.clip_end_frames, [1, 4, 8])
+    assert loader.clip_end_frames.dtype == np.dtype(np.int32)
     assert loader.source_clip_indices == (0, 1, 2)
     assert loader.joint_pos.shape == (9, 2)
     assert loader.joint_pos.dtype == np.dtype(np.float32)
@@ -162,14 +165,45 @@ def test_motion_command_surface_and_optional_global_gather(tmp_path: Path) -> No
         [[0.0, 1.0], [1000.0, 1001.0], [2300.0, 2301.0]],
     )
     np.testing.assert_array_equal(out.body_pos_w[..., 0], out.joint_pos)
-    assert out.smpl_joints is not None
-    assert out.smpl_root_quat_w is not None
-    np.testing.assert_array_equal(out.smpl_joints[:, 0, 0], [0.25, 1.25, 2.25])
-    np.testing.assert_array_equal(out.smpl_root_quat_w[:, 0], [0.5, 1.5, 2.5])
+    assert out.smpl_joints is None
+    assert out.smpl_root_quat_w is None
+    assert all(
+        set(decoded.arrays)
+        == {
+            "joint_pos",
+            "joint_vel",
+            "body_pos_w",
+            "body_quat_w",
+            "body_lin_vel_w",
+            "body_ang_vel_w",
+        }
+        for decoded in loader._cache.values()
+    )
     np.testing.assert_array_equal(loader.get_clip_indices(indices), [0, 1, 2])
+
+    optional = loader.gather_fields(
+        ("smpl_joints", "smpl_root_quat_w"),
+        np.asarray([0, 2, 8], dtype=np.int64),
+    )
+    np.testing.assert_array_equal(optional["smpl_joints"][:, 0, 0], [0.25, 1.25, 2.25])
+    np.testing.assert_array_equal(optional["smpl_root_quat_w"][:, 0], [0.5, 1.5, 2.5])
 
     optional = loader.gather_fields(("smpl_joints",), np.asarray([-1], dtype=np.int64))
     np.testing.assert_array_equal(optional["smpl_joints"][:, 0, 0], [2.25])
+
+
+def test_optional_preselection_does_not_hide_manifest_capabilities(tmp_path: Path) -> None:
+    loader = _loader(
+        _write_store(tmp_path, clip_lengths=(2,)),
+        optional_fields=("smpl_joints",),
+    )
+
+    assert {"smpl_joints", "smpl_root_quat_w"}.issubset(loader.available_fields)
+    gathered = loader.gather_fields(
+        ("smpl_root_quat_w",),
+        np.asarray([1], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(gathered["smpl_root_quat_w"][:, 0], [0.5])
 
 
 def test_lru_clip_count_and_bytes_remain_bounded(tmp_path: Path) -> None:
