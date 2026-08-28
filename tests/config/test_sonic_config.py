@@ -5,7 +5,6 @@ from pathlib import Path
 from hydra import compose, initialize_config_dir
 from hydra.core.global_hydra import GlobalHydra
 
-
 CONF_DIR = Path(__file__).parents[2] / "conf" / "sonic"
 
 
