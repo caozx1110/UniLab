@@ -19,6 +19,8 @@ algo:
   max_iterations: 100000
   save_interval: 500
   empirical_normalization: false
+  # The official all_mlp_v1 critic uses a per-feature running mean/std.
+  critic_obs_normalization: true
   obs_groups:
     actor: [actor]
   actor_obs_dim: 930
