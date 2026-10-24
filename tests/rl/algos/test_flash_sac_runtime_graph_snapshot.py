@@ -73,6 +73,40 @@ def test_uninstrumented_learner_does_not_claim_replay_state():
     assert "whole_cycle_replay_submitted" not in graph
 
 
+def test_full_objective_compile_without_cuda_graphs_has_precise_evidence(tmp_path):
+    def wrapped():
+        pass
+
+    wrapped._torchdynamo_orig_callable = lambda: None
+    learner = SimpleNamespace(
+        use_compile=True,
+        use_update_cycle=False,
+        compile_options={"triton.cudagraphs": False, "fallback_random": True},
+        compile_full_objectives=True,
+        compile_actor_inference=True,
+        actor=SimpleNamespace(get_mean_and_std=wrapped),
+        _full_actor_objective=wrapped,
+        _full_critic_objective=wrapped,
+    )
+    runner = _runner(learner)
+    graph = runner._cuda_graph_runtime_manifest()
+    assert graph["scope"] == "full_objectives"
+    assert graph["orchestration"] == "torch_compile"
+    assert graph["compiled_wrappers"] == {"actor": True, "critic": True, "inference": True}
+    assert graph["compile_options"]["fallback_random"] is True
+    assert isinstance(graph["compile_counters"], dict)
+    runner.runtime_manifest["cuda_graph"] = graph
+    runner._persist_runtime_manifest_snapshot(
+        str(tmp_path),
+        phase="compiled_update_progress",
+        iteration=1000,
+    )
+    validate_runtime_manifest(runner.runtime_manifest)
+    payload = json.loads((tmp_path / "runtime_manifest.rank0.json").read_text())
+    assert payload["iteration"] == 1000
+    assert payload["runtime_manifest"]["cuda_graph"] == graph
+
+
 @pytest.mark.parametrize("fail", [False, True])
 def test_replay_evidence_is_set_only_after_replay_returns(fail):
     graph = SimpleNamespace(

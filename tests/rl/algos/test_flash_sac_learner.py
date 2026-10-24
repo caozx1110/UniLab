@@ -454,6 +454,47 @@ def test_flashsac_whole_cycle_uses_max_autotune_without_nested_graphs(monkeypatc
     ]
 
 
+def test_flashsac_explicit_inference_and_objective_compile_share_options(monkeypatch) -> None:
+    calls = []
+
+    def fake_compile(fn, **kwargs):
+        calls.append((fn.__name__, kwargs))
+        return fn
+
+    options = {"triton.cudagraphs": False, "max_autotune": True, "fallback_random": True}
+    learner = _make_small_learner(
+        compile_options=options,
+        compile_actor_inference=True,
+    )
+    options["fallback_random"] = False
+    learner.device = torch.device("cuda")
+    learner.compile_full_objectives = True
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    learner._compile_training_methods()
+    assert [name for name, _ in calls] == [
+        "get_mean_and_std",
+        "_full_critic_objective",
+        "_full_actor_objective",
+    ]
+    assert all(
+        kwargs
+        == {
+            "dynamic": False,
+            "options": {"triton.cudagraphs": False, "max_autotune": True, "fallback_random": True},
+        }
+        for _, kwargs in calls
+    )
+
+
+def test_flashsac_explicit_compile_options_cannot_nest_in_whole_cycle(monkeypatch) -> None:
+    learner = _make_small_learner(compile_options={"triton.cudagraphs": True})
+    learner.device = torch.device("cuda")
+    learner._compile_full_update_cycle = True
+    monkeypatch.setattr(torch, "compile", lambda fn, **kwargs: fn)
+    with pytest.raises(ValueError, match="whole-cycle CUDA graphs disabled"):
+        learner._compile_training_methods()
+
+
 def test_flashsac_amp_dtype_resolution_and_scaler_rules() -> None:
     assert FlashSACLearner._resolve_amp_dtype("auto", "cuda") is torch.bfloat16
     assert FlashSACLearner._resolve_amp_dtype("auto", "xpu") is torch.bfloat16

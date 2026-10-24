@@ -165,6 +165,8 @@ def _flashsac_cfg() -> Any:
                         "amp_dtype": "bf16",
                         "use_compile": False,
                         "compile_full_objectives": True,
+                        "compile_options": {"fallback_random": True},
+                        "compile_actor_inference": True,
                         "use_whole_cycle_cuda_graph": False,
                     },
                 }
@@ -249,6 +251,8 @@ def test_flashsac_builder_forwards_backend_device_injection(
     assert runner.kwargs["inference_placement"] is None
     assert runner.kwargs["runtime_settings"] is None
     assert _FakeLearner.last_kwargs["compile_full_objectives"] is True
+    assert _FakeLearner.last_kwargs["compile_options"] == {"fallback_random": True}
+    assert _FakeLearner.last_kwargs["compile_actor_inference"] is True
     assert _FakeLearner.last_kwargs["use_whole_cycle_cuda_graph"] is False
     assert _FakeLearner.last_kwargs["actor_normalize_parameters"] is True
     assert _FakeLearner.last_kwargs["critic_normalize_parameters"] is True

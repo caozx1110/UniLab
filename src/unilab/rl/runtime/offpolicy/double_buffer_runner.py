@@ -488,6 +488,30 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             manifest["orchestration"] = (
                 "torch_compile" if backend == "torch_compile" else "inductor_cuda_graph_trees"
             )
+        if compile_enabled and hasattr(self.learner, "compile_options"):
+            options = dict(self.learner.compile_options)
+            manifest["compile_options"] = options
+            manifest["compile_full_objectives"] = bool(self.learner.compile_full_objectives)
+            manifest["compile_actor_inference"] = bool(self.learner.compile_actor_inference)
+            manifest["compiled_wrappers"] = {
+                name: hasattr(function, "_torchdynamo_orig_callable")
+                for name, function in (
+                    ("inference", self.learner.actor.get_mean_and_std),
+                    ("actor", self.learner._full_actor_objective),
+                    ("critic", self.learner._full_critic_objective),
+                )
+            }
+            from torch._dynamo.utils import counters
+
+            manifest["compile_counters"] = {
+                group: {str(key): int(value) for key, value in entries.items()}
+                for group, entries in counters.items()
+            }
+            if not bool(getattr(self.learner, "use_update_cycle", False)):
+                if self.learner.compile_full_objectives:
+                    manifest["scope"] = "full_objectives"
+                if options.get("triton.cudagraphs") is False:
+                    manifest["orchestration"] = "torch_compile"
         if hasattr(self.learner, "_update_cycle_graph"):
             manifest["whole_cycle_graph_present"] = (
                 getattr(self.learner, "_update_cycle_graph", None) is not None
@@ -2221,6 +2245,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                     iter_metrics[key].append(value)
 
                     replay_pipeline.after_tick()
+                    if bool(getattr(learner, "compile_actor_inference", False)) and (
+                        iteration == 1 or iteration % 1000 == 0
+                    ):
+                        self.runtime_manifest["cuda_graph"] = self._cuda_graph_runtime_manifest()
+                        logger.update_runtime_manifest(dict(self.runtime_manifest))
+                        self._persist_runtime_manifest_snapshot(
+                            log_dir,
+                            phase="compiled_update_progress",
+                            iteration=iteration,
+                        )
                     self._synchronize_after_update_phase(
                         torch.device(self.device),
                         phase_ordered_metrics=phase_ordered_metrics,

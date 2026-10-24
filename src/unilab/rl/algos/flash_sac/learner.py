@@ -221,6 +221,8 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         amp_dtype: str = "auto",
         use_compile: bool | None = None,
         compile_full_objectives: bool | None = None,
+        compile_options: Mapping[str, Any] | None = None,
+        compile_actor_inference: bool = False,
         use_whole_cycle_cuda_graph: bool | None = None,
         dp_whole_cycle_cuda_graph: bool = False,
         actor_normalize_parameters: bool = True,
@@ -278,6 +280,8 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             self._nvidia_cuda if compile_full_objectives is None else bool(compile_full_objectives)
         )
         self.compile_full_objectives = bool(full_objectives_requested and self.use_compile)
+        self.compile_options = dict(compile_options or {})
+        self.compile_actor_inference = bool(compile_actor_inference)
         # Host-side ``Tensor.item``/truth checks synchronize the device.  The
         # compiled CUDA path uses the fused optimizer's device gate; MPS has no
         # device-side skip (its fused Adam kernel ignores ``found_inf``), so
@@ -533,6 +537,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             return
 
         if self._compile_full_update_cycle:
+            if self.compile_options or self.compile_actor_inference:
+                raise ValueError(
+                    "Explicit compile options/inference require whole-cycle CUDA graphs disabled"
+                )
             # The raw whole-cycle graph must not nest Inductor CUDA Graph Trees.
             # Architecture-portable max-autotune lets Triton select kernels on
             # the installed GPU instead of restoring Ada/Blackwell learner paths.
@@ -545,8 +553,13 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 "dynamic": False,
                 "options": {
                     "triton.cudagraphs": True,
+                    **self.compile_options,
                 },
             }
+        if self.compile_actor_inference:
+            self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
+                self.actor.get_mean_and_std, **compile_kwargs
+            )
         if self.compile_full_objectives:
             self._full_critic_objective = compile_fn(  # type: ignore[method-assign]
                 self._full_critic_objective, **compile_kwargs
@@ -555,9 +568,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 self._full_actor_objective, **compile_kwargs
             )
             return
-        self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
-            self.actor.get_mean_and_std, **compile_kwargs
-        )
+        if not self.compile_actor_inference:
+            self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
+                self.actor.get_mean_and_std, **compile_kwargs
+            )
         self.__dict__["_critic_objective"] = compile_fn(
             self._critic_objective,
             **compile_kwargs,
