@@ -31,6 +31,21 @@ class UnitLinear(nn.Module):
             self.w.weight.copy_(F.normalize(self.w.weight, dim=-1, eps=1e-8))
 
 
+@torch.compiler.disable()
+def _native_batch_norm(
+    x: torch.Tensor,
+    running_mean: torch.Tensor,
+    running_var: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    training: bool,
+    momentum: float,
+    eps: float,
+) -> torch.Tensor:
+    """Keep native BN arithmetic and autograd across an explicit graph break."""
+    return F.batch_norm(x, running_mean, running_var, weight, bias, training, momentum, eps)
+
+
 class UnitBatchNorm(nn.Module):
     """BatchNorm variant with normalized affine parameters."""
 
@@ -45,8 +60,24 @@ class UnitBatchNorm(nn.Module):
         self.register_buffer("running_var", torch.ones(input_dim))
         self.momentum = momentum
         self.eps = eps
+        # Opt-in at the learner boundary; built-in whole-cycle paths stay compiled.
+        self.preserve_native_execution = False
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
+        if self.preserve_native_execution:
+            return cast(
+                torch.Tensor,
+                _native_batch_norm(
+                    x,
+                    self.running_mean,
+                    self.running_var,
+                    self.weight,
+                    self.bias,
+                    training,
+                    self.momentum,
+                    self.eps,
+                ),
+            )
         return F.batch_norm(
             x,
             self.running_mean,

@@ -480,6 +480,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 getattr(self.learner, "_host_finite_checks", True)
             ),
         }
+        if hasattr(self.learner, "compile_native_batch_norm"):
+            manifest["compile_native_batch_norm"] = bool(self.learner.compile_native_batch_norm)
+            manifest["native_batch_norm_module_count"] = int(
+                self.learner.native_batch_norm_module_count
+            )
+            manifest["intentional_graph_breaks"] = (
+                ["actor.UnitBatchNorm: native forward/backward"]
+                if self.learner.native_batch_norm_module_count
+                else []
+            )
         if bool(getattr(self.learner, "use_update_cycle", False)):
             manifest["scope"] = "update_cycle"
             manifest["orchestration"] = "cuda_graph"
@@ -509,7 +519,11 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             }
             if not bool(getattr(self.learner, "use_update_cycle", False)):
                 if self.learner.compile_full_objectives:
-                    manifest["scope"] = "full_objectives"
+                    manifest["scope"] = (
+                        "full_objectives_with_native_batch_norm"
+                        if getattr(self.learner, "native_batch_norm_module_count", 0)
+                        else "full_objectives"
+                    )
                 if options.get("triton.cudagraphs") is False:
                     manifest["orchestration"] = "torch_compile"
         if hasattr(self.learner, "_update_cycle_graph"):

@@ -223,6 +223,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         compile_full_objectives: bool | None = None,
         compile_options: Mapping[str, Any] | None = None,
         compile_actor_inference: bool = False,
+        compile_native_batch_norm: bool = False,
         use_whole_cycle_cuda_graph: bool | None = None,
         dp_whole_cycle_cuda_graph: bool = False,
         actor_normalize_parameters: bool = True,
@@ -282,6 +283,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         self.compile_full_objectives = bool(full_objectives_requested and self.use_compile)
         self.compile_options = dict(compile_options or {})
         self.compile_actor_inference = bool(compile_actor_inference)
+        self.compile_native_batch_norm = bool(compile_native_batch_norm)
         # Host-side ``Tensor.item``/truth checks synchronize the device.  The
         # compiled CUDA path uses the fused optimizer's device gate; MPS has no
         # device-side skip (its fused Adam kernel ignores ``found_inf``), so
@@ -307,6 +309,11 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             if use_whole_cycle_cuda_graph is None
             else bool(use_whole_cycle_cuda_graph)
         )
+        if self.compile_native_batch_norm and (graph_requested or self._dp_whole_cycle_cuda_graph):
+            raise ValueError(
+                "compile_native_batch_norm introduces explicit actor graph breaks; "
+                "set use_whole_cycle_cuda_graph=false and dp_whole_cycle_cuda_graph=false"
+            )
         if self._actor_spec is not None:
             if not self.actor_normalize_parameters:
                 raise ValueError(
@@ -462,7 +469,19 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         if self.use_compile:
             if self._compile_full_update_cycle:
                 self._materialize_capturable_optimizer_state()
+            if self.compile_native_batch_norm:
+                for module in self.actor.modules():
+                    if isinstance(module, UnitBatchNorm):
+                        module.preserve_native_execution = True
             self._compile_training_methods()
+
+    @property
+    def native_batch_norm_module_count(self) -> int:
+        """Actual actor BN modules deliberately outside compiled graphs."""
+        return sum(
+            isinstance(module, UnitBatchNorm) and module.preserve_native_execution
+            for module in self.actor.modules()
+        )
 
     @property
     def use_update_cycle(self) -> bool:
@@ -537,7 +556,11 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             return
 
         if self._compile_full_update_cycle:
-            if self.compile_options or self.compile_actor_inference:
+            if (
+                self.compile_options
+                or self.compile_actor_inference
+                or self.compile_native_batch_norm
+            ):
                 raise ValueError(
                     "Explicit compile options/inference require whole-cycle CUDA graphs disabled"
                 )
