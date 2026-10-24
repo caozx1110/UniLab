@@ -253,6 +253,7 @@ def test_flashsac_builder_forwards_backend_device_injection(
     assert _FakeLearner.last_kwargs["compile_full_objectives"] is True
     assert _FakeLearner.last_kwargs["compile_options"] == {"fallback_random": True}
     assert _FakeLearner.last_kwargs["compile_actor_inference"] is True
+    assert _FakeLearner.last_kwargs["compile_native_batch_norm"] is False
     assert _FakeLearner.last_kwargs["use_whole_cycle_cuda_graph"] is False
     assert _FakeLearner.last_kwargs["actor_normalize_parameters"] is True
     assert _FakeLearner.last_kwargs["critic_normalize_parameters"] is True
@@ -263,6 +264,43 @@ def test_flashsac_builder_forwards_backend_device_injection(
         "min_weight": 0.1,
         "num_buckets": 2000,
     }
+
+
+@pytest.mark.parametrize("enabled", [None, False, True])
+def test_flashsac_builder_configures_native_batch_norm_on_real_learner(monkeypatch, enabled):
+    import unilab.rl.algos.flash_sac.double_buffer as module
+    from unilab.rl.algos.flash_sac import learner as learner_module
+    from unilab.rl.algos.flash_sac.layers import UnitBatchNorm
+
+    cfg = _flashsac_cfg()
+    cfg.algo.num_atoms = 5
+    cfg.algo.algo_params.use_compile = True
+    cfg.algo.algo_params.actor_noise_zeta_max = 4
+    if enabled is not None:
+        cfg.algo.algo_params.compile_native_batch_norm = enabled
+    # Exercise the real builder and learner without constructing replay or CUDA.
+    _patch_flashsac_host_gates(monkeypatch, module)
+    monkeypatch.setattr(module, "DoubleBufferOffPolicyRunner", _FakeRunner)
+    monkeypatch.setattr(
+        learner_module, "get_torch_compile_for_device", lambda *_args, **_kwargs: torch.compile
+    )
+    runner = module.build_double_buffer_runner(
+        cfg,
+        env_factory=_fake_env_factory,
+        env_cfg_override=None,
+        replay_prefetch_mode="one_tick",
+        device="cpu",
+    )
+    learner = runner.kwargs["learner"]
+    assert isinstance(learner, module.FlashSACLearner)
+    assert learner.compile_native_batch_norm is bool(enabled)
+    assert learner.native_batch_norm_module_count == (3 if enabled else 0)
+    assert all(
+        module.preserve_native_execution is bool(enabled)
+        for module in learner.actor.modules()
+        if isinstance(module, UnitBatchNorm)
+    )
+    assert hasattr(learner.actor.get_mean_and_std, "_torchdynamo_orig_callable")
 
 
 @pytest.mark.parametrize("algo", ["sac", "flashsac"])

@@ -130,6 +130,7 @@ def build_double_buffer_runner(
         "compile_full_objectives": _algo_param(cfg.algo, "compile_full_objectives", None),
         "compile_options": _algo_param(cfg.algo, "compile_options", None),
         "compile_actor_inference": _algo_param(cfg.algo, "compile_actor_inference", False),
+        "compile_native_batch_norm": _algo_param(cfg.algo, "compile_native_batch_norm", False),
         "use_whole_cycle_cuda_graph": _algo_param(cfg.algo, "use_whole_cycle_cuda_graph", None),
         "dp_whole_cycle_cuda_graph": _algo_param(cfg.algo, "dp_whole_cycle_cuda_graph", False),
         "actor_normalize_parameters": bool(
