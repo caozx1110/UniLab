@@ -753,7 +753,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             )
             for aux_loss in aux_losses.values():
                 actor_loss = actor_loss + aux_loss
-        return actor_loss, entropy, dict(aux_losses)
+        # These outputs are diagnostics only. Keep their original tensors in
+        # actor_loss, but do not expose unused differentiable outputs to AOT
+        # backward (actor-owned detached health aliases can leave None tangents).
+        return actor_loss, entropy, {name: loss.detach() for name, loss in aux_losses.items()}
 
     def update_critic(
         self,

@@ -158,6 +158,20 @@ class TestCustomActorConstruction:
 
 
 class TestAuxiliaryLosses:
+    def test_auxiliary_diagnostics_are_detached_without_losing_gradients(self) -> None:
+        torch.manual_seed(7)
+        learner = _make_learner(actor_config=_actor_config(hidden_dim=8, aux_weight=0.5))
+        batch = _make_batch()
+        loss, entropy, diagnostics = learner._full_actor_objective(
+            batch["obs"], batch["next_obs"], batch["actions"], batch["critic"]
+        )
+        assert loss.requires_grad
+        assert not entropy.requires_grad
+        assert diagnostics and all(not value.requires_grad for value in diagnostics.values())
+        loss.backward(inputs=list(learner.actor.parameters()))
+        gradient = learner.actor.aux_head.weight.grad
+        assert gradient is not None and gradient.abs().sum() > 0
+
     def test_aux_loss_gradients_reach_actor_parameters(self) -> None:
         torch.manual_seed(7)
         learner = _make_learner(actor_config=_actor_config(hidden_dim=8, aux_weight=0.5))
