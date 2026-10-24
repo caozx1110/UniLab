@@ -438,6 +438,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         self._update_cycle_lr_cursors: dict[int, int] = {}
         self._capture_update_cycle = False
         self._update_cycle_capture_failed = False
+        self._update_cycle_replay_submitted = False
         # Whole-cycle capture wraps compiled objectives, so disabling compile
         # also disables this dependent layer.  The graph switch otherwise does
         # not change which objective boundary Inductor compiles.
@@ -863,18 +864,24 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             self.temperature_scheduler.step()
 
         post_update_temperature = self.temperature()
-        actor_metric_tensors = (actor_loss, entropy, post_update_temperature, temp_loss)
+        aux_metric_names = tuple(f"Loss/aux_{name}" for name in aux_names)
+        aux_metric_tensors = tuple(aux_losses[name] for name in aux_names)
+        actor_metric_tensors = (
+            actor_loss,
+            entropy,
+            post_update_temperature,
+            temp_loss,
+            *aux_metric_tensors,
+        )
         if not read_metrics:
             # Keep a private device-side snapshot.  The cycle-end drain below
             # performs the only D2H read, after all compiled replays finish.
-            # Auxiliary-loss diagnostics only exist on the metrics-reading
-            # path; their values remain part of Loss/actor here.
+            # Preserve named custom-actor diagnostics in the same deferred
+            # transfer; this does not change the actor objective or gradients.
             self._pending_actor_metric_values = torch.stack(
                 [tensor.detach().reshape(()) for tensor in actor_metric_tensors]
             )
             return {}
-        aux_metric_names = tuple(f"Loss/aux_{name}" for name in aux_names)
-        aux_metric_tensors = tuple(aux_losses[name] for name in aux_names)
         return self._read_metric_tensors(
             (
                 "Loss/actor",
@@ -883,7 +890,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 "Loss/temperature",
                 *aux_metric_names,
             ),
-            (*actor_metric_tensors, *aux_metric_tensors),
+            actor_metric_tensors,
         )
 
     @staticmethod
@@ -907,6 +914,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                     "Loss/entropy",
                     "Policy/temperature",
                     "Loss/temperature",
+                    *(f"Loss/aux_{name}" for name in (self._aux_loss_names or ())),
                 ),
                 values.cpu().tolist(),
                 strict=True,
@@ -1091,12 +1099,14 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         if self._gradient_graph_hooks is not None:
             self._gradient_graph_hooks[2]()
         self._update_cycle_graph.replay()
+        self._update_cycle_replay_submitted = True
         self._advance_update_cycle_schedulers()
         self._pending_cycle_metric_values = self._update_cycle_graph_metric_values
 
     def _reset_update_cycle_graph(self) -> None:
         """Invalidate captured storage after checkpoint or DP state changes."""
         self._update_cycle_capture_failed = False
+        self._update_cycle_replay_submitted = False
         self._update_cycle_graph = None
         self._update_cycle_graph_cache_key = None
         self._update_cycle_static_batch = None

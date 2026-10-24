@@ -465,3 +465,31 @@ def test_validate_custom_actor_requires_parameters() -> None:
 
     with pytest.raises(ValueError, match="no parameters"):
         validate_custom_actor(_Paramless(), obs_dim=_OBS_DIM, action_dim=_ACTION_DIM)
+
+
+@pytest.mark.parametrize("custom", [False, True])
+def test_deferred_actor_metrics_match_direct_update_and_drain_once(custom):
+    import copy
+
+    torch.manual_seed(7)
+    kwargs = {"actor_config": _actor_config(hidden_dim=8)} if custom else {}
+    direct = _make_learner(**kwargs)
+    deferred = _make_learner(**kwargs)
+    deferred.load_state_dict(copy.deepcopy(direct.get_state_dict()))
+    batch = _make_batch()
+    rng = torch.get_rng_state()
+    expected = direct.update_actor(batch, read_metrics=True)
+    torch.set_rng_state(rng)
+    assert deferred.update_actor(batch, read_metrics=False) == {}
+    actual = deferred.read_deferred_actor_metrics()
+    assert actual.keys() == expected.keys()
+    assert actual == pytest.approx(expected)
+    assert deferred.read_deferred_actor_metrics() == {}
+    for key, value in direct.actor.state_dict().items():
+        torch.testing.assert_close(deferred.actor.state_dict()[key], value, rtol=0, atol=0)
+    if custom:
+        assert "Loss/aux_token_recon" in actual
+        assert deferred.actor.aux_head.weight.grad is not None
+    else:
+        assert not any(name.startswith("Loss/aux_") for name in actual)
+    normalize_metric_map(actual)

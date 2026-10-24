@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import queue as queue_module
 import statistics
@@ -487,7 +488,46 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             manifest["orchestration"] = (
                 "torch_compile" if backend == "torch_compile" else "inductor_cuda_graph_trees"
             )
+        if hasattr(self.learner, "_update_cycle_graph"):
+            manifest["whole_cycle_graph_present"] = (
+                getattr(self.learner, "_update_cycle_graph", None) is not None
+            )
+            manifest["whole_cycle_capture_failed"] = bool(
+                getattr(self.learner, "_update_cycle_capture_failed", False)
+            )
+        if hasattr(self.learner, "_update_cycle_replay_submitted"):
+            manifest["whole_cycle_replay_submitted"] = bool(
+                getattr(self.learner, "_update_cycle_replay_submitted", False)
+            )
         return manifest
+
+    def _persist_runtime_manifest_snapshot(
+        self,
+        log_dir: str,
+        *,
+        phase: str,
+        iteration: int | None = None,
+    ) -> None:
+        """落盘每个 rank 的已观测状态，避免限时停止丢失最终 summary。"""
+        rank = 0 if self.dp_sync is None else self.dp_sync.rank
+        directory = Path(log_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        destination = directory / f"runtime_manifest.rank{rank}.json"
+        temporary = directory / f".{destination.name}.{os.getpid()}.tmp"
+        payload = {
+            "snapshot_schema_version": 1,
+            "rank": rank,
+            "pid": os.getpid(),
+            "phase": phase,
+            "iteration": iteration,
+            "unix_time": time.time(),
+            "runtime_manifest": self.runtime_manifest,
+        }
+        try:
+            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            temporary.replace(destination)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _learner_performance_tier_manifest(self) -> dict[str, object] | None:
         tier = getattr(self.learner, "_performance_tier", None)
@@ -1712,6 +1752,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             graph_manifest = self._cuda_graph_runtime_manifest()
             self.runtime_manifest["cuda_graph"] = graph_manifest
             logger.update_runtime_manifest(dict(self.runtime_manifest))
+            self._persist_runtime_manifest_snapshot(log_dir, phase="learner_prepared")
             self._shutdown_recorder.set_phase(owner="learner", phase="startup/collector_start")
 
             # --- start collector ---
@@ -1781,6 +1822,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 )
 
             training_e2e_start_ns = 0
+
+            graph_replay_snapshot_written = False
 
             # ---- training loop ----
             for iteration in range(start_iteration, max_iterations + 1):
@@ -2050,6 +2093,19 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                                 deferred_cycle_metrics(),
                             ).items():
                                 iter_metrics[key].append(value)
+                        if not graph_replay_snapshot_written and bool(
+                            getattr(learner, "_update_cycle_replay_submitted", False)
+                        ):
+                            self.runtime_manifest["cuda_graph"] = (
+                                self._cuda_graph_runtime_manifest()
+                            )
+                            logger.update_runtime_manifest(dict(self.runtime_manifest))
+                            self._persist_runtime_manifest_snapshot(
+                                log_dir,
+                                phase="first_whole_cycle_replay_submitted",
+                                iteration=iteration,
+                            )
+                            graph_replay_snapshot_written = True
                     else:
 
                         def run_actor_update(
