@@ -20,6 +20,8 @@ import copy
 import queue
 import threading
 from collections import deque
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -382,6 +384,106 @@ class _ReadyPipeline(_FakePipeline):
 
     def after_tick(self):
         return None
+
+
+def test_lifecycle_reuses_held_tick_and_stops_at_actual_checkpoint(monkeypatch, tmp_path):
+    events = []
+    requests = []
+    served = []
+
+    class Replay(_FakeReplayBuffer):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.ptr[0] = self.size[0] = self.published_ptr = 4
+
+    class Pipeline(_ReadyPipeline):
+        def retained_state(self):
+            return {"identity": id(self)}
+
+        @contextmanager
+        def paused(self):
+            events.append("pause")
+            yield
+            events.append("unpause")
+
+    class Learner(_Learner):
+        def update_critic(self, batch):
+            return {}
+
+        def update_actor(self, batch):
+            return {}
+
+        def soft_update_target(self):
+            pass
+
+    class Hook:
+        def __init__(self):
+            self.iteration = 0
+
+        def __call__(self, context):
+            events.append((context.phase, context.iteration))
+            if context.phase == "iteration_start":
+                self.iteration = context.iteration
+                assert context.learner.update_count == context.iteration - 1
+            else:
+                saved = torch.load(context.checkpoint_path, weights_only=False)
+                assert saved["update_count"] == context.iteration
+                assert saved["lifecycle_state"]["hook"]["iteration"] == context.iteration
+                if context.iteration == 3:
+                    context.request_stop("owner evaluation threshold")
+
+        def state_dict(self):
+            return {"iteration": self.iteration}
+
+        def load_state_dict(self, state, *, iteration):
+            assert state["iteration"] == iteration
+            self.iteration = iteration
+
+    monkeypatch.setattr(device_runner_module, "ReplayBuffer", Replay)
+    monkeypatch.setattr(device_runner_module, "DeviceReplayPipeline", Pipeline)
+    monkeypatch.setattr(device_runner_module, "OffPolicyLogger", _FakeLogger)
+    monkeypatch.setattr(device_runner_module.time, "sleep", lambda _: None)
+    runner = _make_device_runner(monkeypatch, Learner(), device="cpu")
+    monkeypatch.setattr(runner, "_start_collector", lambda **kwargs: None)
+    monkeypatch.setattr(runner, "_check_collector_alive", lambda: True)
+
+    def wait(*args, expected_tick, **kwargs):
+        requests.append(expected_tick)
+        return expected_tick
+
+    def serve(*args, tick_id, **kwargs):
+        served.append(tick_id)
+        return dict.fromkeys(
+            (
+                "inference_h2d_time",
+                "inference_forward_time",
+                "inference_d2h_time",
+                "inference_time",
+            ),
+            0.0,
+        )
+
+    monkeypatch.setattr(runner, "_wait_for_inference_request", wait)
+    monkeypatch.setattr(runner, "_serve_learner_inference", serve)
+    monkeypatch.setattr(runner, "_publish_inference_response", lambda *args, **kwargs: None)
+    runner.learn(
+        max_iterations=4,
+        save_interval=3,
+        checkpoint_iterations=[2],
+        lifecycle_hook=Hook(),
+        log_dir=str(tmp_path),
+    )
+    assert served == [0, 1, 2]
+    assert requests == [0, 1, 2, 3]  # held tick 2 is served, never requested twice
+    assert ("checkpoint", 2) in events and ("checkpoint", 3) in events
+    assert ("iteration_start", 4) not in events
+    assert runner.last_run_summary["status"] == "completed"
+    assert runner.last_run_summary["completed_iterations"] == 3
+    assert runner.last_run_summary["termination"] == "lifecycle_stop"
+    assert runner.last_run_summary["stop_reason"] == "owner evaluation threshold"
+    assert runner.last_run_summary["requested_max_iterations"] == 4
+    assert Path(runner.last_run_summary["last_checkpoint"]).name == "model_3.pt"
+    assert sorted(path.name for path in tmp_path.glob("model_*.pt")) == ["model_2.pt", "model_3.pt"]
 
 
 class _FakeLogger:

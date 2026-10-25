@@ -111,6 +111,20 @@ class DpParameterSync:
             for key in self._ordered_keys(tensors):
                 dist.broadcast(tensors[key], src=0)
 
+    def barrier(self) -> None:
+        """Synchronize a short lifecycle boundary, never a long external job."""
+        if not self._started:
+            raise RuntimeError("Cannot synchronize before the DP process group starts")
+        dist.barrier()
+
+    def agree_stop_reason(self, reason: str | None) -> str | None:
+        """Reject divergent owner stop decisions before ranks leave a milestone."""
+        reasons: list[str | None] = [None] * self.world_size
+        dist.all_gather_object(reasons, reason)
+        if any(item != reasons[0] for item in reasons):
+            raise RuntimeError(f"Lifecycle stop decision differs across ranks: {reasons!r}")
+        return reasons[0]
+
     def allreduce_gradients(self, parameters: Iterable[torch.Tensor]) -> None:
         """Average one optimizer's gradients with one flat all-reduce.
 

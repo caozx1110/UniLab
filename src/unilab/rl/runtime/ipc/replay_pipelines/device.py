@@ -21,6 +21,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from contextlib import contextmanager
+from dataclasses import asdict
 from typing import Any, Dict, List, Tuple, cast
 
 import torch
@@ -207,6 +209,7 @@ class DeviceReplayPipeline:
             self._slot_events = [torch.mps.Event() for _ in range(2)]
         self._span_events: deque[tuple[int, Any, int, int, int]] = deque()
         self._submission_lock = threading.Lock()
+        self._work_lock = threading.RLock()
         self._submitted_ptr = 0
         self._visible_ptr = 0
         self._ingress_high_water = replay_buffer.ingress_diagnostics()["high_water_occupancy"]
@@ -344,17 +347,18 @@ class DeviceReplayPipeline:
 
     def _sync_worker(self) -> None:
         while True:
-            if self._closed:
-                return
-            try:
-                did_work = self._drain_completed_spans()
-                did_work |= self._service_pending_prepare()
-                did_work |= self._submit_new_spans()
-            except BaseException as exc:
-                with self._prepare_condition:
-                    self._prepare_error = exc
-                    self._prepare_condition.notify_all()
-                return
+            with self._work_lock:
+                if self._closed:
+                    return
+                try:
+                    did_work = self._drain_completed_spans()
+                    did_work |= self._service_pending_prepare()
+                    did_work |= self._submit_new_spans()
+                except BaseException as exc:
+                    with self._prepare_condition:
+                        self._prepare_error = exc
+                        self._prepare_condition.notify_all()
+                    return
             if not did_work:
                 time.sleep(self._POLL_INTERVAL_S)
 
@@ -580,6 +584,60 @@ class DeviceReplayPipeline:
         return True
 
     # -- public API -----------------------------------------------------------
+
+    def retained_state(self) -> dict[str, Any]:
+        """Read pause-audit metadata without advancing replay or copying data.
+
+        Call only while the collector is parked and ``paused()`` is held.
+        Addresses identify retained allocations within this process, not data
+        checksums or portable checkpoint identities.
+        """
+        return {
+            "pipeline_id": id(self),
+            "replay_buffer_id": id(self._replay_buffer),
+            "storage_data_ptr": self._gpu_storage.data_ptr(),
+            "batch_data_ptrs": [slot.data_ptr() for slot in self._gpu_packed],
+            "published_ptr": self._replay_buffer.published_ptr,
+            "committed_ptr": int(self._replay_buffer.ptr[0]),
+            "committed_size": int(self._replay_buffer.size[0]),
+            "submitted_ptr": self._submitted_ptr,
+            "visible_ptr": self._visible_ptr,
+            "pending_spans": [
+                [end, id(event), slot, start, count]
+                for end, event, slot, start, count in self._span_events
+            ],
+            "prepare_tick_id": self._prepare_tick_id,
+            "prepare_required_ptr": self._prepare_required_ptr,
+            "prepare_state": self._prepare_state,
+            "prepared_metadata": (
+                asdict(self._prepared_metadata) if self._prepared_metadata is not None else None
+            ),
+            "hot_metadata": asdict(self._hot_metadata) if self._hot_metadata is not None else None,
+            "hot_slot": self._hot,
+            "cold_slot": self._cold,
+            "has_hot_batch": self._has_hot_batch,
+            "base_seed": self._base_seed,
+        }
+
+    @contextmanager
+    def paused(self):
+        """Suspend daemon submissions and retain all ingress/prepare state.
+
+        The caller must first park the collector at its next inference request.
+        Already-submitted device work finishes before entry. Pending prepares,
+        slots, seeds, pointers and metadata are retained, never resampled or
+        closed. The learner thread must not drive replay while in this scope.
+        """
+        with self._work_lock:
+            if self._closed:
+                raise RuntimeError("Cannot pause a closed replay pipeline")
+            if self._prepare_error is not None:
+                raise self._prepare_error
+            if self._sync_stream is not None:
+                self._sync_stream.synchronize()
+            else:
+                sync_device(self._device)
+            yield
 
     def _validate_sample_count(self, sample_count: int) -> None:
         if int(sample_count) != int(self._sample_count):

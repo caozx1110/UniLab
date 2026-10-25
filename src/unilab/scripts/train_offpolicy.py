@@ -58,6 +58,7 @@ from unilab.training.cuda_process_sharing import (
 )
 from unilab.training.dp_config import apply_dp_rank_config
 from unilab.training.experiment import ExperimentTracker
+from unilab.training.lifecycle import resolve_offpolicy_lifecycle
 from unilab.training.onnx_export import export_policy_onnx, verify_policy_onnx
 from unilab.training.seed import apply_configured_training_seed
 from unilab.training.tensor_runtime import (
@@ -782,6 +783,15 @@ def main(cfg: DictConfig) -> None:
             if not cfg.training.play_only:
                 runner = None
                 try:
+                    lifecycle_hook, checkpoint_iterations = resolve_offpolicy_lifecycle(
+                        cfg.training
+                    )
+                    lifecycle_options = {}
+                    if lifecycle_hook is not None or checkpoint_iterations:
+                        lifecycle_options = {
+                            "lifecycle_hook": lifecycle_hook,
+                            "checkpoint_iterations": checkpoint_iterations,
+                        }
                     runner = build_runner(algo_name, cfg, log_dir=log_dir)
                     runner.learn(
                         max_iterations=cfg.algo.max_iterations,
@@ -789,6 +799,7 @@ def main(cfg: DictConfig) -> None:
                         log_dir=log_dir,
                         logger_type=cfg.training.logger,
                         resume_checkpoint=resolve_train_resume_checkpoint(cfg),
+                        **lifecycle_options,
                     )
                     run_summary = getattr(runner, "last_run_summary", None)
                     if isinstance(run_summary, dict) and run_summary.get("status") not in (

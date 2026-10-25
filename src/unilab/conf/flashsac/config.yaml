@@ -65,6 +65,8 @@ algo:
 
 training:
   task_name: G1WalkFlat
+  # Optional owner factory and extra checkpoints; see training.lifecycle resolver.
+  lifecycle: null
   # list[list[int]] | null; one CPU-id segment per rank for the collector's
   # MuJoCo pool; null = auto partition of cpu_count // world_size per rank.
   dp_collector_cpu_ids: null
