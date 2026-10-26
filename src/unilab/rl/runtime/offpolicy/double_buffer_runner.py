@@ -47,6 +47,7 @@ from unilab.rl.runtime.ipc.replay_pipelines.device import (
 )
 from unilab.rl.runtime.offpolicy import continuation
 from unilab.rl.runtime.offpolicy.actor_adapter import get_offpolicy_actor_adapter
+from unilab.rl.runtime.offpolicy.collector_continuation import cpu_tree
 from unilab.rl.runtime.offpolicy.coordination import LearnerCoordinationState
 from unilab.rl.runtime.offpolicy.lifecycle import (
     LifecycleContext,
@@ -1179,6 +1180,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "iteration": iteration,
             "held_tick": held_tick,
             "runner": runner_state,
+            # Independently observe live native learner state. On resume the
+            # evaluator checkpoint preserves its original SHA, so comparing that
+            # copied file alone cannot verify restored weights/optimizers.
+            "learner_native": cpu_tree(self.learner.get_state_dict()),
             "learner": self.learner.export_continuation_state(),
             "rng": continuation.capture_rng_state(self.device),
         }
