@@ -10,7 +10,7 @@ import statistics
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
@@ -1380,6 +1380,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         replay_buffer,
         ckpt_path: str | None,
         train_start_wall: float,
+        defer_collector_failure_cleanup: bool = False,
     ) -> int:
         self._learner_coordination.mark_waiting()
         while True:
@@ -1396,6 +1397,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     trace_recorder,
                 )
                 if not self._check_collector_alive():
+                    if defer_collector_failure_cleanup:
+                        # The resume owner must release its startup replay pause
+                        # before _fail_collector_died closes/joins the daemon.
+                        raise _CollectorDiedError("Collector died during resumed startup")
                     self._fail_collector_died(
                         logger,
                         replay_buffer,
@@ -2045,6 +2050,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             f"Replay learner lightweight: batched event write (log_interval={self.log_interval})"
         )
         self._active_logger = logger
+        resume_replay_pause = ExitStack()
         try:
             self._shutdown_recorder.set_phase(owner="learner", phase="startup/dp_init")
             # --- inference coordination queues ---
@@ -2069,6 +2075,11 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 inference_dones=inference_dones_actor,
                 replay_pipeline=replay_pipeline,
             )
+            if self._resume_continuation is not None:
+                # Keep restored pending ingress/prefetch metadata stationary
+                # throughout collector construction and the first held-boundary
+                # capture. The nested pauses in restore/checkpoint are reentrant.
+                resume_replay_pause.enter_context(replay_pipeline.paused())
             restored_runtime = self._restore_continuation(replay_pipeline)
             if restored_runtime is not None:
                 inference_slot.initialize_continuation_tick(restored_runtime["held_tick"])
@@ -2279,10 +2290,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         replay_buffer=replay_buffer,
                         ckpt_path=ckpt_path,
                         train_start_wall=train_start_wall,
+                        defer_collector_failure_cleanup=True,
                     ),
                 )
                 if self._lifecycle_stop_reason is not None:
                     raise RuntimeError("Restored checkpoint hook requested a stop")
+            resume_replay_pause.close()
 
             # ---- training loop ----
             for iteration in range(start_iteration, max_iterations + 1):
@@ -2944,6 +2957,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             self._record_shutdown_diagnostics(logger)
             self._active_logger = None
         except _CollectorDiedError:
+            resume_replay_pause.close()
             self._fail_collector_died(
                 logger,
                 replay_buffer,
@@ -2954,6 +2968,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             )
             raise
         except BaseException as exc:
+            resume_replay_pause.close()
             self._shutdown_recorder.record_failure(exc)
             self._record_shutdown_diagnostics(logger)
             try:
@@ -2972,6 +2987,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 self.last_run_summary = self._minimal_failed_summary("failed")
             raise
         finally:
+            # Release before collector/pipeline teardown on every startup error.
+            # ExitStack.close() is idempotent after the successful boundary hook.
+            resume_replay_pause.close()
             # Learner stop/death must release the collector even when the active
             # exception is unrelated to collector liveness.
             try:
