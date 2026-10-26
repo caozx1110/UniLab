@@ -11,11 +11,21 @@ import hashlib
 import json
 import os
 import random
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+
+_SAVE_LOCK = threading.Lock()
+_HASH_CHUNK_BYTES = 8 * 1024 * 1024
+_WRITE_POLL_SECONDS = 0.5
+_HASH_PROGRESS_SECONDS = 1.0
+
+Progress = Callable[[dict[str, Any]], None]
 
 
 def capture_rng_state(device: str | torch.device = "cpu") -> dict[str, Any]:
@@ -45,12 +55,23 @@ def restore_rng_state(state: dict[str, Any]) -> None:
         torch.mps.set_rng_state(state["mps"])
 
 
-def file_binding(path: str | Path) -> dict[str, Any]:
+def file_binding(path: str | Path, *, progress: Progress | None = None) -> dict[str, Any]:
     path = Path(path).resolve()
     digest = hashlib.sha256()
+    size = 0
+    reported = 0
+    next_report = 0.0
     with path.open("rb") as stream:
-        while block := stream.read(8 * 1024 * 1024):
+        while block := stream.read(_HASH_CHUNK_BYTES):
             digest.update(block)
+            size += len(block)
+            now = time.monotonic()
+            if progress is not None and now >= next_report:
+                progress({"stage": "hash", "bytes": size})
+                reported = size
+                next_report = now + _HASH_PROGRESS_SECONDS
+    if progress is not None and size > reported:
+        progress({"stage": "hash", "bytes": size})
     return {"path": str(path), "sha256": digest.hexdigest(), "bytes": path.stat().st_size}
 
 
@@ -63,24 +84,63 @@ def verify_binding(binding: dict[str, Any]) -> Path:
     return Path(actual["path"])
 
 
-class HashingWriter:
-    """Hash the sequential torch zip stream without rereading large replay files."""
+def temporary_path(path: str | Path, *, pid: int | None = None) -> Path:
+    path = Path(path).resolve()
+    return path.with_name(f".{path.name}.{os.getpid() if pid is None else pid}.tmp")
 
-    def __init__(self, stream: Any):
-        self.stream = stream
-        self.digest = hashlib.sha256()
-        self.size = 0
 
-    def write(self, data: bytes) -> int:
-        count = self.stream.write(data)
-        if count != len(data):
-            raise OSError("Short continuation write")
-        self.digest.update(data)
-        self.size += count
-        return count
+def _save_native(path: Path, state: dict[str, Any]) -> None:
+    # A Python file-like writer materializes an entire storage as Python bytes
+    # before write() can run (the replay storage can exceed 50 GB). Native paths
+    # stream directly. ZIP CRC32 also scans a whole storage before its first
+    # write; the manifest's SHA256 provides stronger, chunk-observable integrity.
+    # These snapshots are a paused cold path. Restore the process-local option,
+    # even on failure, and serialize our own concurrent callers around it.
+    with _SAVE_LOCK:
+        crc32 = torch.serialization.get_crc32_options()
+        try:
+            torch.serialization.set_crc32_options(False)
+            torch.save(state, str(path))
+        finally:
+            torch.serialization.set_crc32_options(crc32)
 
-    def flush(self) -> None:
-        self.stream.flush()
+
+def _save_with_progress(path: Path, state: dict[str, Any], progress: Progress) -> None:
+    done = threading.Event()
+    errors: list[BaseException] = []
+
+    def write() -> None:
+        try:
+            _save_native(path, state)
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            done.set()
+
+    writer = threading.Thread(target=write, name="continuation-writer", daemon=True)
+    writer.start()
+    reported = 0
+
+    def report_growth() -> None:
+        nonlocal reported
+        try:
+            size = path.stat().st_size
+        except FileNotFoundError:
+            return
+        if size > reported:
+            progress({"stage": "write", "bytes": size})
+            reported = size
+
+    try:
+        while not done.wait(_WRITE_POLL_SECONDS):
+            # Observed bytes, not thread liveness, extend the health deadline.
+            # A blocked write/CRC/pickle/fsync has no automatic heartbeat.
+            report_growth()
+        report_growth()
+    finally:
+        writer.join()
+    if errors:
+        raise errors[0]
 
 
 def sync_directory(path: Path) -> None:
@@ -91,19 +151,23 @@ def sync_directory(path: Path) -> None:
         os.close(descriptor)
 
 
-def save_state(path: str | Path, state: dict[str, Any]) -> dict[str, Any]:
+def save_state(
+    path: str | Path, state: dict[str, Any], *, progress: Progress | None = None
+) -> dict[str, Any]:
     path = Path(path).resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = temporary_path(path)
     try:
-        with temporary.open("wb") as stream:
-            writer = HashingWriter(stream)
-            torch.save(state, writer)
-            writer.flush()
+        if progress is None:
+            _save_native(temporary, state)
+        else:
+            _save_with_progress(temporary, state, progress)
+        with temporary.open("rb") as stream:
             os.fsync(stream.fileno())
+        binding = file_binding(temporary, progress=progress)
         os.replace(temporary, path)
         sync_directory(path.parent)
-        return {"path": str(path), "sha256": writer.digest.hexdigest(), "bytes": writer.size}
+        return {**binding, "path": str(path)}
     finally:
         temporary.unlink(missing_ok=True)
 

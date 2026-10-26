@@ -99,7 +99,7 @@ def test_full_snapshot_observes_and_clones_live_native_learner_not_copied_checkp
     observed = []
     original_save = continuation.save_state
 
-    def save_state(path, state):
+    def save_state(path, state, **kwargs):
         if Path(path).name == "runtime.pt":
             actual = state["learner_native"]
             weight = actual["actor"]["weight"]
@@ -113,7 +113,7 @@ def test_full_snapshot_observes_and_clones_live_native_learner_not_copied_checkp
                 is not live_native["actor_optimizer"]["param_groups"]
             )
             observed.append(weight.item())
-        return original_save(path, state)
+        return original_save(path, state, **kwargs)
 
     response = queue.Queue()
 

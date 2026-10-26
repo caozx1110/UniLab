@@ -1138,10 +1138,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         response_queue,
         runner_state: Callable[[], dict[str, Any]],
         drain_metrics: Callable[[int], None],
+        progress: continuation.Progress | None = None,
     ) -> None:
         """Commit a complete state only with the collector and replay parked."""
         root = Path(log_dir).resolve() / f"continuation_{iteration}"
         root.mkdir(exist_ok=False)
+
+        def report(component: str, details: dict[str, Any]) -> None:
+            if progress is not None:
+                progress({"continuation_component": component, **details})
+
         request_id = str(iteration)
         request_queue.put(
             {
@@ -1152,6 +1158,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             }
         )
         drain_metrics(held_tick)
+        collector_written = 0
         while True:
             try:
                 response = response_queue.get(timeout=1.0)
@@ -1159,6 +1166,18 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             except queue_module.Empty:
                 if not self._collector_process.is_alive():
                     raise RuntimeError("Collector died while saving full continuation")
+                # The collector owns its temporary file; observe actual growth
+                # without sending a timer heartbeat or touching its RNG/state.
+                temporary = continuation.temporary_path(
+                    root / "collector.pt", pid=self._collector_process.pid
+                )
+                try:
+                    written = temporary.stat().st_size
+                except FileNotFoundError:
+                    continue
+                if written > collector_written:
+                    report("collector", {"stage": "write", "bytes": written})
+                    collector_written = written
         if response.get("error"):
             raise RuntimeError(f"Collector continuation failed: {response['error']}")
         if response.get("request_id") != request_id or response.get("tick") != held_tick:
@@ -1166,7 +1185,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         collector_binding = {key: response[key] for key in ("path", "sha256", "bytes")}
         if Path(collector_binding["path"]) != root / "collector.pt":
             raise ValueError("Collector continuation wrote an unexpected path")
+        report("collector", {"stage": "committed", "bytes": collector_binding["bytes"]})
         replay_state = replay_pipeline.export_continuation_state()
+        report("replay", {"stage": "exported"})
         runner_state = runner_state()
         if replay_state["prepare_tick_id"] is not None and (
             replay_state["prepare_tick_id"] != runner_state["prepared_tick"]
@@ -1187,9 +1208,13 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "learner": self.learner.export_continuation_state(),
             "rng": continuation.capture_rng_state(self.device),
         }
-        replay_binding = continuation.save_state(root / "replay.pt", replay_state)
+        replay_binding = continuation.save_state(
+            root / "replay.pt", replay_state, progress=partial(report, "replay")
+        )
         del replay_state
-        runtime_binding = continuation.save_state(root / "runtime.pt", runtime_state)
+        runtime_binding = continuation.save_state(
+            root / "runtime.pt", runtime_state, progress=partial(report, "runtime")
+        )
         checkpoint = Path(log_dir).resolve() / f"model_{iteration}.pt"
         with checkpoint.open("rb") as checkpoint_stream:
             os.fsync(checkpoint_stream.fileno())
@@ -1198,7 +1223,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             "iteration": iteration,
             "held_tick": held_tick,
             "identity": self._continuation_identity(),
-            "checkpoint": continuation.file_binding(checkpoint),
+            "checkpoint": continuation.file_binding(checkpoint, progress=partial(report, "native")),
             "collector": collector_binding,
             "replay": replay_binding,
             "runtime": runtime_binding,
@@ -1250,7 +1275,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         log_dir: str,
         replay_pipeline,
         wait_for_request: Callable[[], int],
-        capture_continuation: Callable[[int], None] | None = None,
+        capture_continuation: Callable[[int, continuation.Progress], None] | None = None,
     ) -> int:
         """Hold the next inference request until the owner checkpoint hook returns."""
         hook = self._lifecycle_hook
@@ -1263,6 +1288,14 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             log_dir=log_dir,
             checkpoint_path=checkpoint_path,
         )
+        # The single-rank native checkpoint already exists. Other DP ranks may
+        # arrive before rank 0's atomic save; they bind it after the entry fence.
+        if Path(checkpoint_path).exists():
+            checkpoint = Path(checkpoint_path).stat()
+            context = replace(
+                context,
+                checkpoint_token=f"{iteration}:{checkpoint.st_mtime_ns}:{checkpoint.st_size}",
+            )
         publish_lifecycle_state(context, "checkpoint_wait")
         pause_started = time.monotonic()
         stop_reasons: list[str] = []
@@ -1293,8 +1326,6 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 sync_device(self.device)
                 if self.dp_sync is not None:
                     self.dp_sync.barrier()
-                if capture_continuation is not None:
-                    capture_continuation(held_tick)
                 # Rank 0 saved atomically before entering the shared boundary.
                 checkpoint = Path(checkpoint_path).stat()
                 context = replace(
@@ -1302,6 +1333,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     checkpoint_token=f"{iteration}:{checkpoint.st_mtime_ns}:{checkpoint.st_size}",
                     retained_state=retained_state(),
                 )
+                if capture_continuation is not None:
+                    progress = partial(publish_lifecycle_state, context, "checkpoint_wait")
+                    progress({"continuation_stage": "capture"})
+                    capture_continuation(held_tick, progress)
                 context = replace(
                     context,
                     progress_publisher=partial(publish_lifecycle_state, context, "checkpoint_hook"),
@@ -2254,7 +2289,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                         trace_recorder,
                     )
 
-            def capture_continuation(held_tick: int) -> None:
+            def capture_continuation(held_tick: int, progress: continuation.Progress) -> None:
                 self._save_continuation(
                     iteration=iteration,
                     held_tick=held_tick,
@@ -2264,6 +2299,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     response_queue=checkpoint_response_queue,
                     runner_state=continuation_runner_state,
                     drain_metrics=drain_continuation_metrics,
+                    progress=progress,
                 )
 
             if self._resume_continuation is not None:
