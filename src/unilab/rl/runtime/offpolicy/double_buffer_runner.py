@@ -1421,6 +1421,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         ckpt_path: str | None,
         train_start_wall: float,
         defer_collector_failure_cleanup: bool = False,
+        progress_replay: bool = True,
     ) -> int:
         self._learner_coordination.mark_waiting()
         while True:
@@ -1428,7 +1429,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 message = int(queue.get(timeout=0.1))
             except queue_module.Empty:
                 self._learner_coordination.mark_progress()
-                replay_pipeline.progress()
+                if progress_replay:
+                    replay_pipeline.progress()
                 self._drain_metrics(
                     metrics_queue,
                     reward_history,
@@ -2303,6 +2305,26 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 )
 
             if self._resume_continuation is not None:
+                # Collector construction/restoration may take minutes. Keep
+                # this under the startup guard (and the outer replay pause),
+                # not checkpoint_wait's short no-progress deadline. Consume
+                # READY and the saved held tick exactly once, before publishing
+                # any checkpoint lifecycle state or copying the native model.
+                restored_held_tick = self._wait_for_inference_request(
+                    inference_request_queue,
+                    expected_tick=inference_scheduler.next_tick,
+                    replay_pipeline=replay_pipeline,
+                    metrics_queue=metrics_queue,
+                    reward_history=reward_history,
+                    latest_reward_components=latest_reward_components,
+                    logger=logger,
+                    trace_recorder=trace_recorder,
+                    replay_buffer=replay_buffer,
+                    ckpt_path=ckpt_path,
+                    train_start_wall=train_start_wall,
+                    defer_collector_failure_cleanup=True,
+                    progress_replay=False,
+                )
                 # Persist the restored boundary in the new attempt before any
                 # action/update. This gives an auditable round-trip artifact and
                 # reruns a hook possibly interrupted by preemption. The original
@@ -2318,21 +2340,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     log_dir=log_dir,
                     replay_pipeline=replay_pipeline,
                     capture_continuation=capture_continuation,
-                    wait_for_request=partial(
-                        self._wait_for_inference_request,
-                        inference_request_queue,
-                        expected_tick=inference_scheduler.next_tick,
-                        replay_pipeline=replay_pipeline,
-                        metrics_queue=metrics_queue,
-                        reward_history=reward_history,
-                        latest_reward_components=latest_reward_components,
-                        logger=logger,
-                        trace_recorder=trace_recorder,
-                        replay_buffer=replay_buffer,
-                        ckpt_path=ckpt_path,
-                        train_start_wall=train_start_wall,
-                        defer_collector_failure_cleanup=True,
-                    ),
+                    wait_for_request=lambda: restored_held_tick,
                 )
                 if self._lifecycle_stop_reason is not None:
                     raise RuntimeError("Restored checkpoint hook requested a stop")
