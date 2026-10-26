@@ -1799,6 +1799,7 @@ class ManagerBasedRlEnv(TorchEnv):
         self.scene._invalidate_state_reads()
         if self.scene.read_plan is not None:
             self.scene.read_plan.refresh()
+        self._prepare_reward_log_continuation(state["values"])
         for key, value in state["values"].items():
             setattr(self, key, restore_tree(getattr(self, key), value, device=self.device))
         expected_bias = {
@@ -1816,6 +1817,35 @@ class ManagerBasedRlEnv(TorchEnv):
         if self.common_step_counter != self.step_counter:
             raise ValueError("Restored manager and environment clocks disagree")
         self.rng.set_state(state["rng"])
+
+    def _prepare_reward_log_continuation(self, values: Mapping[str, Any]) -> None:
+        """Materialize the first-step reward-log cache without computing rewards.
+
+        This cache starts empty in a new process. Its only nonempty layout is
+        determined by the reward manager, not by an arbitrary checkpoint shape.
+        Keep the generic tensor restore strict and preserve existing storage
+        once that layout has been materialized.
+        """
+        names = values["_reward_log_names"]
+        means = values["_reward_log_means"]
+        expected_names = self.reward_manager.step_reward_names
+        if (
+            not isinstance(names, tuple)
+            or names not in ((), expected_names)
+            or not isinstance(means, torch.Tensor)
+            or means.dtype != torch.float32
+            or means.shape != (len(names),)
+        ):
+            raise ValueError("Continuation reward-log layout changed")
+        current = self._reward_log_means
+        if not isinstance(current, torch.Tensor) or current.dtype != torch.float32:
+            raise ValueError("Continuation reward-log carrier changed")
+        if current.shape != means.shape:
+            if current.shape != (0,):
+                raise ValueError("Continuation reward-log carrier shape changed")
+            self._reward_log_means = torch.empty(
+                (len(names),), dtype=torch.float32, device=self.device
+            )
 
     def close(self) -> None:
         read_plan = self.scene.read_plan

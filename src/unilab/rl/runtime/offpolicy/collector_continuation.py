@@ -21,29 +21,7 @@ def cpu_tree(value):
 
 
 def restore_metric_state(metrics, saved):
-    if set(saved) != set(vars(metrics)):
-        raise ValueError("Collector metric state fields changed")
-    for key, value in saved.items():
-        target = getattr(metrics, key)
-        if isinstance(value, torch.Tensor):
-            if (
-                not isinstance(target, torch.Tensor)
-                or target.shape != value.shape
-                or target.dtype != value.dtype
-            ):
-                raise ValueError(f"Collector metric tensor {key} changed")
-            target.copy_(value.to(target.device))
-        elif key in {
-            "device",
-            "num_envs",
-            "interval",
-            "reward_component_names",
-            "reward_component_count",
-        }:
-            if value != target:
-                raise ValueError(f"Collector metric configuration {key} changed")
-        else:
-            setattr(metrics, key, value)
+    metrics.restore_continuation_values(saved)
 
 
 def service_checkpoint_request(request_queue, response_queue, *, tick, snapshot):

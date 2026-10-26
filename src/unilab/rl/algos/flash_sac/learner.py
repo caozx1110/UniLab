@@ -1295,6 +1295,18 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             raise ValueError("Unsupported FlashSAC learner continuation schema")
         if state.get("configuration") != self._continuation_configuration():
             raise ValueError("FlashSAC continuation learner configuration differs")
+        self._import_continuation_payload(state)
+
+    def _import_continuation_payload(self, state: dict[str, Any]) -> None:
+        """Restore numeric payload after the caller has validated logical config.
+
+        The production entry remains ``import_continuation_state`` and retains
+        its exact device-derived AMP/compile configuration checks. This shared
+        cold-path core also permits CPU constructor carriers to audit the saved
+        numbers; it does not attest CUDA execution or configuration equivalence.
+        """
+        if state.get("schema") != "unilab.flashsac-learner-continuation.v1":
+            raise ValueError("Unsupported FlashSAC learner continuation schema")
         import_actor = getattr(self.actor, "import_continuation_state", None)
         if not callable(import_actor):
             raise TypeError("Actor does not support complete exploration-state continuation")

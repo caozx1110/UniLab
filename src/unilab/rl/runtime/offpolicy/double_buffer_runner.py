@@ -48,6 +48,7 @@ from unilab.rl.runtime.ipc.replay_pipelines.device import (
 from unilab.rl.runtime.offpolicy import continuation
 from unilab.rl.runtime.offpolicy.actor_adapter import get_offpolicy_actor_adapter
 from unilab.rl.runtime.offpolicy.collector_continuation import cpu_tree
+from unilab.rl.runtime.offpolicy.control_continuation import RunnerControlState
 from unilab.rl.runtime.offpolicy.coordination import LearnerCoordinationState
 from unilab.rl.runtime.offpolicy.lifecycle import (
     LifecycleContext,
@@ -2183,21 +2184,25 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
             time.sleep(0.5)
 
-            # Recent collector reports; each entry is already the collector's
-            # rolling 100-episode mean, so a short window keeps the logged
-            # reward timely without losing smoothing.
-            reward_history: deque = deque(maxlen=10)
-            latest_reward_components = RewardComponentWindow()
-            has_logged_reward = False
-            last_buf_log = 0
-            write_read_ema = 0.0
-            reward_stats_ptr = 0
-            train_start_threshold = self.train_start_threshold
-            prepared_tick: int | None = None
+            # Cold control values are shared with the CPU continuation inventory.
             inference_scheduler = _LearnerInferenceScheduler(
                 env_steps_per_sync=self.env_steps_per_sync,
                 initial_policy_version=int(getattr(self.learner, "update_count", 0)),
             )
+            control = RunnerControlState(
+                inference_scheduler,
+                logger,
+                best_mean_reward=best_mean_reward,
+                last_mean_reward=last_mean_reward,
+            )
+            reward_history = control.reward_history
+            latest_reward_components = control.reward_components
+            has_logged_reward = control.has_logged_reward
+            last_buf_log = control.last_buf_log
+            write_read_ema = control.write_read_ema
+            reward_stats_ptr = control.reward_stats_ptr
+            prepared_tick = control.prepared_tick
+            train_start_threshold = self.train_start_threshold
 
             if trace_recorder:
                 manifest_ns = time.perf_counter_ns()
@@ -2215,29 +2220,16 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             held_inference_request: int | None = None
 
             if restored_runtime is not None:
-                restored_runner = restored_runtime["runner"]
-                scheduler_state = restored_runner["inference_scheduler"]
-                if (
-                    set(scheduler_state) != set(vars(inference_scheduler))
-                    or scheduler_state["env_steps_per_sync"] != self.env_steps_per_sync
-                    or scheduler_state["_pending_tick"] is not None
-                    or scheduler_state["_ticks_since_update"] != 0
-                ):
-                    raise ValueError("Invalid inference scheduler continuation boundary")
-                vars(inference_scheduler).update(scheduler_state)
-                reward_stats_ptr = restored_runner["reward_stats_ptr"]
-                prepared_tick = restored_runner["prepared_tick"]
-                reward_history.extend(restored_runner["reward_history"])
-                latest_reward_components = RewardComponentWindow(
-                    **restored_runner["reward_components"]
-                )
-                has_logged_reward = restored_runner["has_logged_reward"]
-                last_buf_log = restored_runner["last_buf_log"]
-                write_read_ema = restored_runner["write_read_ema"]
-                best_mean_reward = restored_runner["best_mean_reward"]
-                last_mean_reward = restored_runner["last_mean_reward"]
-                for name, value in restored_runner["logger"].items():
-                    setattr(logger, name, value)
+                control.import_values(restored_runtime["runner"])
+                reward_stats_ptr = control.reward_stats_ptr
+                prepared_tick = control.prepared_tick
+                reward_history = control.reward_history
+                has_logged_reward = control.has_logged_reward
+                last_buf_log = control.last_buf_log
+                write_read_ema = control.write_read_ema
+                best_mean_reward = control.best_mean_reward
+                last_mean_reward = control.last_mean_reward
+                latest_reward_components = control.reward_components
                 continuation.restore_rng_state(restored_runtime["rng"])
                 del restored_runtime
 

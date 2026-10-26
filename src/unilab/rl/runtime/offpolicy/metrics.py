@@ -20,7 +20,7 @@ class MetricFlush:
     reward_component_updates: int = 0
 
 
-class CollectorMetrics:
+class CollectorMetricState:
     """Accumulate collector metrics and flush them in one D2H transfer.
 
     A fixed ``interval * num_envs`` window removes per-step scalar ``.item()``,
@@ -35,6 +35,7 @@ class CollectorMetrics:
         interval: int,
         device: str | torch.device,
         reward_component_names: Sequence[str] = (),
+        storage_device: str | torch.device | None = None,
     ) -> None:
         if isinstance(num_envs, bool) or not isinstance(num_envs, int) or num_envs <= 0:
             raise ValueError("collector metrics require a positive environment count")
@@ -43,30 +44,62 @@ class CollectorMetrics:
         self.num_envs = int(num_envs)
         self.interval = int(interval)
         self.device = torch.device(device)
+        # CPU acceptance changes physical placement only; source logical device
+        # remains configuration and is strictly compared by the restore core.
+        placement = self.device if storage_device is None else torch.device(storage_device)
         self.reward_component_names = tuple(reward_component_names)
         self.reward_component_count = len(self.reward_component_names)
         self._reward_component_sum = (
-            torch.zeros(self.reward_component_count, dtype=torch.float64, device=self.device)
+            torch.zeros(self.reward_component_count, dtype=torch.float64, device=placement)
             if self.reward_component_count
             else None
         )
         self._reward_component_updates = 0
-        self.current_rewards = torch.zeros(self.num_envs, device=self.device)
-        self.current_lengths = torch.zeros(self.num_envs, dtype=torch.int64, device=self.device)
+        self.current_rewards = torch.zeros(self.num_envs, device=placement)
+        self.current_lengths = torch.zeros(self.num_envs, dtype=torch.int64, device=placement)
         self.finished_rewards = torch.zeros(
-            (self.interval, self.num_envs), dtype=torch.float64, device=self.device
+            (self.interval, self.num_envs), dtype=torch.float64, device=placement
         )
         self.finished_lengths = torch.zeros(
-            (self.interval, self.num_envs), dtype=torch.float64, device=self.device
+            (self.interval, self.num_envs), dtype=torch.float64, device=placement
         )
         self.finished_valid = torch.zeros(
-            (self.interval, self.num_envs), dtype=torch.bool, device=self.device
+            (self.interval, self.num_envs), dtype=torch.bool, device=placement
         )
-        self.done_count = torch.zeros((), dtype=torch.int64, device=self.device)
-        self.timeout_count = torch.zeros((), dtype=torch.int64, device=self.device)
+        self.done_count = torch.zeros((), dtype=torch.int64, device=placement)
+        self.timeout_count = torch.zeros((), dtype=torch.int64, device=placement)
         self._cursor = 0
         self._updates = 0
         self._finalized = False
+
+    def restore_continuation_values(self, saved):
+        if set(saved) != set(vars(self)):
+            raise ValueError("Collector metric state fields changed")
+        for key, value in saved.items():
+            target = getattr(self, key)
+            if isinstance(value, torch.Tensor):
+                if (
+                    not isinstance(target, torch.Tensor)
+                    or target.shape != value.shape
+                    or target.dtype != value.dtype
+                ):
+                    raise ValueError(f"Collector metric tensor {key} changed")
+                target.copy_(value.to(target.device))
+            elif key in {
+                "device",
+                "num_envs",
+                "interval",
+                "reward_component_names",
+                "reward_component_count",
+            }:
+                if value != target:
+                    raise ValueError(f"Collector metric configuration {key} changed")
+            else:
+                setattr(self, key, value)
+
+
+class CollectorMetrics(CollectorMetricState):
+    """Device aggregation using the same cold value carrier as CPU acceptance."""
 
     @property
     def ready(self) -> bool:
@@ -214,4 +247,4 @@ class CollectorMetrics:
         return result
 
 
-__all__ = ["CollectorMetrics", "MetricFlush"]
+__all__ = ["CollectorMetricState", "CollectorMetrics", "MetricFlush"]

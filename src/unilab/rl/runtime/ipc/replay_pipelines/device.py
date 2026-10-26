@@ -31,6 +31,10 @@ from unilab.rl.runtime.device import sync_device
 from unilab.rl.runtime.ipc.completion import wait_completion
 from unilab.rl.runtime.ipc.replay_buffer import ReplayBuffer
 from unilab.rl.runtime.ipc.replay_pipelines.base import ReplayTickMetadata
+from unilab.rl.runtime.ipc.replay_pipelines.continuation import (
+    initialize_replay_continuation,
+    restore_replay_continuation_values,
+)
 from unilab.rl.runtime.ipc.replay_pipelines.transfer import build_replay_transfer_backend
 
 
@@ -133,7 +137,9 @@ class DeviceReplayPipeline:
         trace_recorder=None,
         trace_cuda_events: bool = True,
     ) -> None:
-        self._replay_buffer = replay_buffer
+        initialize_replay_continuation(
+            self, replay_buffer, sample_count=sample_count, base_seed=base_seed
+        )
         self._device = torch.device(require_offpolicy_replay_device(device))
         if self._device.type not in {"cuda", "mps"}:
             raise ValueError(
@@ -145,12 +151,7 @@ class DeviceReplayPipeline:
             raise ValueError("DeviceReplayPipeline requires an available MPS device")
         self._main_thread_submission = self._device.type == "mps"
         self._learner_thread_id = threading.get_ident()
-        self._sample_count = int(sample_count)
-        self._base_seed = int(base_seed)
         self._trace_recorder = trace_recorder
-        self._capacity = int(replay_buffer.capacity)
-        self._storage_width = int(replay_buffer.storage_width)
-        self._packed_width = self._storage_width
 
         # -- device memory guard (hard fail: this pipeline is opt-in) --
         storage_bytes = self._capacity * self._storage_width * 4
@@ -210,18 +211,6 @@ class DeviceReplayPipeline:
         self._span_events: deque[tuple[int, Any, int, int, int]] = deque()
         self._submission_lock = threading.Lock()
         self._work_lock = threading.RLock()
-        self._submitted_ptr = 0
-        self._visible_ptr = 0
-        self._ingress_high_water = replay_buffer.ingress_diagnostics()["high_water_occupancy"]
-
-        self._hot = 0
-        self._cold = 1
-        self._has_hot_batch = False
-        self._hot_metadata: ReplayTickMetadata | None = None
-        self._prepared_metadata: ReplayTickMetadata | None = None
-        self._prepare_tick_id: int | None = None
-        self._prepare_required_ptr = 0
-        self._prepare_state = "idle"
         self._prepare_error: BaseException | None = None
         self.last_incremental_h2d_time_s = 0.0
         self._prepare_condition = threading.Condition()
@@ -640,103 +629,8 @@ class DeviceReplayPipeline:
     def import_continuation_state(self, state: dict[str, Any]) -> None:
         """Restore after warmup, before spawning a collector, with ``paused()`` held."""
         self._require_continuation_pause()
-        if state.get("schema") != "unilab.device-replay-continuation.v1":
-            raise ValueError("Unsupported device replay continuation schema")
-        if state.get("layout") != [self._capacity, self._storage_width, self._sample_count]:
-            raise ValueError("Replay continuation layout differs")
-        if state.get("sampler") != self.continuation_sampler_configuration():
-            raise ValueError("Replay continuation sampler differs")
-        if int(state["base_seed"]) != self._base_seed:
-            raise ValueError("Replay continuation seed differs")
-        if self._submitted_ptr or self._visible_ptr or self._prepare_tick_id is not None:
-            raise RuntimeError("Replay continuation restore requires an unused pipeline")
-        submitted, visible = int(state["submitted_ptr"]), int(state["visible_ptr"])
-        ingress = state["ingress"]
-        if not 0 <= visible <= submitted <= int(ingress["published_ptr"]):
-            raise ValueError("Invalid replay continuation pointer order")
-        if visible != int(ingress["ptr"]):
-            raise ValueError("Replay continuation visible/committed pointers differ")
-        hot, cold = int(state["hot_slot"]), int(state["cold_slot"])
-        if {hot, cold} != {0, 1}:
-            raise ValueError("Invalid replay continuation slots")
-        prepare_state = state["prepare_state"]
-        if prepare_state not in {"idle", "preparing", "gather_submitted", "ready"}:
-            raise ValueError("Invalid replay continuation prepare state")
-        prepared = (
-            ReplayTickMetadata(**state["prepared_metadata"])
-            if state["prepared_metadata"] is not None
-            else None
-        )
-        hot_metadata = (
-            ReplayTickMetadata(**state["hot_metadata"])
-            if state["hot_metadata"] is not None
-            else None
-        )
-        if prepared is not None and (
-            prepared.batch_gpu_slot != cold
-            or prepared.tick_id != state["prepare_tick_id"]
-            or prepared.sample_count != self._sample_count
-            or prepared.sample_seed != self._base_seed + prepared.tick_id
-        ):
-            raise ValueError("Invalid prepared replay continuation metadata")
-        if bool(state["has_hot_batch"]) != (hot_metadata is not None):
-            raise ValueError("Invalid hot replay continuation metadata")
-        storage = state["storage"]
-        if (
-            not isinstance(storage, torch.Tensor)
-            or storage.dtype != torch.float32
-            or tuple(storage.shape) != (min(submitted, self._capacity), self._storage_width)
-        ):
-            raise ValueError("Invalid replay continuation ring tensor")
-        slots = state["slots"]
-        if len(slots) != 2:
-            raise ValueError("Invalid replay continuation slot count")
-        for index, slot in enumerate(slots):
-            live = (prepared is not None and index == cold) or (
-                bool(state["has_hot_batch"]) and index == hot
-            )
-            if live and slot is None:
-                raise ValueError("Replay continuation is missing a prefetched batch")
-            if slot is not None and (
-                not isinstance(slot, torch.Tensor)
-                or slot.dtype != torch.float32
-                or tuple(slot.shape) != (self._sample_count, self._packed_width)
-            ):
-                raise ValueError("Invalid replay continuation batch tensor")
-        expected_start = visible
-        pending_spans = state["pending_spans"]
-        if len(pending_spans) != int(ingress["consumed_sequence"]) - int(
-            ingress["released_sequence"]
-        ):
-            raise ValueError("Replay continuation pending span/ingress count differs")
-        for offset, (end, slot, start, count) in enumerate(pending_spans):
-            pending = ingress["pending"][offset]
-            if (
-                int(start) != expected_start
-                or int(end) != int(start) + int(count)
-                or int(slot) != pending["slot"]
-                or int(start) != pending["start"]
-                or int(count) != pending["count"]
-            ):
-                raise ValueError("Invalid replay continuation pending span")
-            expected_start = int(end)
-        if expected_start != submitted:
-            raise ValueError("Replay continuation spans do not reach submitted pointer")
-
-        self._replay_buffer.import_continuation_state(ingress)
-        self._gpu_storage[: storage.shape[0]].copy_(storage)
-        for index, slot in enumerate(slots):
-            if slot is not None:
-                self._gpu_packed[index].copy_(slot)
+        pending_spans = restore_replay_continuation_values(self, state)
         sync_device(self._device)
-        self._submitted_ptr, self._visible_ptr = submitted, visible
-        self._hot, self._cold = hot, cold
-        self._has_hot_batch = bool(state["has_hot_batch"])
-        self._hot_metadata, self._prepared_metadata = hot_metadata, prepared
-        self._prepare_tick_id = state["prepare_tick_id"]
-        self._prepare_required_ptr = int(state["prepare_required_ptr"])
-        self._prepare_state = prepare_state
-        self._ingress_high_water = int(state["ingress_high_water"])
         # Event handles are never serialized. Restored byte copies are already
         # complete; fresh completion events preserve their logical ordering.
         for event in self._slot_events:

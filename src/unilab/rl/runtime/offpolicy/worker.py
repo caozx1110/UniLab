@@ -19,6 +19,7 @@ from unilab.rl.runtime.offpolicy.actor_adapter import (
     get_offpolicy_actor_adapter,
     import_actor_adapter_modules,
 )
+from unilab.rl.runtime.offpolicy.control_continuation import CollectorControlState
 from unilab.rl.runtime.offpolicy.coordination import (
     LearnerCoordinationState,
     LearnerPhase,
@@ -422,11 +423,11 @@ def _run_collector(
     replay_buffer.attach_stop_event(stop_event)
     from collections import defaultdict, deque
 
-    total_steps = 0
-    # Bounded rolling window of the most recent completed episodes; an
-    # unbounded list here grows for the entire run.
-    ep_rewards: deque[float] = deque(maxlen=100)
-    ep_lengths: deque[int] = deque(maxlen=100)
+    control = CollectorControlState()
+    total_steps = control.total_steps
+    # Bounded rolling window of the most recent completed episodes.
+    ep_rewards: deque[float] = control.ep_rewards
+    ep_lengths: deque[int] = control.ep_lengths
     state = env.state
     assert state is not None
     # Fail closed on the observation contract: the collector runtime is
@@ -474,19 +475,19 @@ def _run_collector(
         reward_component_names=reward_component_names,
     )
 
-    ep_reward_components = defaultdict(list)
-    timing_accum_ms: defaultdict[str, float] = defaultdict(float)
-    timing_counts: defaultdict[str, int] = defaultdict(int)
-    done_count_window = 0
-    timeout_count_window = 0
+    ep_reward_components = control.ep_reward_components
+    timing_accum_ms = control.timing_accum_ms
+    timing_counts = control.timing_counts
+    done_count_window = control.done_count_window
+    timeout_count_window = control.timeout_count_window
     inference_queue_depth = 0
     inference_action_backlog = 0
     inference_in_flight = 0
-    max_action_backlog_since_metric = 0
-    max_in_flight_since_metric = 0
-    max_publication_lag_since_metric = 0
+    max_action_backlog_since_metric = control.max_action_backlog_since_metric
+    max_in_flight_since_metric = control.max_in_flight_since_metric
+    max_publication_lag_since_metric = control.max_publication_lag_since_metric
     final_metrics_flushed = False
-    pending_metric_flush: MetricFlush | None = None
+    pending_metric_flush: MetricFlush | None = control.pending_metric_flush
 
     def enqueue_collector_metrics(
         *,
@@ -648,7 +649,7 @@ def _run_collector(
     assert obs_t is not None
     assert critic_t is not None
     prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=actor_observation.device)
-    inference_tick = 0
+    inference_tick = control.inference_tick
     resume_rng = None
     if resume_collector_state is not None:
         from unilab.rl.runtime.offpolicy.collector_continuation import restore_metric_state
@@ -670,29 +671,20 @@ def _run_collector(
         importer(saved["environment"])
         state = env.state
         obs_t, critic_t = split_obs_dict(state.obs)
-        prev_dones = saved["prev_dones"]
-        if prev_dones.shape != prev_dones_t.shape or prev_dones.dtype != prev_dones_t.dtype:
-            raise ValueError("Collector continuation previous-done shape/dtype changed")
-        prev_dones_t.copy_(prev_dones.to(prev_dones_t.device))
-        inference_tick = saved["inference_tick"]
-        total_steps = saved["total_steps"]
-        if total_steps != inference_tick * num_envs:
-            raise ValueError("Collector continuation step/tick counters disagree")
-        ep_rewards = deque(saved["ep_rewards"], maxlen=100)
-        ep_lengths = deque(saved["ep_lengths"], maxlen=100)
-        ep_reward_components = defaultdict(list, saved["ep_reward_components"])
-        timing_accum_ms = defaultdict(float, saved["timing_accum_ms"])
-        timing_counts = defaultdict(int, saved["timing_counts"])
-        done_count_window = saved["done_count_window"]
-        timeout_count_window = saved["timeout_count_window"]
-        max_action_backlog_since_metric = saved["max_action_backlog_since_metric"]
-        max_in_flight_since_metric = saved["max_in_flight_since_metric"]
-        max_publication_lag_since_metric = saved["max_publication_lag_since_metric"]
-        pending_metric_flush = (
-            None
-            if saved["pending_metric_flush"] is None
-            else MetricFlush(**saved["pending_metric_flush"])
-        )
+        control.import_values(saved, num_envs=num_envs, prev_dones=prev_dones_t)
+        inference_tick = control.inference_tick
+        total_steps = control.total_steps
+        ep_rewards = control.ep_rewards
+        ep_lengths = control.ep_lengths
+        ep_reward_components = control.ep_reward_components
+        timing_accum_ms = control.timing_accum_ms
+        timing_counts = control.timing_counts
+        done_count_window = control.done_count_window
+        timeout_count_window = control.timeout_count_window
+        max_action_backlog_since_metric = control.max_action_backlog_since_metric
+        max_in_flight_since_metric = control.max_in_flight_since_metric
+        max_publication_lag_since_metric = control.max_publication_lag_since_metric
+        pending_metric_flush = control.pending_metric_flush
         restore_metric_state(collector_metrics, saved["collector_metrics"])
         resume_rng = saved["rng"]
 

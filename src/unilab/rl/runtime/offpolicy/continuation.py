@@ -7,6 +7,7 @@ The manifest is committed last; an interrupted write is never a recovery point.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -41,14 +42,63 @@ def capture_rng_state(device: str | torch.device = "cpu") -> dict[str, Any]:
     }
 
 
-def restore_rng_state(state: dict[str, Any]) -> None:
+def stage_rng_state(state: dict[str, Any]) -> dict[str, Any]:
+    """Validate and detach serialized RNG values without creating device state.
+
+    CUDA/MPS byte arrays are opaque here: actual generator materialization and
+    next-draw equivalence still require their original device implementation.
+    Host engines validate their real state formats on independent generators.
+    """
+    if set(state) != {"schema", "python", "numpy", "torch_cpu", "device_type", "cuda", "mps"}:
+        raise ValueError("Process RNG snapshot fields differ")
     if state.get("schema") != "unilab.process-rng.v1":
         raise ValueError("Unsupported process RNG snapshot")
-    if state["device_type"] == "cuda" and len(state["cuda"]) != torch.cuda.device_count():
-        raise ValueError("Continuation CUDA device count differs")
+    if state["device_type"] not in {"cpu", "cuda", "mps"}:
+        raise ValueError("Unsupported process RNG device type")
+
+    def validate_bytes(value: Any) -> None:
+        if (
+            not isinstance(value, torch.Tensor)
+            or value.device.type != "cpu"
+            or value.dtype != torch.uint8
+            or value.ndim != 1
+            or value.numel() == 0
+        ):
+            raise ValueError("RNG state must be a nonempty CPU uint8 vector")
+
+    validate_bytes(state["torch_cpu"])
+    random.Random().setstate(state["python"])
+    np.random.RandomState().set_state(state["numpy"])
+    torch.Generator(device="cpu").set_state(state["torch_cpu"])
+    if not isinstance(state["cuda"], list):
+        raise ValueError("CUDA RNG states must be a list")
+    for value in state["cuda"]:
+        validate_bytes(value)
+    if state["device_type"] != "cuda" and state["cuda"]:
+        raise ValueError("Unexpected CUDA RNG state for another device")
+    if state["device_type"] == "mps":
+        validate_bytes(state["mps"])
+    elif state["mps"] is not None:
+        raise ValueError("Unexpected MPS RNG state for another device")
+    return copy.deepcopy(state)
+
+
+def _restore_host_rng_payload(state: dict[str, Any]) -> None:
     random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.random.set_rng_state(state["torch_cpu"])
+
+
+def restore_host_rng_state(state: dict[str, Any]) -> None:
+    """Restore host generators only; never label this a complete GPU restore."""
+    _restore_host_rng_payload(stage_rng_state(state))
+
+
+def restore_rng_state(state: dict[str, Any]) -> None:
+    state = stage_rng_state(state)
+    if state["device_type"] == "cuda" and len(state["cuda"]) != torch.cuda.device_count():
+        raise ValueError("Continuation CUDA device count differs")
+    _restore_host_rng_payload(state)
     if state["device_type"] == "cuda":
         torch.cuda.set_rng_state_all(state["cuda"])
     elif state["device_type"] == "mps":

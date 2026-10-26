@@ -25,6 +25,16 @@ def copy_tree(value: Any, *, device=None):
             raise ValueError(
                 "Continuation carrier exceeds 256 MiB; immutable tables need exclusion"
             )
+        if value.dtype == torch.bool:
+            # Bool copy kernels can normalize nonzero scratch bytes to 1.
+            # Continuation owns the original representation, including scalar
+            # scratch that has not yet been overwritten by its first use.
+            return (
+                value.detach()
+                .view(torch.uint8)
+                .to(device=device or "cpu", copy=True)
+                .view(torch.bool)
+            )
         return value.detach().to(device=device or "cpu", copy=True)
     if isinstance(value, np.ndarray):
         if value.nbytes > 256 * 1024**2 or value.dtype.hasobject:
@@ -46,10 +56,15 @@ def restore_tree(target, saved, *, device):
         if isinstance(target, torch.Tensor):
             if target.shape != saved.shape or target.dtype != saved.dtype:
                 raise ValueError("Continuation tensor shape/dtype mismatch")
-            target.copy_(saved.to(device=target.device))
+            if saved.dtype == torch.bool:
+                target.view(torch.uint8).copy_(saved.view(torch.uint8).to(device=target.device))
+            else:
+                target.copy_(saved.to(device=target.device))
             return target
         if target is not None:
             raise TypeError("Continuation tensor target changed type")
+        if saved.dtype == torch.bool:
+            return saved.view(torch.uint8).to(device=device, copy=True).view(torch.bool)
         return saved.to(device=device, copy=True)
     if isinstance(saved, np.ndarray):
         if isinstance(target, np.ndarray):
