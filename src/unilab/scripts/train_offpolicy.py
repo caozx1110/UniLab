@@ -792,6 +792,8 @@ def main(cfg: DictConfig) -> None:
                             "lifecycle_hook": lifecycle_hook,
                             "checkpoint_iterations": checkpoint_iterations,
                         }
+                    if OmegaConf.select(cfg, "training.save_continuation_state", default=False):
+                        lifecycle_options["save_continuation_state"] = True
                     runner = build_runner(algo_name, cfg, log_dir=log_dir)
                     runner.learn(
                         max_iterations=cfg.algo.max_iterations,

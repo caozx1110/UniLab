@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 import os
 import queue as queue_module
+import shutil
 import statistics
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
-from dataclasses import replace
+from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
@@ -44,6 +45,7 @@ from unilab.rl.runtime.ipc.replay_pipelines.device import (
     DeviceReplayPipeline,
     require_offpolicy_replay_device,
 )
+from unilab.rl.runtime.offpolicy import continuation
 from unilab.rl.runtime.offpolicy.actor_adapter import get_offpolicy_actor_adapter
 from unilab.rl.runtime.offpolicy.coordination import LearnerCoordinationState
 from unilab.rl.runtime.offpolicy.lifecycle import (
@@ -1103,6 +1105,126 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         )
         return update_count + 1
 
+    def _continuation_identity(self) -> dict[str, Any]:
+        return {
+            name: getattr(self, name)
+            for name in (
+                "algo_type",
+                "num_envs",
+                "obs_dim",
+                "critic_obs_dim",
+                "action_dim",
+                "batch_size",
+                "updates_per_step",
+                "env_steps_per_sync",
+                "replay_buffer_n",
+                "seed",
+                "train_start_threshold",
+                "policy_before_critic",
+                "target_frequency",
+                "policy_frequency",
+            )
+        }
+
+    def _save_continuation(
+        self,
+        *,
+        iteration: int,
+        held_tick: int,
+        log_dir: str,
+        replay_pipeline,
+        request_queue,
+        response_queue,
+        runner_state: Callable[[], dict[str, Any]],
+        drain_metrics: Callable[[int], None],
+    ) -> None:
+        """Commit a complete state only with the collector and replay parked."""
+        root = Path(log_dir).resolve() / f"continuation_{iteration}"
+        root.mkdir(exist_ok=False)
+        request_id = str(iteration)
+        request_queue.put(
+            {
+                "operation": "snapshot",
+                "request_id": request_id,
+                "tick": held_tick,
+                "path": str(root / "collector.pt"),
+            }
+        )
+        drain_metrics(held_tick)
+        while True:
+            try:
+                response = response_queue.get(timeout=1.0)
+                break
+            except queue_module.Empty:
+                if not self._collector_process.is_alive():
+                    raise RuntimeError("Collector died while saving full continuation")
+        if response.get("error"):
+            raise RuntimeError(f"Collector continuation failed: {response['error']}")
+        if response.get("request_id") != request_id or response.get("tick") != held_tick:
+            raise ValueError("Collector continuation acknowledged a different boundary")
+        collector_binding = {key: response[key] for key in ("path", "sha256", "bytes")}
+        if Path(collector_binding["path"]) != root / "collector.pt":
+            raise ValueError("Collector continuation wrote an unexpected path")
+        replay_state = replay_pipeline.export_continuation_state()
+        runner_state = runner_state()
+        if replay_state["prepare_tick_id"] is not None and (
+            replay_state["prepare_tick_id"] != runner_state["prepared_tick"]
+        ):
+            raise ValueError("Prepared replay tick differs from runner continuation")
+        # The terminal iteration does not prefetch beyond its endpoint. A later
+        # explicit extension must prepare normally, rather than invent a batch.
+        runner_state["prepared_tick"] = replay_state["prepare_tick_id"]
+        runtime_state = {
+            "schema": "unilab.offpolicy-runtime.v1",
+            "iteration": iteration,
+            "held_tick": held_tick,
+            "runner": runner_state,
+            "learner": self.learner.export_continuation_state(),
+            "rng": continuation.capture_rng_state(self.device),
+        }
+        replay_binding = continuation.save_state(root / "replay.pt", replay_state)
+        del replay_state
+        runtime_binding = continuation.save_state(root / "runtime.pt", runtime_state)
+        checkpoint = Path(log_dir).resolve() / f"model_{iteration}.pt"
+        with checkpoint.open("rb") as checkpoint_stream:
+            os.fsync(checkpoint_stream.fileno())
+        manifest = {
+            "schema": "unilab.offpolicy-continuation.v1",
+            "iteration": iteration,
+            "held_tick": held_tick,
+            "identity": self._continuation_identity(),
+            "checkpoint": continuation.file_binding(checkpoint),
+            "collector": collector_binding,
+            "replay": replay_binding,
+            "runtime": runtime_binding,
+        }
+        continuation.commit_manifest(checkpoint.with_suffix(".continuation.json"), manifest)
+
+    def _restore_continuation(self, replay_pipeline) -> dict[str, Any] | None:
+        """Cold preparation may mutate scratch/exploration; restore only after it."""
+        manifest = self._resume_continuation
+        if manifest is None:
+            return None
+        runtime = continuation.load_state(manifest["runtime"])
+        if (
+            runtime.get("schema") != "unilab.offpolicy-runtime.v1"
+            or runtime["iteration"] != manifest["iteration"]
+            or runtime["held_tick"] != manifest["held_tick"]
+            or runtime["runner"]["inference_scheduler"]["next_tick"] != manifest["held_tick"]
+        ):
+            raise ValueError("Continuation components disagree on the stopped boundary")
+        state = torch.load(
+            self._resume_checkpoint_path, map_location=self.device, weights_only=False
+        )
+        self.learner.load_state_dict(state)
+        self.learner.import_continuation_state(runtime["learner"])
+        replay_state = continuation.load_state(manifest["replay"])
+        if runtime["runner"]["prepared_tick"] != replay_state["prepare_tick_id"]:
+            raise ValueError("Continuation prefetched replay tick differs")
+        with replay_pipeline.paused():
+            replay_pipeline.import_continuation_state(replay_state)
+        return runtime
+
     def _lifecycle_context(
         self, *, phase: str, iteration: int, log_dir: str, checkpoint_path: str | None = None
     ) -> LifecycleContext:
@@ -1123,10 +1245,11 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         log_dir: str,
         replay_pipeline,
         wait_for_request: Callable[[], int],
+        capture_continuation: Callable[[int], None] | None = None,
     ) -> int:
         """Hold the next inference request until the owner checkpoint hook returns."""
         hook = self._lifecycle_hook
-        if hook is None:
+        if hook is None and capture_continuation is None:
             raise RuntimeError("Checkpoint lifecycle requires an injected hook")
         checkpoint_path = str((Path(log_dir) / f"model_{iteration}.pt").resolve())
         context = self._lifecycle_context(
@@ -1165,6 +1288,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 sync_device(self.device)
                 if self.dp_sync is not None:
                     self.dp_sync.barrier()
+                if capture_continuation is not None:
+                    capture_continuation(held_tick)
                 # Rank 0 saved atomically before entering the shared boundary.
                 checkpoint = Path(checkpoint_path).stat()
                 context = replace(
@@ -1178,7 +1303,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     stop_request=request_stop,
                 )
                 context.publish_progress()
-                hook(context)
+                if hook is not None:
+                    hook(context)
                 if not publish_retention_check(context, retained_state()):
                     raise RuntimeError("Checkpoint hook changed retained training/replay state")
                 # Long work must be host-coordinated by the hook so all ranks
@@ -1559,17 +1685,39 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         resume_checkpoint: str | None = None,
         lifecycle_hook: LifecycleHook | None = None,
         checkpoint_iterations: Sequence[int] = (),
+        save_continuation_state: bool = False,
     ) -> None:
         validate_hook(lifecycle_hook)
         self._lifecycle_hook = lifecycle_hook
         self._lifecycle_stop_reason = None
         self._lifecycle_pause_seconds = 0.0
+        self._save_continuation_state = bool(save_continuation_state)
+        self._resume_continuation = None
+        self._resume_checkpoint_path = resume_checkpoint
+        if save_continuation_state:
+            if self.dp_sync is not None or not self.collector_tensor_native:
+                raise ValueError("Full continuation currently requires one tensor-native rank")
+            for name in ("export_continuation_state", "import_continuation_state"):
+                if not callable(getattr(self.learner, name, None)):
+                    raise TypeError(f"Learner does not support {name}")
+            validator = getattr(self.learner, "validate_continuation_support", None)
+            if callable(validator):
+                validator()
+            if resume_checkpoint is not None:
+                if Path(resume_checkpoint).resolve().parent == Path(log_dir).resolve():
+                    raise ValueError("Full continuation requires a new output directory")
+                self._resume_continuation = continuation.read_manifest(resume_checkpoint)
         self._checkpoint_iterations = validate_checkpoint_iterations(
             checkpoint_iterations, max_iterations
         )
         resume_start_iteration = 1
         if resume_checkpoint is not None:
             resume_start_iteration = self._restore_resume_checkpoint(resume_checkpoint)
+            if self._resume_continuation is not None and (
+                self._resume_continuation["iteration"] != resume_start_iteration - 1
+                or self._resume_continuation["identity"] != self._continuation_identity()
+            ):
+                raise ValueError("Continuation runner configuration/progress differs")
         self.resume_start_iteration = resume_start_iteration
         if resume_start_iteration > max_iterations + 1:
             raise ValueError(
@@ -1904,6 +2052,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             inference_response_queue = _SPAWN_CTX.Queue(maxsize=1)
 
             metrics_queue = _SPAWN_CTX.Queue(maxsize=100)
+            checkpoint_request_queue = _SPAWN_CTX.Queue(maxsize=1)
+            checkpoint_response_queue = _SPAWN_CTX.Queue(maxsize=1)
 
             # --- DP init broadcast must land before the collector's first ---
             # --- inference request reaches learner.actor ---
@@ -1919,6 +2069,9 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 inference_dones=inference_dones_actor,
                 replay_pipeline=replay_pipeline,
             )
+            restored_runtime = self._restore_continuation(replay_pipeline)
+            if restored_runtime is not None:
+                inference_slot.initialize_continuation_tick(restored_runtime["held_tick"])
             graph_manifest = self._cuda_graph_runtime_manifest()
             self.runtime_manifest["cuda_graph"] = graph_manifest
             logger.update_runtime_manifest(dict(self.runtime_manifest))
@@ -1952,6 +2105,18 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 "learner_coordination": self._learner_coordination,
                 "learner_pid": os.getpid(),
             }
+            if self._save_continuation_state:
+                collector_kwargs.update(
+                    {
+                        "checkpoint_request_queue": checkpoint_request_queue,
+                        "checkpoint_response_queue": checkpoint_response_queue,
+                        "resume_collector_state": (
+                            None
+                            if self._resume_continuation is None
+                            else self._resume_continuation["collector"]
+                        ),
+                    }
+                )
             # The collector may finish env construction quickly while the
             # learner is still in its startup sleep. It must observe a healthy
             # waiting learner, never the pre-start STOPPED phase.
@@ -1995,6 +2160,129 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
             graph_replay_snapshot_written = False
             held_inference_request: int | None = None
+
+            if restored_runtime is not None:
+                restored_runner = restored_runtime["runner"]
+                scheduler_state = restored_runner["inference_scheduler"]
+                if (
+                    set(scheduler_state) != set(vars(inference_scheduler))
+                    or scheduler_state["env_steps_per_sync"] != self.env_steps_per_sync
+                    or scheduler_state["_pending_tick"] is not None
+                    or scheduler_state["_ticks_since_update"] != 0
+                ):
+                    raise ValueError("Invalid inference scheduler continuation boundary")
+                vars(inference_scheduler).update(scheduler_state)
+                reward_stats_ptr = restored_runner["reward_stats_ptr"]
+                prepared_tick = restored_runner["prepared_tick"]
+                reward_history.extend(restored_runner["reward_history"])
+                latest_reward_components = RewardComponentWindow(
+                    **restored_runner["reward_components"]
+                )
+                has_logged_reward = restored_runner["has_logged_reward"]
+                last_buf_log = restored_runner["last_buf_log"]
+                write_read_ema = restored_runner["write_read_ema"]
+                best_mean_reward = restored_runner["best_mean_reward"]
+                last_mean_reward = restored_runner["last_mean_reward"]
+                for name, value in restored_runner["logger"].items():
+                    setattr(logger, name, value)
+                continuation.restore_rng_state(restored_runtime["rng"])
+                del restored_runtime
+
+            def continuation_runner_state() -> dict[str, Any]:
+                return {
+                    "inference_scheduler": dict(vars(inference_scheduler)),
+                    "reward_stats_ptr": reward_stats_ptr,
+                    "prepared_tick": prepared_tick,
+                    "reward_history": list(reward_history),
+                    "reward_components": asdict(latest_reward_components),
+                    "has_logged_reward": has_logged_reward,
+                    "last_buf_log": last_buf_log,
+                    "write_read_ema": write_read_ema,
+                    "best_mean_reward": best_mean_reward,
+                    "last_mean_reward": last_mean_reward,
+                    "logger": {
+                        name: getattr(logger, name)
+                        for name in (
+                            "_total_steps",
+                            "_buffer_size",
+                            "_buffer_target",
+                            "_mean_ep_length",
+                            "_timeout_rate",
+                            "_buffer_utilization",
+                        )
+                    },
+                }
+
+            def drain_continuation_metrics(held_tick: int) -> None:
+                # Cross-queue publication order is not guaranteed by
+                # multiprocessing feeder threads. A marker on the metrics queue
+                # proves that all pre-checkpoint reports reached this owner.
+                while True:
+                    try:
+                        message = metrics_queue.get(timeout=1.0)
+                    except queue_module.Empty:
+                        if not self._collector_process.is_alive():
+                            raise RuntimeError("Collector died before continuation metrics fence")
+                        continue
+                    if "continuation_barrier" in message:
+                        if message != {"continuation_barrier": held_tick}:
+                            raise ValueError("Collector metrics fence belongs to another tick")
+                        return
+                    pending = queue_module.Queue()
+                    pending.put(message)
+                    self._drain_metrics(
+                        pending,
+                        reward_history,
+                        latest_reward_components,
+                        logger,
+                        trace_recorder,
+                    )
+
+            def capture_continuation(held_tick: int) -> None:
+                self._save_continuation(
+                    iteration=iteration,
+                    held_tick=held_tick,
+                    log_dir=log_dir,
+                    replay_pipeline=replay_pipeline,
+                    request_queue=checkpoint_request_queue,
+                    response_queue=checkpoint_response_queue,
+                    runner_state=continuation_runner_state,
+                    drain_metrics=drain_continuation_metrics,
+                )
+
+            if self._resume_continuation is not None:
+                # Persist the restored boundary in the new attempt before any
+                # action/update. This gives an auditable round-trip artifact and
+                # reruns a hook possibly interrupted by preemption. The original
+                # policy checkpoint remains byte-identical and immutable.
+                iteration = start_iteration - 1
+                checkpoint_copy = Path(log_dir).resolve() / f"model_{iteration}.pt"
+                if checkpoint_copy.exists():
+                    raise FileExistsError("Resume output already contains its checkpoint")
+                shutil.copyfile(self._resume_checkpoint_path, checkpoint_copy)
+                ckpt_path = str(checkpoint_copy)
+                held_inference_request = self._checkpoint_lifecycle(
+                    iteration=iteration,
+                    log_dir=log_dir,
+                    replay_pipeline=replay_pipeline,
+                    capture_continuation=capture_continuation,
+                    wait_for_request=partial(
+                        self._wait_for_inference_request,
+                        inference_request_queue,
+                        expected_tick=inference_scheduler.next_tick,
+                        replay_pipeline=replay_pipeline,
+                        metrics_queue=metrics_queue,
+                        reward_history=reward_history,
+                        latest_reward_components=latest_reward_components,
+                        logger=logger,
+                        trace_recorder=trace_recorder,
+                        replay_buffer=replay_buffer,
+                        ckpt_path=ckpt_path,
+                        train_start_wall=train_start_wall,
+                    ),
+                )
+                if self._lifecycle_stop_reason is not None:
+                    raise RuntimeError("Restored checkpoint hook requested a stop")
 
             # ---- training loop ----
             for iteration in range(start_iteration, max_iterations + 1):
@@ -2511,7 +2799,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 if (
                     (save_interval > 0 and iteration % save_interval == 0)
                     or iteration in self._checkpoint_iterations
-                    or (self._lifecycle_hook is not None and iteration == max_iterations)
+                    or (
+                        (self._lifecycle_hook is not None or self._save_continuation_state)
+                        and iteration == max_iterations
+                    )
                 ):
                     saved_path = self._save_checkpoint(
                         log_dir=log_dir,
@@ -2520,11 +2811,14 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                     )
                     if saved_path is not None:
                         ckpt_path = saved_path
-                    if self._lifecycle_hook is not None:
+                    if self._lifecycle_hook is not None or self._save_continuation_state:
                         held_inference_request = self._checkpoint_lifecycle(
                             iteration=iteration,
                             log_dir=log_dir,
                             replay_pipeline=replay_pipeline,
+                            capture_continuation=(
+                                capture_continuation if self._save_continuation_state else None
+                            ),
                             wait_for_request=partial(
                                 self._wait_for_inference_request,
                                 inference_request_queue,

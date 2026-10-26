@@ -921,6 +921,78 @@ class TorchEnv(ABEnv):
     def export_training_state(self) -> dict[str, Any]:
         return {"version": 1, "step_counter": self.step_counter}
 
+    def export_continuation_state(self) -> dict[str, Any]:
+        """Export a completed transition, including backend integration state."""
+        from unilab.managers.continuation import capture_attributes, copy_tree
+
+        if self._state is None or self._autoreset_reset_active:
+            raise RuntimeError("Environment continuation requires a completed transition")
+        if self._pending_backend_step_completion is not None:
+            raise RuntimeError("Environment continuation has a pending physics step")
+        info = {key: value for key, value in self._state.info.items() if key != "completion"}
+        return {
+            "schema": "unilab.torch-env-continuation.v1",
+            "class": f"{type(self).__module__}.{type(self).__qualname__}",
+            "num_envs": self.num_envs,
+            "step_counter": self.step_counter,
+            "autoreset": self._autoreset,
+            "backend": self._backend.export_continuation_state(),
+            "transition": copy_tree(
+                {
+                    "obs": self._state.obs,
+                    "reward": self._state.reward,
+                    "terminated": self._state.terminated,
+                    "truncated": self._state.truncated,
+                    "info": info,
+                    "final_observation": self._state.final_observation,
+                }
+            ),
+            "nan_guard": (
+                None
+                if self._nan_guard is None
+                else capture_attributes(self._nan_guard, exclude=("_cfg",))
+            ),
+        }
+
+    def import_continuation_state(self, state: Mapping[str, Any]) -> None:
+        from unilab.managers.continuation import restore_attributes, restore_tree
+
+        if (
+            state.get("schema") != "unilab.torch-env-continuation.v1"
+            or state.get("num_envs") != self.num_envs
+            or state.get("class") != f"{type(self).__module__}.{type(self).__qualname__}"
+            or self._state is None
+            or self._autoreset_reset_active
+        ):
+            raise ValueError("Environment continuation schema/identity/boundary mismatch")
+        counter = state["step_counter"]
+        if type(counter) is not int or counter < 0 or type(state["autoreset"]) is not bool:
+            raise ValueError("Environment continuation counters are invalid")
+        if (state["nan_guard"] is None) != (self._nan_guard is None):
+            raise ValueError("Environment continuation diagnostic guard changed")
+        self._backend.import_continuation_state(state["backend"])
+        transition = state["transition"]
+        if set(transition) != {
+            "obs",
+            "reward",
+            "terminated",
+            "truncated",
+            "info",
+            "final_observation",
+        }:
+            raise ValueError("Environment continuation transition fields changed")
+        for key, value in transition.items():
+            setattr(
+                self._state, key, restore_tree(getattr(self._state, key), value, device=self.device)
+            )
+        self.step_counter = counter
+        self._autoreset = state["autoreset"]
+        self._pending_backend_step_completion = None
+        if self._nan_guard is not None:
+            restore_attributes(
+                self._nan_guard, state["nan_guard"], device=self.device, exclude=("_cfg",)
+            )
+
     def import_training_state(self, state: Mapping[str, Any]) -> None:
         if not isinstance(state, Mapping) or set(state) != {"version", "step_counter"}:
             raise ValueError("TorchEnv training state requires version and step_counter only")

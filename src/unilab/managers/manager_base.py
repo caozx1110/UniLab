@@ -92,6 +92,17 @@ class ManagerTermBase:
         """Returns the value of the term required by the manager."""
         raise NotImplementedError
 
+    def export_continuation_state(self) -> dict[str, Any]:
+        """Save value-only term state; opaque owners must implement this API."""
+        from unilab.managers.continuation import capture_attributes
+
+        return capture_attributes(self, exclude=("_env", "cfg"))
+
+    def import_continuation_state(self, state: dict[str, Any]) -> None:
+        from unilab.managers.continuation import restore_attributes
+
+        restore_attributes(self, state, device=self._env.device, exclude=("_env", "cfg"))
+
 
 class ManagerBase(abc.ABC):
     """Base class for all managers."""

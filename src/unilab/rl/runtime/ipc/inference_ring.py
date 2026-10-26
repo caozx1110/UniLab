@@ -12,6 +12,7 @@ flag.
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 from typing import Any, Protocol, cast
 
 import torch
@@ -270,6 +271,8 @@ class SharedInferenceRing:
         self.action_dim = int(action_dim)
         self.capacity = int(capacity)
         self.device = target
+        self._creator_pid = os.getpid()
+        self._continuation_initialized = False
         self._epoch = _SPAWN_CTX.Value("q", int(epoch))
         self._closed = _SPAWN_CTX.Value("i", 0)
         self._published_tick = _SPAWN_CTX.Value("q", -1)
@@ -381,6 +384,42 @@ class SharedInferenceRing:
         state["_local_consumer_done_events"] = {}
         state["_local_closed"] = False
         return state
+
+    def initialize_continuation_tick(self, next_tick: int) -> None:
+        """Set a new empty ring's first tick before spawning its collector.
+
+        The restored collector republishes the held observation at this tick.
+        IPC events, epochs, headers and semaphore counts remain newly created;
+        no message from the previous process is replayed or acknowledged twice.
+        Only the process that constructed the unused ring may initialize it.
+        """
+        if type(next_tick) is not int or next_tick < 0:
+            raise ValueError("Continuation inference tick must be a non-negative integer")
+        self._require_open()
+        if os.getpid() != self._creator_pid:
+            raise RuntimeError("Only a new inference ring's creator may initialize continuation")
+        if self._continuation_initialized:
+            raise RuntimeError("Inference ring continuation was already initialized")
+        cursors = (
+            self._published_tick,
+            self._observation_tick,
+            self._action_tick,
+            self._consumed_tick,
+        )
+        headers = (
+            self._request_ticks,
+            self._request_epochs,
+            self._response_ticks,
+            self._policy_versions,
+            self._consumer_done_ticks,
+        )
+        if any(int(cursor.value) != -1 for cursor in cursors) or any(
+            int(value) != -1 for header in headers for value in header
+        ):
+            raise RuntimeError("Continuation initialization requires a new empty inference ring")
+        for cursor in cursors:
+            cursor.value = next_tick - 1
+        self._continuation_initialized = True
 
     @property
     def nbytes(self) -> int:

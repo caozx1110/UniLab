@@ -28,13 +28,41 @@ uv run train --algo flashsac --task g1_motion_tracking --sim mjwarp \
   training.no_play=true
 ```
 
-The off-policy checkpoint restores the full learner state (networks,
+By default, the off-policy checkpoint restores the full learner state (networks,
 optimizers, schedulers, normalizers, and update count), and training
 continues with absolute iteration numbering (`model_32000.pt` resumes at
 iteration 32001, so `algo.max_iterations` stays the total budget, not an
 increment). The replay buffer is not checkpointed: a resumed run re-warms
 from an empty buffer through the usual train-start threshold, and RNG state
 is not restored.
+
+### Complete runtime continuation (source profile)
+
+The explicit `++training.save_continuation_state=true` option adds complete
+single-rank tensor-runtime snapshots. The learner, task terms and simulation
+backend must implement `export_continuation_state()` and
+`import_continuation_state(state)`; unsupported owners fail closed. FlashSAC
+whole-cycle/DP CUDA graphs and Inductor CUDA graphs are not supported by this
+continuation path. Ordinary policy checkpoints remain available for evaluation.
+
+At each save point, the runner holds the next published inference request,
+fences collector metrics and pauses replay. It preserves the physical state,
+manager/observation/action histories, exploration state, valid replay ring,
+already-prefetched samples, reward-normalization cursor and process RNGs. A
+`model_N.continuation.json` manifest binds the native model and three component
+files under `continuation_N/`. All files are synced before the manifest commits;
+a partial directory without a complete manifest is not a recovery point.
+
+Resume with the same option and the original checkpoint selector into a **new**
+output directory. After cold construction/compilation, the runtime restores all
+state, creates new empty IPC objects at the saved tick, and republishes the saved
+observation without resetting or taking an extra environment step. It records
+the restored boundary in the new output before the first update, then repeats
+the checkpoint lifecycle hook so an interrupted evaluation is not skipped.
+Task owners must bind immutable data/config/source identities and account for
+snapshot I/O, startup and repeated evaluation costs. Large replay snapshots can
+require substantial host memory and disk space. Loading is only for trusted
+runtime-produced files, with SHA validation before deserialization.
 
 ## Checkpoint Format Support Boundary
 

@@ -122,6 +122,50 @@ class FlashSACActor(nn.Module):
         self._repeat_count = torch.zeros(batch_size, device=device, dtype=torch.int32)
         self._repeat_target = torch.zeros(batch_size, device=device, dtype=torch.int32)
 
+    def export_continuation_state(self) -> dict[str, object]:
+        """Save temporally correlated exploration separately from policy weights."""
+        return {
+            "schema": "unilab.flashsac-exploration-continuation.v1",
+            "noise": self._noise.detach().to("cpu", copy=True),
+            "repeat_count": self._repeat_count.detach().to("cpu", copy=True),
+            "repeat_target": self._repeat_target.detach().to("cpu", copy=True),
+        }
+
+    def import_continuation_state(self, state: dict[str, object]) -> None:
+        """Restore after actor warmup, before its first resumed inference."""
+        if state.get("schema") != "unilab.flashsac-exploration-continuation.v1":
+            raise ValueError("Unsupported FlashSAC exploration continuation schema")
+        noise, count, target = (state[key] for key in ("noise", "repeat_count", "repeat_target"))
+        if not all(isinstance(value, torch.Tensor) for value in (noise, count, target)):
+            raise ValueError("FlashSAC exploration continuation must contain tensors")
+        noise, count, target = (
+            cast(torch.Tensor, noise),
+            cast(torch.Tensor, count),
+            cast(torch.Tensor, target),
+        )
+        batch_size = noise.shape[0] if noise.ndim else -1
+        expected_noise_shape = (0,) if noise.numel() == 0 else (batch_size, self.action_dim)
+        if (
+            tuple(noise.shape) != expected_noise_shape
+            or tuple(count.shape) != (batch_size,)
+            or tuple(target.shape) != (batch_size,)
+            or noise.dtype != torch.float32
+            or count.dtype != torch.int32
+            or target.dtype != torch.int32
+        ):
+            raise ValueError("Invalid FlashSAC exploration continuation shape or dtype")
+        device = self.zeta_cdf.device
+        for name, value in (
+            ("_noise", noise),
+            ("_repeat_count", count),
+            ("_repeat_target", target),
+        ):
+            current = getattr(self, name)
+            if current.shape == value.shape and current.dtype == value.dtype:
+                current.copy_(value)
+            else:
+                setattr(self, name, value.to(device, copy=True))
+
     def _sample_repeat_targets(self, batch_size: int, device: torch.device) -> torch.Tensor:
         draws = torch.rand(batch_size, device=device)
         cdf = self.zeta_cdf.to(device)

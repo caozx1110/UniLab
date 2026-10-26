@@ -242,6 +242,154 @@ class ReplayBuffer:
     def attach_stop_event(self, stop_event: Any) -> None:
         self._stop_event = stop_event
 
+    def export_continuation_state(self) -> dict[str, Any]:
+        """Copy bounded ingress while its producer and pipeline are parked.
+
+        The large authoritative ring belongs to the pipeline and is deliberately
+        absent here. CUDA publications must have completed before this call.
+        Locks, semaphores and IPC event handles are process resources, not data.
+        """
+        published = int(self._ingress_publish_seq[0])
+        consumed = int(self._ingress_consume_seq)
+        released = int(self._ingress_release_seq)
+        if not released <= consumed <= published or published - released > self._ingress_depth:
+            raise RuntimeError("Cannot checkpoint inconsistent replay ingress sequences")
+        if bool(self._ingress_closed[0]):
+            raise RuntimeError("Cannot checkpoint closed replay ingress")
+        completion = self.import_ingress_publication()
+        if completion is not None:
+            wait_completion(
+                completion,
+                stream=self._ingress_read_stream(),
+                operation=completion.operation,
+                producer_id=self.completion_producer_id,
+                last_sequence=self.completion_sequence,
+            )
+        pending = []
+        for sequence in range(released, published):
+            slot = sequence % self._ingress_depth
+            count = int(self._ingress_counts[slot])
+            pending.append(
+                {
+                    "sequence": sequence,
+                    "slot": slot,
+                    "start": int(self._ingress_starts[slot]),
+                    "count": count,
+                    "data": self._ingress_slots[slot][:count].detach().to("cpu", copy=True),
+                }
+            )
+        diagnostics = {
+            name: int(getattr(self, name)[0])
+            for name in (
+                "_ingress_high_water",
+                "_ingress_backpressure_waits",
+                "_ingress_backpressure_wait_ns",
+                "_ingress_early_returns",
+                "_ingress_dropped_batches",
+                "_ingress_closed_returns",
+                "_ingress_stop_returns",
+            )
+        }
+        return {
+            "schema": "unilab.replay-ingress-continuation.v1",
+            "layout": [
+                self.capacity,
+                self._obs_dim,
+                self._action_dim,
+                self._critic_dim,
+                self._ingress_depth,
+                self._ingress_slot_rows,
+            ],
+            "ptr": int(self.ptr[0]),
+            "size": int(self.size[0]),
+            "published_ptr": self.published_ptr,
+            "published_sequence": published,
+            "consumed_sequence": consumed,
+            "released_sequence": released,
+            "pending": pending,
+            "diagnostics": diagnostics,
+        }
+
+    def import_continuation_state(self, state: dict[str, Any]) -> None:
+        """Restore ingress before spawning its producer, with the pipeline paused."""
+        if state.get("schema") != "unilab.replay-ingress-continuation.v1":
+            raise ValueError("Unsupported replay ingress continuation schema")
+        layout = [
+            self.capacity,
+            self._obs_dim,
+            self._action_dim,
+            self._critic_dim,
+            self._ingress_depth,
+            self._ingress_slot_rows,
+        ]
+        if state.get("layout") != layout:
+            raise ValueError("Replay ingress continuation layout differs")
+        if self.published_ptr or int(self.ptr[0]) or int(self._ingress_publish_seq[0]):
+            raise RuntimeError("Replay ingress restore requires an unused instance")
+        published = int(state["published_sequence"])
+        consumed = int(state["consumed_sequence"])
+        released = int(state["released_sequence"])
+        ptr, size, published_ptr = (int(state[name]) for name in ("ptr", "size", "published_ptr"))
+        if not 0 <= released <= consumed <= published or published - released > self._ingress_depth:
+            raise ValueError("Invalid replay ingress continuation sequences")
+        if not 0 <= ptr <= published_ptr or size != min(ptr, self.capacity):
+            raise ValueError("Invalid replay ingress continuation pointers")
+        pending = state["pending"]
+        if len(pending) != published - released:
+            raise ValueError("Replay ingress continuation has missing pending slots")
+        expected_start = ptr
+        for sequence, item in zip(range(released, published), pending, strict=True):
+            count, slot = int(item["count"]), sequence % self._ingress_depth
+            data = item["data"]
+            if (
+                item["sequence"] != sequence
+                or item["slot"] != slot
+                or int(item["start"]) != expected_start
+                or not 0 < count <= self._ingress_slot_rows
+                or not isinstance(data, torch.Tensor)
+                or data.dtype != torch.float32
+                or tuple(data.shape) != (count, self.storage_width)
+            ):
+                raise ValueError("Invalid replay ingress continuation slot")
+            expected_start += count
+        if expected_start != published_ptr:
+            raise ValueError("Replay ingress continuation does not reach published pointer")
+        for item in pending:
+            slot, count = int(item["slot"]), int(item["count"])
+            self._ingress_slots[slot][:count].copy_(item["data"])
+            self._ingress_starts[slot] = int(item["start"])
+            self._ingress_counts[slot] = count
+        self.ptr[0], self.size[0] = ptr, size
+        self._published_ptr[0] = published_ptr
+        self._ingress_publish_seq[0] = published
+        self._ingress_consume_seq = consumed
+        self._ingress_release_seq = released
+        self._ingress_release_seq_tensor[0] = released
+        for name, value in state["diagnostics"].items():
+            if name not in {
+                "_ingress_high_water",
+                "_ingress_backpressure_waits",
+                "_ingress_backpressure_wait_ns",
+                "_ingress_early_returns",
+                "_ingress_dropped_batches",
+                "_ingress_closed_returns",
+                "_ingress_stop_returns",
+            }:
+                raise ValueError("Unknown replay ingress diagnostic field")
+            getattr(self, name)[0] = int(value)
+        spawn_context = mp.get_context("spawn")
+        self._ingress_free = spawn_context.Semaphore(self._ingress_depth - (published - released))
+        self._ingress_ready = spawn_context.Semaphore(published - consumed)
+        # All restored bytes have completed their copy. No event from the old
+        # CUDA context is meaningful; the next producer establishes a new
+        # receipt identity without changing its saved environment/RNG state.
+        self._last_completion = None
+        self._completion_sequence = 0
+        self._completion_producer_id = None
+        self._completion_metadata_available.zero_()
+        self._completion_metadata_version.zero_()
+        self._completion_metadata_local_version = 0
+
     def take_published_ingress(self) -> tuple[int, int, int, torch.Tensor] | None:
         if not self._ingress_ready.acquire(block=False):
             return None

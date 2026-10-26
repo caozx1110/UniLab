@@ -26,10 +26,31 @@ uv run train --algo flashsac --task g1_motion_tracking --sim mjwarp \
   training.no_play=true
 ```
 
-off-policy checkpoint 恢复完整的 learner 状态（网络、优化器、调度器、normalizer
+默认 off-policy checkpoint 恢复完整的 learner 状态（网络、优化器、调度器、normalizer
 与 update count），训练以绝对迭代编号继续（`model_32000.pt` 从第 32001 次迭代继续，
 因此 `algo.max_iterations` 仍是总预算而不是增量）。replay buffer 不落盘：续训的 run
 会从空 buffer 重新经过 train-start 阈值热身，且 RNG 状态不恢复。
+
+### 完整运行时续接（源码 profile）
+
+显式设置 `++training.save_continuation_state=true`，为单 rank tensor runtime
+保存完整状态。learner、任务 term 和仿真 backend 必须实现
+`export_continuation_state()` / `import_continuation_state(state)`；不支持的 owner
+明确拒绝，不隐式降级。该路径暂不支持 FlashSAC whole-cycle/DP CUDA graph 或
+Inductor CUDA graph。原生模型 checkpoint 保持评测兼容。
+
+保存时，runner 保留下一条已发布推理请求，排空该边界之前的 collector 指标并暂停
+replay，保存物理状态、manager/观测/动作历史、探索状态、有效 replay ring、已经
+预取的样本、奖励归一化游标及各进程 RNG。`model_N.continuation.json` 绑定原生模型
+和 `continuation_N/` 内三个组件文件；全部文件同步落盘后才提交 manifest。
+没有完整 manifest 的半成品目录不能用于恢复。
+
+恢复保留同一选项及原 checkpoint 选择器，必须使用**新的输出目录**。构建/编译后
+再恢复状态，新建空 IPC 对象并从保存的 tick 接续，只重新发布保存的观测，不 reset、
+不多走环境步。首次更新前在新目录再次保存恢复边界，并重做 checkpoint lifecycle
+hook，避免跳过被抢占中断的评测。任务 owner 仍须绑定不可变数据、配置和源码身份，
+计入保存 I/O、初始化与重复评测成本，并核查大型 replay 对主机内存和磁盘的需求。
+只加载本运行时产生的可信文件，先校验 SHA，再反序列化。
 
 ## 检查点格式支持边界
 

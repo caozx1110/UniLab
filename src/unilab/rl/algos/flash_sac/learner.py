@@ -309,6 +309,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             if use_whole_cycle_cuda_graph is None
             else bool(use_whole_cycle_cuda_graph)
         )
+        self._whole_cycle_cuda_graph_requested = graph_requested
         if self.compile_native_batch_norm and (graph_requested or self._dp_whole_cycle_cuda_graph):
             raise ValueError(
                 "compile_native_batch_norm introduces explicit actor graph breaks; "
@@ -1202,6 +1203,142 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             ),
             "update_count": self.update_count,
         }
+
+    def validate_continuation_support(self) -> None:
+        """Graph-owned RNG/capture state has not been validated across processes."""
+        if (
+            self._whole_cycle_cuda_graph_requested
+            or self._compile_full_update_cycle
+            or self._update_cycle_graph is not None
+            or self._dp_whole_cycle_cuda_graph
+            or (
+                self.use_compile
+                and self.compile_options.get("triton.cudagraphs", True) is not False
+            )
+        ):
+            raise ValueError(
+                "Complete FlashSAC continuation requires whole-cycle and Inductor CUDA graphs disabled"
+            )
+
+    def _continuation_configuration(self) -> dict[str, Any]:
+        return {
+            **{
+                name: copy.deepcopy(getattr(self, name))
+                for name in (
+                    "gamma",
+                    "tau",
+                    "n_step",
+                    "actor_bc_alpha",
+                    "actor_normalize_parameters",
+                    "critic_normalize_parameters",
+                    "use_amp",
+                    "use_compile",
+                    "compile_full_objectives",
+                    "compile_actor_inference",
+                    "compile_native_batch_norm",
+                    "compile_options",
+                )
+            },
+            "amp_dtype": str(self._amp_dtype),
+            "observation_normalizer": (
+                f"{type(self.obs_normalizer).__module__}.{type(self.obs_normalizer).__qualname__}"
+            ),
+            "reward_normalizer": (
+                {name: getattr(self.reward_normalizer, name) for name in ("gamma", "g_max", "eps")}
+                if self.reward_normalizer is not None
+                else None
+            ),
+        }
+
+    def export_continuation_state(self) -> dict[str, Any]:
+        """Runtime state omitted from the policy/optimizer checkpoint ABI.
+
+        Save at a completed learner-cycle boundary. Ordinary checkpoints remain
+        usable by evaluators; a complete restart additionally needs this state,
+        replay/collector state and process RNG. Gradient tensors are scratch:
+        every subsequent optimizer update clears them before backward.
+        """
+        self.validate_continuation_support()
+        export_actor = getattr(self.actor, "export_continuation_state", None)
+        if not callable(export_actor):
+            raise TypeError("Actor does not support complete exploration-state continuation")
+        tensor_names = (
+            "_optimizer_found_inf",
+            "_critic_update_finite",
+            "_target_tau",
+            "_pending_actor_metric_values",
+            "_pending_cycle_critic_metric_values",
+            "_pending_cycle_metric_values",
+        )
+        return {
+            "schema": "unilab.flashsac-learner-continuation.v1",
+            "configuration": self._continuation_configuration(),
+            "actor": export_actor(),
+            "scaler": copy.deepcopy(self.scaler.state_dict()) if self.scaler is not None else None,
+            "aux_loss_names": self._aux_loss_names,
+            "target_entropy": self.target_entropy,
+            "lr_peak": self._lr_peak,
+            "tensors": {
+                name: (
+                    getattr(self, name).detach().to("cpu", copy=True)
+                    if getattr(self, name) is not None
+                    else None
+                )
+                for name in tensor_names
+            },
+        }
+
+    def import_continuation_state(self, state: dict[str, Any]) -> None:
+        """Restore after native learner weights and all cold-path preparation."""
+        self.validate_continuation_support()
+        if state.get("schema") != "unilab.flashsac-learner-continuation.v1":
+            raise ValueError("Unsupported FlashSAC learner continuation schema")
+        if state.get("configuration") != self._continuation_configuration():
+            raise ValueError("FlashSAC continuation learner configuration differs")
+        import_actor = getattr(self.actor, "import_continuation_state", None)
+        if not callable(import_actor):
+            raise TypeError("Actor does not support complete exploration-state continuation")
+        if (self.scaler is None) != (state["scaler"] is None):
+            raise ValueError("FlashSAC continuation GradScaler configuration differs")
+        tensor_names = {
+            "_optimizer_found_inf",
+            "_critic_update_finite",
+            "_target_tau",
+            "_pending_actor_metric_values",
+            "_pending_cycle_critic_metric_values",
+            "_pending_cycle_metric_values",
+        }
+        if set(state["tensors"]) != tensor_names:
+            raise ValueError("FlashSAC continuation runtime tensor fields differ")
+        for name, value in state["tensors"].items():
+            current = getattr(self, name)
+            if name in {"_optimizer_found_inf", "_critic_update_finite", "_target_tau"}:
+                if (
+                    not isinstance(value, torch.Tensor)
+                    or value.shape != current.shape
+                    or value.dtype != current.dtype
+                ):
+                    raise ValueError("FlashSAC continuation scalar tensor differs")
+            elif value is not None and not isinstance(value, torch.Tensor):
+                raise ValueError("FlashSAC continuation metric must be a tensor or None")
+        import_actor(state["actor"])
+        if self.scaler is not None:
+            self.scaler.load_state_dict(state["scaler"])
+        self._aux_loss_names = state["aux_loss_names"]
+        self.target_entropy = state["target_entropy"]
+        self._lr_peak = state["lr_peak"]
+        for name, value in state["tensors"].items():
+            current = getattr(self, name)
+            if value is None:
+                setattr(self, name, None)
+            elif (
+                current is not None
+                and current.shape == value.shape
+                and current.dtype == value.dtype
+            ):
+                current.copy_(value)
+            else:
+                setattr(self, name, value.to(self.device, copy=True))
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         validate_actor_semantics(state_dict.get("actor_semantics"), self._actor_semantics)

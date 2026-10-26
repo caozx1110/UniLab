@@ -135,5 +135,13 @@ class AgeBiasedReplayPipeline(DeviceReplayPipeline):
         )
         torch.index_select(self._gpu_storage, 0, indices, out=self._gpu_packed[slot])
 
+    def continuation_sampler_configuration(self) -> dict[str, object]:
+        return {
+            **super().continuation_sampler_configuration(),
+            "decay_step": self.decay_step,
+            "min_weight": self.min_weight,
+            "num_buckets": self.num_buckets,
+        }
+
 
 __all__ = ["AgeBiasedReplayPipeline"]

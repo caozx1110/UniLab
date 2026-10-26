@@ -1724,6 +1724,99 @@ class ManagerBasedRlEnv(TorchEnv):
         self.common_step_counter = self.step_counter
         self._sim_step_counter = self.step_counter * self._cfg.sim_substeps
 
+    _continuation_fields = (
+        "common_step_counter",
+        "_sim_step_counter",
+        "episode_length_buf",
+        "reset_buf",
+        "reset_terminated",
+        "reset_time_outs",
+        "reward_buf",
+        "obs_buf",
+        "_control",
+        "_manual_reset_pending",
+        "_has_transition",
+        "_reward_log_names",
+        "_reward_log_means",
+        "tensor_reset_pose_bounds",
+        "tensor_reset_velocity_bounds",
+        "tensor_reset_bounds_key",
+        "_tensor_reset_env_origins_nonzero",
+    )
+    _continuation_managers = (
+        "event_manager",
+        "command_manager",
+        "action_manager",
+        "observation_manager",
+        "termination_manager",
+        "reward_manager",
+    )
+
+    def _validate_continuation_boundary(self) -> None:
+        if self._reset_state.active or self._reset_state._mocap_pending:
+            raise RuntimeError("Cannot checkpoint an active manager reset transaction")
+        for name in (
+            "curriculum_manager",
+            "metrics_manager",
+            "recorder_manager",
+            "reset_owner_manager",
+        ):
+            if getattr(self, name).active_terms:
+                raise NotImplementedError(f"Continuation of active {name} is not implemented")
+
+    def export_continuation_state(self) -> dict[str, Any]:
+        from unilab.managers.continuation import copy_tree, manager_state
+
+        self._validate_continuation_boundary()
+        return {
+            "schema": "unilab.manager-env-continuation.v1",
+            "base": super().export_continuation_state(),
+            "rng": self.rng.get_state().cpu().clone(),
+            "values": {key: copy_tree(getattr(self, key)) for key in self._continuation_fields},
+            "managers": {
+                key: manager_state(getattr(self, key)) for key in self._continuation_managers
+            },
+            "encoder_bias": {
+                name: copy_tree(entity.data.encoder_bias_tensor)
+                for name, entity in self.scene.entities.items()
+                if entity.data._encoder_bias is not None
+            },
+        }
+
+    def import_continuation_state(self, state: Mapping[str, Any]) -> None:
+        from unilab.managers.continuation import restore_manager, restore_tree
+
+        self._validate_continuation_boundary()
+        if (
+            state.get("schema") != "unilab.manager-env-continuation.v1"
+            or set(state["values"]) != set(self._continuation_fields)
+            or set(state["managers"]) != set(self._continuation_managers)
+        ):
+            raise ValueError("Manager environment continuation schema changed")
+        super().import_continuation_state(state["base"])
+        # Refresh only scene packet bindings, never managers/observations: those
+        # calls advance history or consume noise RNG and would change trajectory.
+        self.scene._invalidate_state_reads()
+        if self.scene.read_plan is not None:
+            self.scene.read_plan.refresh()
+        for key, value in state["values"].items():
+            setattr(self, key, restore_tree(getattr(self, key), value, device=self.device))
+        expected_bias = {
+            name
+            for name, entity in self.scene.entities.items()
+            if entity.data._encoder_bias is not None
+        }
+        if set(state["encoder_bias"]) != expected_bias:
+            raise ValueError("Manager environment encoder-bias entities changed")
+        for name, value in state["encoder_bias"].items():
+            self.scene[name].data.encoder_bias_tensor.copy_(value.to(self.device))
+        for key in self._continuation_managers:
+            restore_manager(getattr(self, key), state["managers"][key], device=self.device)
+        self.extras = self._state.info
+        if self.common_step_counter != self.step_counter:
+            raise ValueError("Restored manager and environment clocks disagree")
+        self.rng.set_state(state["rng"])
+
     def close(self) -> None:
         read_plan = self.scene.read_plan
         if read_plan is not None:

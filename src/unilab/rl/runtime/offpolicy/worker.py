@@ -177,6 +177,7 @@ def _wait_for_inference_tick(
     learner_coordination: LearnerCoordinationState | None = None,
     learner_pid: int | None = None,
     timeout: float = 30.0,
+    checkpoint_poll: Callable[[], None] | None = None,
 ) -> bool:
     """Wait for a learner action using phase and process liveness.
 
@@ -191,6 +192,8 @@ def _wait_for_inference_tick(
     last_progress = -1
     last_progress_change = time.monotonic()
     while not stop_event.is_set():
+        if checkpoint_poll is not None:
+            checkpoint_poll()
         try:
             received_tick = int(coordination_queue.get(timeout=0.1))
         except queue.Empty:
@@ -278,6 +281,9 @@ def offpolicy_collector_fn(
     backend_device_configurer: Callable[[str, str | None], str | None] | None = None,
     learner_coordination: LearnerCoordinationState | None = None,
     learner_pid: int | None = None,
+    checkpoint_request_queue=None,
+    checkpoint_response_queue=None,
+    resume_collector_state=None,
 ):
     """Entry point for the off-policy collector subprocess.
 
@@ -310,6 +316,9 @@ def offpolicy_collector_fn(
         backend_device_configurer=backend_device_configurer,
         learner_coordination=learner_coordination,
         learner_pid=learner_pid,
+        checkpoint_request_queue=checkpoint_request_queue,
+        checkpoint_response_queue=checkpoint_response_queue,
+        resume_collector_state=resume_collector_state,
     )
 
 
@@ -339,6 +348,9 @@ def _run_collector(
     backend_device_configurer=None,
     learner_coordination=None,
     learner_pid=None,
+    checkpoint_request_queue=None,
+    checkpoint_response_queue=None,
+    resume_collector_state=None,
 ):
     # Spawn subprocesses do not inherit the parent's adapter registrations;
     # import the configured modules so registration side effects run here too.
@@ -636,6 +648,116 @@ def _run_collector(
     assert obs_t is not None
     assert critic_t is not None
     prev_dones_t = torch.zeros(num_envs, dtype=torch.float32, device=actor_observation.device)
+    inference_tick = 0
+    resume_rng = None
+    if resume_collector_state is not None:
+        from unilab.rl.runtime.offpolicy.collector_continuation import restore_metric_state
+        from unilab.rl.runtime.offpolicy.continuation import load_state
+
+        saved = load_state(resume_collector_state)
+        if (
+            saved.get("schema") != "unilab.offpolicy-collector-continuation.v1"
+            or saved.get("num_envs") != num_envs
+            or saved.get("algo_type") != algo_type
+            or saved.get("inference_transport") != inference_transport
+            or type(saved.get("inference_tick")) is not int
+            or saved["inference_tick"] < 0
+        ):
+            raise ValueError("Collector continuation identity/configuration mismatch")
+        importer = getattr(env, "import_continuation_state", None)
+        if not callable(importer):
+            raise TypeError("Collector environment has no full continuation API")
+        importer(saved["environment"])
+        state = env.state
+        obs_t, critic_t = split_obs_dict(state.obs)
+        prev_dones = saved["prev_dones"]
+        if prev_dones.shape != prev_dones_t.shape or prev_dones.dtype != prev_dones_t.dtype:
+            raise ValueError("Collector continuation previous-done shape/dtype changed")
+        prev_dones_t.copy_(prev_dones.to(prev_dones_t.device))
+        inference_tick = saved["inference_tick"]
+        total_steps = saved["total_steps"]
+        if total_steps != inference_tick * num_envs:
+            raise ValueError("Collector continuation step/tick counters disagree")
+        ep_rewards = deque(saved["ep_rewards"], maxlen=100)
+        ep_lengths = deque(saved["ep_lengths"], maxlen=100)
+        ep_reward_components = defaultdict(list, saved["ep_reward_components"])
+        timing_accum_ms = defaultdict(float, saved["timing_accum_ms"])
+        timing_counts = defaultdict(int, saved["timing_counts"])
+        done_count_window = saved["done_count_window"]
+        timeout_count_window = saved["timeout_count_window"]
+        max_action_backlog_since_metric = saved["max_action_backlog_since_metric"]
+        max_in_flight_since_metric = saved["max_in_flight_since_metric"]
+        max_publication_lag_since_metric = saved["max_publication_lag_since_metric"]
+        pending_metric_flush = (
+            None
+            if saved["pending_metric_flush"] is None
+            else MetricFlush(**saved["pending_metric_flush"])
+        )
+        restore_metric_state(collector_metrics, saved["collector_metrics"])
+        resume_rng = saved["rng"]
+
+    def collector_snapshot():
+        from dataclasses import asdict
+
+        from unilab.rl.runtime.offpolicy.collector_continuation import cpu_tree
+        from unilab.rl.runtime.offpolicy.continuation import capture_rng_state
+
+        if metrics_queue is not None:
+            # FIFO marker fences every metric already flushed out of this
+            # process. The learner drains through it before saving its logger
+            # state; collection stays parked until it releases the held tick.
+            deadline = time.monotonic() + 30.0
+            while True:
+                if stop_event.is_set() or not learner_pid_is_alive(learner_pid):
+                    raise RuntimeError("Learner stopped while checkpointing collector metrics")
+                try:
+                    metrics_queue.put({"continuation_barrier": inference_tick}, timeout=0.1)
+                    break
+                except queue.Full:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Learner did not drain the collector metric barrier")
+        if actor_observation.device.type == "cuda":
+            torch.cuda.synchronize(actor_observation.device)
+        exporter = getattr(env, "export_continuation_state", None)
+        if not callable(exporter):
+            raise TypeError("Collector environment has no full continuation API")
+        environment = exporter()
+        return {
+            "schema": "unilab.offpolicy-collector-continuation.v1",
+            "num_envs": num_envs,
+            "algo_type": algo_type,
+            "inference_transport": inference_transport,
+            "inference_tick": inference_tick,
+            "total_steps": total_steps,
+            "environment": environment,
+            "prev_dones": cpu_tree(prev_dones_t),
+            "ep_rewards": list(ep_rewards),
+            "ep_lengths": list(ep_lengths),
+            "ep_reward_components": dict(ep_reward_components),
+            "timing_accum_ms": dict(timing_accum_ms),
+            "timing_counts": dict(timing_counts),
+            "done_count_window": done_count_window,
+            "timeout_count_window": timeout_count_window,
+            "max_action_backlog_since_metric": max_action_backlog_since_metric,
+            "max_in_flight_since_metric": max_in_flight_since_metric,
+            "max_publication_lag_since_metric": max_publication_lag_since_metric,
+            "pending_metric_flush": (
+                None if pending_metric_flush is None else asdict(pending_metric_flush)
+            ),
+            "collector_metrics": cpu_tree(vars(collector_metrics)),
+            "rng": capture_rng_state(device=actor_observation.device),
+        }
+
+    def poll_checkpoint():
+        from unilab.rl.runtime.offpolicy.collector_continuation import service_checkpoint_request
+
+        service_checkpoint_request(
+            checkpoint_request_queue,
+            checkpoint_response_queue,
+            tick=inference_tick,
+            snapshot=collector_snapshot,
+        )
+
     import time as _time
 
     backend_diagnostics = get_backend_runtime_diagnostics(env)
@@ -677,10 +799,13 @@ def _run_collector(
         except queue.Full:
             pass
 
+    if resume_rng is not None:
+        from unilab.rl.runtime.offpolicy.continuation import restore_rng_state
+
+        restore_rng_state(resume_rng)
     if not _publish_collector_ready(inference_request_queue, stop_event):
         return
 
-    inference_tick = 0
     replay_add = replay_buffer.add_batch
     # Collection loop
     try:
@@ -747,6 +872,7 @@ def _run_collector(
                 stop_event,
                 learner_coordination=learner_coordination,
                 learner_pid=learner_pid,
+                checkpoint_poll=poll_checkpoint if checkpoint_request_queue is not None else None,
             ):
                 break
             actions, policy_version = inference_slot.consume_action(
