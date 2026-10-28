@@ -223,8 +223,9 @@ def test_sac_builder_forwards_backend_device_injection(
 
 
 @pytest.mark.parametrize("with_injection", [False, True])
+@pytest.mark.parametrize("episode_boundaries", [None, False, True])
 def test_flashsac_builder_forwards_backend_device_injection(
-    monkeypatch: pytest.MonkeyPatch, with_injection: bool
+    monkeypatch: pytest.MonkeyPatch, with_injection: bool, episode_boundaries: bool | None
 ) -> None:
     import unilab.rl.algos.flash_sac.double_buffer as module
 
@@ -236,8 +237,11 @@ def test_flashsac_builder_forwards_backend_device_injection(
     if with_injection:
         kwargs["backend_device_resolver"] = _resolver
         kwargs["backend_device_configurer"] = _configurer
+    cfg = _flashsac_cfg()
+    if episode_boundaries is not None:
+        cfg.algo.algo_params.reward_normalizer_episode_boundaries = episode_boundaries
     runner = module.build_double_buffer_runner(
-        _flashsac_cfg(),
+        cfg,
         env_factory=_fake_env_factory,
         env_cfg_override=None,
         replay_prefetch_mode="one_tick",
@@ -257,6 +261,9 @@ def test_flashsac_builder_forwards_backend_device_injection(
     assert _FakeLearner.last_kwargs["use_whole_cycle_cuda_graph"] is False
     assert _FakeLearner.last_kwargs["actor_normalize_parameters"] is True
     assert _FakeLearner.last_kwargs["critic_normalize_parameters"] is True
+    assert _FakeLearner.last_kwargs["reward_normalizer_episode_boundaries"] is bool(
+        episode_boundaries
+    )
     assert runner.kwargs["target_frequency"] == 1
     assert runner.kwargs["policy_before_critic"] is False
     assert runner.kwargs["replay_pipeline_factory"].keywords == {

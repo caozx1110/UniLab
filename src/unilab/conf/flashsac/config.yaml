@@ -33,6 +33,9 @@ algo:
   use_layer_norm: false
   algo_params:
     normalize_reward: true
+    # Include terminal rewards before clearing carry; clear carry on rebuilt-env resume.
+    # Keep false to reproduce checkpoints/runs using the original statistics.
+    reward_normalizer_episode_boundaries: false
     normalized_g_max: 5.0
     actor_num_blocks: 2
     critic_num_blocks: 2

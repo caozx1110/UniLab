@@ -91,7 +91,13 @@ class RunningMeanStd:
 
 
 class RewardNormalizer:
-    """Adaptive reward scaling with running discounted-return statistics."""
+    """Adaptive reward scaling with running discounted-return statistics.
+
+    ``episode_boundaries`` includes each terminal reward in its own episode's
+    statistics before clearing that row's carry. It defaults off for historical
+    run reproducibility and is deliberately controlled by configuration, not by
+    the checkpoint's statistics payload.
+    """
 
     def __init__(
         self,
@@ -99,11 +105,14 @@ class RewardNormalizer:
         g_max: float,
         device: torch.device,
         eps: float = 1e-8,
+        *,
+        episode_boundaries: bool = False,
     ):
         self.gamma = gamma
         self.g_max = g_max
         self.eps = eps
         self.device = device
+        self.episode_boundaries = episode_boundaries
         self.rms = RunningMeanStd.create(device)
         self.g_r = torch.zeros(0, device=device, dtype=torch.float32)
         self.g_r_max = torch.tensor(0.0, device=device, dtype=torch.float32)
@@ -132,9 +141,14 @@ class RewardNormalizer:
         done = torch.clamp(dones, min=0.0, max=1.0)
 
         for step in range(rewards.shape[0]):
-            self.g_r.mul_(self.gamma * (1.0 - done[step])).add_(rewards[step])
+            if self.episode_boundaries:
+                self.g_r.mul_(self.gamma).add_(rewards[step])
+            else:
+                self.g_r.mul_(self.gamma * (1.0 - done[step])).add_(rewards[step])
             self.g_r_max.copy_(torch.maximum(self.g_r_max, self.g_r.abs().max()))
             self.rms.update(self.g_r)
+            if self.episode_boundaries:
+                self.g_r.mul_(1.0 - done[step])
 
     def normalize(self, rewards: torch.Tensor) -> torch.Tensor:
         denominator = torch.maximum(
@@ -229,6 +243,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         actor_normalize_parameters: bool = True,
         critic_normalize_parameters: bool = True,
         actor_config: Mapping[str, Any] | None = None,
+        reward_normalizer_episode_boundaries: bool = False,
     ):
         self.actor_normalize_parameters = bool(actor_normalize_parameters)
         self.critic_normalize_parameters = bool(critic_normalize_parameters)
@@ -394,7 +409,12 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             self.obs_normalizer = nn.Identity()
 
         self.reward_normalizer = (
-            RewardNormalizer(gamma=self.gamma, g_max=normalized_g_max, device=self.device)
+            RewardNormalizer(
+                gamma=self.gamma,
+                g_max=normalized_g_max,
+                device=self.device,
+                episode_boundaries=reward_normalizer_episode_boundaries,
+            )
             if normalize_reward
             else None
         )
@@ -1202,6 +1222,16 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             ),
             "update_count": self.update_count,
         }
+
+    def reset_environment_state(self) -> None:
+        """Discard per-environment carry when collectors start fresh episodes.
+
+        Checkpoint loading itself preserves same-episode state. The runner calls
+        this only when resuming with rebuilt environments, retaining global RMS
+        and maximum-return statistics. The opt-in also controls done ordering.
+        """
+        if self.reward_normalizer is not None and self.reward_normalizer.episode_boundaries:
+            self.reward_normalizer.g_r.zero_()
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         validate_actor_semantics(state_dict.get("actor_semantics"), self._actor_semantics)

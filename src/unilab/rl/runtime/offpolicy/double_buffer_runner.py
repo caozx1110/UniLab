@@ -1094,6 +1094,12 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
             )
 
         self.learner.load_state_dict(state)
+        # This runner rebuilds collectors/replay after resume; it does not
+        # restore their episode state. Algorithms may discard per-env carry
+        # through this optional hook without changing ordinary checkpoint load.
+        reset_environment_state = getattr(self.learner, "reset_environment_state", None)
+        if reset_environment_state is not None:
+            reset_environment_state()
         restore_hook_state(
             getattr(self, "_lifecycle_hook", None), state.get("lifecycle_state"), update_count
         )

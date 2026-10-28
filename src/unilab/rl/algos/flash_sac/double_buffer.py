@@ -121,6 +121,9 @@ def build_double_buffer_runner(
         "learning_rate_warmup_steps": cfg.algo.algo_params.learning_rate_warmup_steps,
         "learning_rate_decay_steps": cfg.algo.algo_params.learning_rate_decay_steps,
         "normalize_reward": cfg.algo.algo_params.normalize_reward,
+        "reward_normalizer_episode_boundaries": _algo_param(
+            cfg.algo, "reward_normalizer_episode_boundaries", False
+        ),
         "normalized_g_max": cfg.algo.algo_params.normalized_g_max,
         "n_step": cfg.algo.algo_params.n_step,
         "obs_normalization": cfg.algo.obs_normalization,
