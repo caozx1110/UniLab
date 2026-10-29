@@ -1,5 +1,6 @@
 """Opt-in isolated 200-iteration CPU/CUDA profiler window after warmup."""
 import os
+import json
 from pathlib import Path
 import torch
 
@@ -30,6 +31,8 @@ def end(role):
         root = Path(_ROOT); root.mkdir(parents=True, exist_ok=True)
         profiler.export_chrome_trace(str(root / f'{role}-{os.getpid()}.json'))
         (root / f'{role}-{os.getpid()}.txt').write_text(profiler.key_averages().table(sort_by='self_device_time_total', row_limit=100))
+        rows = [{"name": e.key, "count": e.count, "cpu_total_us": e.cpu_time_total, "self_cpu_us": e.self_cpu_time_total, "device_total_us": e.device_time_total, "self_device_us": e.self_device_time_total} for e in profiler.key_averages()]
+        (root / f'{role}-{os.getpid()}-summary.json').write_text(json.dumps(rows, indent=2))
         del _PROFILERS[role]
 
 
