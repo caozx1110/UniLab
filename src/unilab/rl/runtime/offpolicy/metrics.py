@@ -116,6 +116,9 @@ class CollectorMetrics:
 
         episode_rewards = self.current_rewards + rewards
         episode_lengths = self.current_lengths + 1
+        from unilab.rl.runtime.iteration_evidence import ENABLED, record
+        if ENABLED:
+            record("collector", {"reward": rewards.mean(), "episode_length_sum": torch.where(done, episode_lengths, 0).sum(), "done_count": done.sum(), "active_episode_length": episode_lengths.float().mean()})
         row = self._cursor
         self.finished_rewards[row].copy_(episode_rewards)
         self.finished_lengths[row].copy_(episode_lengths)

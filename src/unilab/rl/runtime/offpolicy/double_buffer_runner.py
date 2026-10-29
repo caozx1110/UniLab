@@ -2455,6 +2455,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
                 avg_metrics = {k: statistics.mean(v) for k, v in iter_metrics.items() if v}
                 avg_metrics.update(self._replay_ingress_metrics(replay_pipeline))
+                from unilab.rl.runtime.iteration_evidence import record as record_iteration_evidence
+                record_iteration_evidence("learner", {"iteration": iteration, "time": time.perf_counter(), "iteration_seconds": iteration_time, "metrics": dict(avg_metrics)})
                 self._update_replay_ingress_manifest(logger, replay_pipeline)
                 mean_return_reports10 = statistics.mean(reward_history) if reward_history else None
 
