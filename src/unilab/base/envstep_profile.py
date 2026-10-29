@@ -76,3 +76,7 @@ def window(fn):
             (root/f'events-{os.getpid()}.json').write_text(json.dumps({'window':[2001,2200],'device':torch.cuda.get_device_name(),'records':records},indent=2))
         return result
     return wrapper
+
+
+def producer_stream(backend, device):
+    return backend._torch_execution_stream(device) if ACTIVE else None
