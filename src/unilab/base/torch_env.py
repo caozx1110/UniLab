@@ -274,7 +274,7 @@ class TorchEnv(ABEnv):
         # previous one before the backend call so unsupported or failed steps
         # cannot expose stale completion metadata.
         self._state.info.pop("completion", None)
-        with phase("physics"):
+        with phase("physics", stream=self._backend._torch_execution_stream(self.device)):
             backend_result = self._backend.step_tensor(ctrl, self._cfg.sim_substeps)
         step_core_ms = (time.perf_counter() - phase) * 1000.0
         step_core_cpu_ms = (_cpu_time() - phase_cpu) * 1000.0

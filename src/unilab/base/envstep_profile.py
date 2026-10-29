@@ -23,19 +23,19 @@ class SyncCounts(TorchDispatchMode):
         return func(*args, **(kwargs or {}))
 
 @contextmanager
-def phase(name):
+def phase(name, stream=None):
     if not ACTIVE:
         yield
         return
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
-    row = {'name': name, 'iteration':COUNT, 'parent':(STACK[-1]['id'] if STACK else None), 'id':len(ROWS), 'operations':{}, 'start':start, 'end':end}
+    row = {'name': name, 'iteration':COUNT, 'parent':(STACK[-1]['id'] if STACK else None), 'id':len(ROWS), 'operations':{}, 'start':start, 'end':end, 'stream': int((stream or torch.cuda.current_stream()).cuda_stream)}
     ROWS.append(row); STACK.append(row)
-    start.record(); host=time.perf_counter()
+    start.record(stream); host=time.perf_counter()
     try:
         yield
     finally:
-        end.record(); row['host_ms']=(time.perf_counter()-host)*1000; STACK.pop()
+        end.record(stream); row['host_ms']=(time.perf_counter()-host)*1000; STACK.pop()
 
 def timed(name, group=False):
     def decorate(fn):
