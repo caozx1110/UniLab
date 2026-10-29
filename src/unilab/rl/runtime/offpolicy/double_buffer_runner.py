@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unilab.rl.runtime.profile_window import phase as profile_phase
+
 import json
 import os
 import queue as queue_module
@@ -1301,6 +1303,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                 )
             return message
 
+    @profile_phase("issue99/inference")
     def _serve_learner_inference(
         self,
         inference_slot: SharedInferenceRing,

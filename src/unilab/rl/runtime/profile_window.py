@@ -31,3 +31,17 @@ def end(role):
         profiler.export_chrome_trace(str(root / f'{role}-{os.getpid()}.json'))
         (root / f'{role}-{os.getpid()}.txt').write_text(profiler.key_averages().table(sort_by='self_device_time_total', row_limit=100))
         del _PROFILERS[role]
+
+
+def phase(name):
+    """Annotate only dedicated profiling runs, preserving unprofiled methods."""
+    def decorate(fn):
+        if not _ROOT:
+            return fn
+        import functools
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            with torch.profiler.record_function(name):
+                return fn(*args, **kwargs)
+        return wrapped
+    return decorate

@@ -18,6 +18,8 @@ Consistency model:
 
 from __future__ import annotations
 
+from unilab.rl.runtime.profile_window import phase as profile_phase
+
 import threading
 import time
 from collections import deque
@@ -857,6 +859,7 @@ class DeviceReplayPipeline:
             )
         return self._prepared_metadata
 
+    @profile_phase("issue99/replay_sample")
     def sample_large_batch(self, tick_id: int, sample_count: int) -> Dict[str, torch.Tensor]:
         self._validate_sample_count(sample_count)
         if self._has_hot_batch:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unilab.rl.runtime.profile_window import phase as profile_phase
+
 import copy
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -781,6 +783,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         # backward (actor-owned detached health aliases can leave None tangents).
         return actor_loss, entropy, {name: loss.detach() for name, loss in aux_losses.items()}
 
+    @profile_phase("issue99/critic")
     def update_critic(
         self,
         batch: dict[str, torch.Tensor],
@@ -842,6 +845,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             metric_tensors,
         )
 
+    @profile_phase("issue99/actor")
     def update_actor(
         self,
         batch: dict[str, torch.Tensor],

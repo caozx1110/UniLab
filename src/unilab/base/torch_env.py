@@ -7,6 +7,8 @@ contracts.
 
 from __future__ import annotations
 
+from unilab.rl.runtime.profile_window import phase as profile_phase
+
 import abc
 import dataclasses
 import os
@@ -237,6 +239,7 @@ class TorchEnv(ABEnv):
         """
         raise NotImplementedError(f"{type(self).__name__} must define a tensor reset lifecycle")
 
+    @profile_phase("issue99/env_step")
     def step(self, actions: torch.Tensor) -> TorchEnvState:
         started = time.perf_counter()
         cpu_started = _cpu_time()
@@ -404,6 +407,7 @@ class TorchEnv(ABEnv):
         if actions.device != self.device:
             raise ValueError(f"TorchEnv action device must be {self.device}, got {actions.device}")
 
+    @profile_phase("issue99/control_validation")
     def _validate_control(self, ctrl: torch.Tensor) -> None:
         if not isinstance(ctrl, torch.Tensor):
             raise TypeError(f"TorchEnv control must be a torch.Tensor, got {type(ctrl).__name__}")
@@ -430,6 +434,7 @@ class TorchEnv(ABEnv):
         if not self.diagnostic_verdict(valid):
             raise ValueError("TorchEnv control contains NaN or Inf")
 
+    @profile_phase("issue99/state_validation")
     def _validate_state(self, state: TorchEnvState) -> None:
         expected_keys = set(self.obs_groups_spec)
         if not isinstance(state.obs, dict) or set(state.obs) != expected_keys:
