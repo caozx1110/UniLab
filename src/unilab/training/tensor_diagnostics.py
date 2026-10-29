@@ -68,6 +68,7 @@ class NanGuard:
         self._buffer_idx = 0
         self._buffer_full = False
         self._dumped = False
+        self.deferred_verdict = None
 
     def _validate_finite_float(self, value: torch.Tensor, label: str) -> None:
         if not isinstance(value, torch.Tensor):
@@ -104,13 +105,16 @@ class NanGuard:
             return None
         if not isinstance(obs, Mapping):
             raise TypeError(f"observations must be a mapping, got {type(obs).__name__}")
-        bad_mask = torch.zeros((self._num_envs,), dtype=torch.bool)
+        bad_mask = torch.zeros((self._num_envs,), dtype=torch.bool, device=reward.device if self.deferred_verdict is not None else "cpu")
         for name, value in obs.items():
             self._validate_finite_float(value, f"obs[{name!r}]")
             bad_mask |= _bad_row_mask(value, self._num_envs).to(bad_mask.device)
         self._validate_finite_float(reward, "reward")
         reward_mask = _bad_row_mask(reward, self._num_envs)
         bad_mask |= reward_mask.to(bad_mask.device)
+        if self.deferred_verdict is not None:
+            self.deferred_verdict(~bad_mask.any())
+            return None
         if not bool(bad_mask.any()):
             return None
         nan_ids = (
@@ -132,6 +136,9 @@ class NanGuard:
             return None
         self._validate_finite_float(ctrl, "ctrl")
         bad_mask = _bad_row_mask(ctrl, self._num_envs)
+        if self.deferred_verdict is not None:
+            self.deferred_verdict(~bad_mask.any())
+            return None
         if not bool(bad_mask.any()):
             return None
         nan_ids = (

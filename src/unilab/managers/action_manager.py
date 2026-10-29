@@ -72,7 +72,7 @@ class ActionTerm(ManagerTermBase):
 
     def publish_validation_verdict(self) -> None:
         """Fail closed on the latest action-slice finite verdict."""
-        if bool(self._action_finite_valid):
+        if (self._env.diagnostic_verdict(self._action_finite_valid) if hasattr(self._env, "diagnostic_verdict") else bool(self._action_finite_valid)):
             return
         raise ValueError(f"{type(self).__name__} received NaN or Inf actions")
 
@@ -237,7 +237,7 @@ class ActionManager(ManagerBase):
             )
         if not reuse_recorded_verdict:
             self._action_finite_valid.copy_(torch.isfinite(action).all())
-            if not bool(self._action_finite_valid):
+            if not (self._env.diagnostic_verdict(self._action_finite_valid) if hasattr(self._env, "diagnostic_verdict") else bool(self._action_finite_valid)):
                 raise ValueError("ActionManager received an action containing NaN or Inf.")
         # ``step`` records the device verdict once and publishes it at the
         # control-validation boundary, so the reuse path stays free of

@@ -284,7 +284,7 @@ class JointPositionAction(BaseAction):
             if isinstance(self._env, TorchEnv):
                 # Publish the affine-target device verdict for the owner
                 # boundary; the control-validation consumer owns the read.
-                self._env._pending_control_finite_check = bool(self._processed_actions_finite_valid)
+                self._env._pending_control_finite_check = self._processed_actions_finite_valid
             return
         processed = self._entity_values(self._processed_actions)
         encoder_bias = self._entity.data.encoder_bias_tensor.to(

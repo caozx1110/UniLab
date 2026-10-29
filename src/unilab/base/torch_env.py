@@ -35,6 +35,7 @@ from unilab.base.backend_timing import (
 )
 from unilab.base.base import ABEnv, EnvCfg, EnvPlayCapabilities
 from unilab.base.cpu_runtime import apply_cpu_confinement
+from unilab.base.deferred_checks import DeferredChecks
 from unilab.base.scene import SceneCfg
 from unilab.dtype_config import get_global_dtype
 
@@ -106,12 +107,13 @@ class TorchEnv(ABEnv):
         self._final_observation_scratch: dict[str, torch.Tensor] | None = None
         self._action_finite_valid = torch.ones((), dtype=torch.bool, device=self._device)
         self._state_finite_valid = torch.ones((), dtype=torch.bool, device=self._device)
-        self._pending_control_finite_check: bool | None = None
+        self._pending_control_finite_check: bool | torch.Tensor | None = None
         self._reset_obs_finite_valid = torch.ones((), dtype=torch.bool, device=self._device)
         self._reset_done_count = torch.zeros((), dtype=torch.int64, device=self._device)
         self._tensor_runtime_bound = False
         self._last_initial_episode_steps: torch.Tensor | None = None
         self.step_counter = 0
+        self._deferred_checks = DeferredChecks(self._device, int(os.environ.get("UNILAB_DIAGNOSTIC_INTERVAL", "1")))
         self._autoreset = True
         self._autoreset_reset_active = False
         self._autoreset_scattered_reset_obs = False
@@ -368,12 +370,20 @@ class TorchEnv(ABEnv):
             completion = backend_result.get("completion")
             if completion is not None:
                 self._state.info["completion"] = completion
+        self._deferred_checks.end_step()
         return self._state
+
+    def diagnostic_verdict(self, valid: torch.Tensor) -> bool:
+        """Default immediate validation; opt-in accumulation changes only publication."""
+        if self._deferred_checks.interval == 1:
+            return bool(valid)
+        self._deferred_checks.record(valid)
+        return True
 
     def _validate_action(self, actions: torch.Tensor) -> None:
         self._validate_action_contract(actions)
         self._record_action_finite(actions)
-        if not bool(self._action_finite_valid):
+        if not self.diagnostic_verdict(self._action_finite_valid):
             raise ValueError("TorchEnv action contains NaN or Inf")
 
     def _validate_action_contract(self, actions: torch.Tensor) -> None:
@@ -417,7 +427,7 @@ class TorchEnv(ABEnv):
                 raise ValueError("TorchEnv control contains NaN or Inf")
             return
         valid = torch.isfinite(ctrl).all()
-        if not bool(valid):
+        if not self.diagnostic_verdict(valid):
             raise ValueError("TorchEnv control contains NaN or Inf")
 
     def _validate_state(self, state: TorchEnvState) -> None:
@@ -452,18 +462,18 @@ class TorchEnv(ABEnv):
         valid.fill_(True)
         for value in (state.reward, *state.obs.values()):
             torch.logical_and(valid, torch.isfinite(value).all(), out=valid)
-        if not bool(valid):
+        if not self.diagnostic_verdict(valid):
             for label, value in (
                 *((f"obs[{name!r}]", value) for name, value in state.obs.items()),
                 ("reward", state.reward),
             ):
-                if not bool(torch.isfinite(value).all()):
+                if not self.diagnostic_verdict(torch.isfinite(value).all()):
                     raise ValueError(f"TorchEnvState {label} contains NaN or Inf")
 
     def _validate_finite_float(self, value: torch.Tensor, label: str) -> None:
         if not value.is_floating_point():
             raise TypeError(f"TorchEnvState {label} must be floating-point")
-        if not bool(torch.isfinite(value).all()):
+        if not self.diagnostic_verdict(torch.isfinite(value).all()):
             raise ValueError(f"TorchEnvState {label} contains NaN or Inf")
 
     def _record_action_finite(self, actions: torch.Tensor) -> None:
@@ -474,7 +484,7 @@ class TorchEnv(ABEnv):
         """Publish and consume the manager control verdict, if recorded."""
         verdict = self._pending_control_finite_check
         self._pending_control_finite_check = None
-        return verdict
+        return self.diagnostic_verdict(verdict) if isinstance(verdict, torch.Tensor) else verdict
 
     def _require_floating_float(self, value: torch.Tensor) -> None:
         if not value.is_floating_point():
@@ -617,9 +627,9 @@ class TorchEnv(ABEnv):
         valid.fill_(True)
         for value in obs.values():
             torch.logical_and(valid, torch.isfinite(value).all(), out=valid)
-        if not bool(valid):
+        if not self.diagnostic_verdict(valid):
             for name, value in obs.items():
-                if not bool(torch.isfinite(value).all()):
+                if not self.diagnostic_verdict(torch.isfinite(value).all()):
                     raise ValueError(f"TorchEnv mask reset obs[{name!r}] contains NaN or Inf")
 
     def _scatter_reset_info_mask(
@@ -861,6 +871,8 @@ class TorchEnv(ABEnv):
         if not isinstance(guard, _NanGuard):
             raise TypeError(f"TorchEnv nan guard must be NanGuard, got {type(guard).__name__}")
         self._nan_guard = guard
+        if self._deferred_checks.interval > 1:
+            guard.deferred_verdict = self.diagnostic_verdict
 
     def _resolve_nan_guard_model_file(self) -> str:
         """Resolve the abnormal-dump model path only on a detected failure."""
@@ -932,7 +944,10 @@ class TorchEnv(ABEnv):
         self.step_counter = counter
 
     def close(self) -> None:
-        self._backend.cleanup_scene_assets()
+        try:
+            self._deferred_checks.flush()
+        finally:
+            self._backend.cleanup_scene_assets()
 
     @abc.abstractmethod
     def apply_action(self, actions: torch.Tensor, state: TorchEnvState) -> torch.Tensor:
