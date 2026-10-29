@@ -7,6 +7,8 @@ public :class:`~unisim.backend.base.SimBackend` contract.
 
 from __future__ import annotations
 
+from unilab.base.envstep_profile import timed
+
 import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
@@ -2768,6 +2770,7 @@ class Entity:
             term_name=f"{self.name}.write_root_state_tensor_to_sim",
         )
 
+    @timed("reset_state_write")
     def write_motion_state_tensor_to_sim(
         self,
         root_state: torch.Tensor,
