@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unilab.base.envstep_profile import timed
+
 import math
 import time
 from collections.abc import Sequence
@@ -954,6 +956,7 @@ class MotionCommand(CommandTerm):
         """Whether the current reset payload already passed owner validation."""
         return bool(self._last_reset_payload_validated)
 
+    @timed("reset_reference_state")
     def _resample_command(self, reset_mask: torch.Tensor) -> None:
         """Full-width motion sampling and masked state publication."""
         if not bool(reset_mask.any()):
@@ -1208,6 +1211,7 @@ class MotionCommand(CommandTerm):
             num_joints=self.motion.num_joints,
         )
 
+    @timed("reference_state_write")
     def _ingest_motion_packet_mask(self, reset_mask: torch.Tensor, packet: torch.Tensor) -> None:
         """Merge a full-width motion packet into only selected rows."""
         scratch = self._motion_packet_scratch

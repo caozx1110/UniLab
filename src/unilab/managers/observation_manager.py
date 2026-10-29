@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from unilab.base.envstep_profile import timed
+
 import time
 from collections.abc import Callable
 from copy import deepcopy
@@ -491,6 +493,7 @@ class ObservationManager(ManagerBase):
             )
         return obs_buffer
 
+    @timed("observation", group=True)
     def compute_group(
         self,
         group_name: str,

@@ -7,6 +7,8 @@ on one Torch device and consume the Manager-owned Torch generator.
 
 from __future__ import annotations
 
+from unilab.base.envstep_profile import timed
+
 import math
 import time
 from dataclasses import dataclass
@@ -215,6 +217,7 @@ class MotionSampler:
     def bin_failed_count(self) -> torch.Tensor:
         return self._bin_failed
 
+    @timed("reset_sampling")
     def sample_frames(
         self, reset_mask: torch.Tensor, torch_rng: torch.Generator | None
     ) -> torch.Tensor:

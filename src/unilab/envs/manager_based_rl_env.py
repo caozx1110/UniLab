@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from unilab.base.envstep_profile import timed
+
 import math
 import re
 import secrets
@@ -1339,6 +1341,7 @@ class ManagerBasedRlEnv(TorchEnv):
         """Advance the fixed-width device episode-step carrier by one."""
         self.episode_length_buf.copy_(steps).add_(1)
 
+    @timed("termination")
     def _compute_termination_and_reset_flags(self) -> None:
         """Compute termination and publish fixed-width reset-flag carriers."""
         self.termination_manager.compute()
@@ -1352,6 +1355,7 @@ class ManagerBasedRlEnv(TorchEnv):
             self.reset_time_outs.copy_(time_outs)
         torch.logical_or(self.reset_terminated, self.reset_time_outs, out=self.reset_buf)
 
+    @timed("reward")
     def _compute_rewards(self) -> torch.Tensor:
         """Compute and return the persistent full-width reward carrier."""
         return self.reward_manager.compute(dt=self.step_dt)
@@ -1360,6 +1364,7 @@ class ManagerBasedRlEnv(TorchEnv):
         """Advance Manager metric carriers after the step boundary."""
         self.metrics_manager.compute()
 
+    @timed("randomization")
     def _apply_runtime_events(self) -> None:
         """Apply runtime events and repack any backend state they mutate."""
         applied_runtime_event = False
@@ -1376,6 +1381,7 @@ class ManagerBasedRlEnv(TorchEnv):
             self.scene._invalidate_state_reads()
             self._refresh_tensor_reads_after_mutation()
 
+    @timed("reference_preflight")
     def _prepare_command_update(self):
         """Pin command dt and return the fixed-width owner transaction scope."""
         self._command_dt.fill_(self.step_dt)
@@ -1383,6 +1389,7 @@ class ManagerBasedRlEnv(TorchEnv):
         self._reset_state.declare_packed_reset_device(self.device)
         return self._reset_state.scoped_device_owner_tensor(self._all_env_reset_mask)
 
+    @timed("reference")
     def _compute_commands(self) -> None:
         """Advance command state using the persistent per-env dt carrier."""
         self.command_manager.compute(dt=self._command_dt)
@@ -1395,10 +1402,12 @@ class ManagerBasedRlEnv(TorchEnv):
             self._refresh_tensor_reads_after_mutation()
         return (time.perf_counter() - started) * 1000.0
 
+    @timed("reference_post")
     def _post_compute_commands(self) -> None:
         """Publish command post-compute state on its owner boundary."""
         self.command_manager.post_compute()
 
+    @timed("observations")
     def _compute_observations(self) -> dict[str, Any]:
         """Compute all observation groups, histories, and noise carriers."""
         return self.observation_manager.compute(update_history=True)
@@ -1483,6 +1492,7 @@ class ManagerBasedRlEnv(TorchEnv):
         value_float = float(value)
         return value_float if math.isfinite(value_float) else 0.0
 
+    @timed("reset_transaction")
     def reset(
         self,
         env_ids: torch.Tensor | None = None,
