@@ -45,7 +45,10 @@ def timed(name, group=False):
             if group:
                 label += '/' + str(args[1] if len(args)>1 else kwargs['group_name'])
             with phase(label):
-                return fn(*args, **kwargs)
+                result = fn(*args, **kwargs)
+                if group and ACTIVE and isinstance(result, torch.Tensor):
+                    STACK[-1]["output_shape"] = list(result.shape)
+                return result
         return wrapper
     return decorate
 

@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from unilab.base.envstep_profile import timed
+
 import math
 from copy import deepcopy
 from dataclasses import dataclass
@@ -170,6 +172,7 @@ class EventManager(ManagerBase):
                 self._interval_term_time_left[index][ids] = sampled
         return {}
 
+    @timed("events")
     def apply(
         self,
         mode: EventMode,
