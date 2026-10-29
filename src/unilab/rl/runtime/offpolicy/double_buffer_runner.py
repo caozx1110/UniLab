@@ -1998,6 +1998,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
 
             # ---- training loop ----
             for iteration in range(start_iteration, max_iterations + 1):
+                from unilab.rl.runtime.profile_window import begin as profile_begin, end as profile_end
+                profile_begin("learner")
                 if self._lifecycle_hook is not None:
                     self._lifecycle_hook(
                         self._lifecycle_context(
@@ -2435,6 +2437,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                             },
                         )
 
+                profile_end("learner")
                 train_time = time.perf_counter() - train_start
                 self.learner.update_count += 1
                 inference_scheduler.finish_update()

@@ -782,7 +782,10 @@ def _run_collector(
                 raise TypeError(
                     f"inference ring actions must be a Torch tensor, got {type(actions).__name__}"
                 )
+            from unilab.rl.runtime.profile_window import begin as profile_begin, end as profile_end
+            profile_begin("collector")
             state = env.step(actions)
+            profile_end("collector")
             if trace_recorder:
                 trace_recorder.add_slice(
                     "collector/env_step",
