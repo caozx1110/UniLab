@@ -1179,7 +1179,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         ):
             for key, value in module.state_dict().items():
                 tensors[f"{prefix}.{key}"] = value
-        for half_life, state in zip(self.actor_ema.half_lives, self.actor_ema.state_dict()["states"]):
+        for half_life, state in zip(self.actor_ema.half_lives, self.actor_ema.live_state_dicts()):
             for key, value in state.items():
                 tensors[f"actor_ema.{half_life:g}.{key}"] = value
         return tensors

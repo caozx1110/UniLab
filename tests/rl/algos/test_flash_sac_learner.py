@@ -764,6 +764,9 @@ def test_actor_ema_matches_offline_recurrence_and_tracks_buffers() -> None:
     torch.testing.assert_close(actual["0.weight"], expected_weight)
     torch.testing.assert_close(actual["1.running_mean"], expected_mean)
     assert ema.updates == 1
+    live = ema.live_state_dicts()[0]
+    live["0.weight"].fill_(9.0)
+    assert torch.equal(ema.actor_state_dict(2.0)["0.weight"], torch.full((2, 2), 9.0))
 
 
 def test_flashsac_ema_round_trip_and_disabled_path() -> None:

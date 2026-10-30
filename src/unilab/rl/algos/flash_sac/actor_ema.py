@@ -57,6 +57,10 @@ class ActorEMA:
             raise ValueError(f"Unknown actor EMA half-life: {half_life}") from error
         return {key: value.detach().clone() for key, value in self._states[index].items()}
 
+    def live_state_dicts(self) -> tuple[dict[str, torch.Tensor], ...]:
+        """Return live EMA storage for in-place distributed synchronization."""
+        return tuple(self._states)
+
     def state_dict(self) -> dict[str, Any]:
         return {
             "half_lives": self.half_lives,
