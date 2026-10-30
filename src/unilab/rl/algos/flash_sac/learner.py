@@ -724,7 +724,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         dones: torch.Tensor,
         truncated: torch.Tensor,
         critic_obs: torch.Tensor,
-        critic_next_obs: torch.Tensor | None = None,
+        critic_next_obs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Full critic forward/target/projection/loss objective."""
         gamma = self.gamma**self.n_step
@@ -816,7 +816,6 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         truncated = batch["truncated"].to(self.device)
         critic_obs = batch["critic"].to(self.device)
         critic_next_obs = batch["next_critic"].to(self.device)
-        critic_next_obs = batch["next_critic"].to(self.device)
 
         obs = self._maybe_normalize_obs(obs, update=True)
         next_obs = self._maybe_normalize_obs(next_obs, update=False)
@@ -874,6 +873,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         next_obs = batch["next_obs"].to(self.device)
         expert_actions = batch["actions"].to(self.device)
         critic_obs = batch["critic"].to(self.device)
+        critic_next_obs = batch["next_critic"].to(self.device)
 
         obs = self._maybe_normalize_obs(obs, update=False)
         next_obs = self._maybe_normalize_obs(next_obs, update=False)

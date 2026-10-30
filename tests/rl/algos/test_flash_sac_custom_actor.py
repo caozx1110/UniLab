@@ -163,7 +163,7 @@ class TestAuxiliaryLosses:
         learner = _make_learner(actor_config=_actor_config(hidden_dim=8, aux_weight=0.5))
         batch = _make_batch()
         loss, entropy, diagnostics = learner._full_actor_objective(
-            batch["obs"], batch["next_obs"], batch["actions"], batch["critic"]
+            batch["obs"], batch["next_obs"], batch["actions"], batch["critic"], batch["next_critic"]
         )
         assert loss.requires_grad
         assert not entropy.requires_grad
