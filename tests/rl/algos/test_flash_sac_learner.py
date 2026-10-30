@@ -787,6 +787,30 @@ def test_flashsac_ema_round_trip_and_disabled_path() -> None:
     assert disabled.actor_ema.half_lives == ()
 
 
+def test_flashsac_ema_reinitializes_from_restored_actor_when_checkpoint_has_no_ema() -> None:
+    source = _make_small_learner(actor_ema_half_lives=(15000.0,))
+    state_dict = source.get_state_dict()
+    state_dict.pop("actor_ema")
+    with torch.no_grad():
+        for parameter in source.actor.parameters():
+            parameter.fill_(0.25)
+    state_dict["actor"] = source.actor.state_dict()
+
+    restored = _make_small_learner(actor_ema_half_lives=(15000.0,))
+    restored.load_state_dict(state_dict)
+    assert restored.actor_ema.updates == 0
+    for key, value in restored.actor.state_dict().items():
+        torch.testing.assert_close(value, restored.actor_ema.actor_state_dict(15000.0)[key])
+
+
+def test_flashsac_ema_rejects_whole_cycle_graph_capture() -> None:
+    with pytest.raises(ValueError, match="eager update cycles"):
+        _make_small_learner(
+            actor_ema_half_lives=(15000.0,),
+            use_whole_cycle_cuda_graph=True,
+        )
+
+
 def test_reward_normalizer_tracks_discounted_returns() -> None:
     normalizer = RewardNormalizer(gamma=0.5, g_max=5.0, device=torch.device("cpu"))
 
