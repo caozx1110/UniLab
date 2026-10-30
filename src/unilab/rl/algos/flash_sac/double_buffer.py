@@ -87,6 +87,23 @@ def build_double_buffer_runner(
     env = env_factory(1, env_cfg_override)
     try:
         obs_dim, critic_obs_dim = get_obs_dims(dict(env.obs_groups_spec))
+        names = env.observation_manager._group_obs_term_names["critic"]
+        dims = env.observation_manager._group_obs_term_dim["critic"]
+        cfgs = env.observation_manager._group_obs_term_cfgs["critic"]
+        offset = 0
+        velocity_target_slice = None
+        for name, dim, term_cfg in zip(names, dims, cfgs, strict=True):
+            width = int(__import__("math").prod(dim))
+            if term_cfg.history_length > 0 and term_cfg.flatten_history_dim:
+                width *= int(term_cfg.history_length)
+            if name == "base_lin_vel":
+                if width < 3 or int(__import__("math").prod(dim)) != 3:
+                    raise ValueError("critic base_lin_vel must be a 3D vector term")
+                velocity_target_slice = (offset + width - 3, offset + width)
+                break
+            offset += width
+        if velocity_target_slice is None:
+            raise ValueError("critic observation manager is missing base_lin_vel")
         action_shape = env.action_space.shape
         assert action_shape is not None
         action_dim = int(action_shape[0])
@@ -97,6 +114,7 @@ def build_double_buffer_runner(
         "obs_dim": obs_dim,
         "action_dim": action_dim,
         "critic_obs_dim": critic_obs_dim,
+        "velocity_target_slice": velocity_target_slice,
         "gamma": cfg.algo.gamma,
         "tau": cfg.algo.tau,
         "actor_lr": cfg.algo.actor_lr,

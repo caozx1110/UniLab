@@ -234,6 +234,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         critic_normalize_parameters: bool = True,
         actor_config: Mapping[str, Any] | None = None,
         actor_ema_half_lives: Sequence[float] = (),
+        velocity_target_slice: tuple[int, int] | None = None,
     ):
         self.actor_normalize_parameters = bool(actor_normalize_parameters)
         self.critic_normalize_parameters = bool(critic_normalize_parameters)
@@ -245,6 +246,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         self.obs_dim = obs_dim
         self.critic_obs_dim = critic_obs_dim
         self.action_dim = action_dim
+        self.velocity_target_slice = velocity_target_slice
         self.update_count = 0
         self._device_type = self.device.type
         self._performance_tier = resolve_learner_performance_tier(self.device)
@@ -765,6 +767,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         next_obs: torch.Tensor,
         expert_actions: torch.Tensor,
         critic_obs: torch.Tensor,
+        critic_next_obs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Full actor/critic forward and actor objective.
 
@@ -774,7 +777,15 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         """
         obs_all = torch.cat([obs, next_obs], dim=0)
         with self._autocast():
-            actions_all, actor_info_all = self.actor(obs_all, training=True)
+            if self.velocity_target_slice is not None and hasattr(self.actor, "velocity_estimator_mode"):
+                start, end = self.velocity_target_slice
+                target = critic_obs[:, start:end]
+                next_target = critic_obs[:, start:end] if critic_next_obs is None else critic_next_obs[:, start:end]
+                actions_all, actor_info_all = self.actor(
+                    obs_all, training=True, velocity_target=torch.cat((target, next_target), dim=0)
+                )
+            else:
+                actions_all, actor_info_all = self.actor(obs_all, training=True)
             actions = actions_all.chunk(2, dim=0)[0]
             log_probs = actor_info_all["log_prob"].chunk(2, dim=0)[0]
             q_values, _ = self.critic(critic_obs, actions, training=False)
@@ -862,6 +873,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         next_obs = batch["next_obs"].to(self.device)
         expert_actions = batch["actions"].to(self.device)
         critic_obs = batch["critic"].to(self.device)
+        critic_next_obs = batch["next_critic"].to(self.device)
 
         obs = self._maybe_normalize_obs(obs, update=False)
         next_obs = self._maybe_normalize_obs(next_obs, update=False)
@@ -872,6 +884,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             next_obs,
             expert_actions,
             critic_obs,
+            critic_next_obs,
         )
         aux_names = tuple(sorted(aux_losses))
         if self._aux_loss_names is None:
