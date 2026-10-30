@@ -724,7 +724,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         dones: torch.Tensor,
         truncated: torch.Tensor,
         critic_obs: torch.Tensor,
-        critic_next_obs: torch.Tensor,
+        critic_next_obs: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Full critic forward/target/projection/loss objective."""
         gamma = self.gamma**self.n_step
@@ -767,6 +767,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         next_obs: torch.Tensor,
         expert_actions: torch.Tensor,
         critic_obs: torch.Tensor,
+        critic_next_obs: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Full actor/critic forward and actor objective.
 
@@ -779,8 +780,9 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             if self.velocity_target_slice is not None and hasattr(self.actor, "velocity_estimator_mode"):
                 start, end = self.velocity_target_slice
                 target = critic_obs[:, start:end]
+                next_target = critic_obs[:, start:end] if critic_next_obs is None else critic_next_obs[:, start:end]
                 actions_all, actor_info_all = self.actor(
-                    obs_all, training=True, velocity_target=torch.cat((target, target), dim=0)
+                    obs_all, training=True, velocity_target=torch.cat((target, next_target), dim=0)
                 )
             else:
                 actions_all, actor_info_all = self.actor(obs_all, training=True)
@@ -813,6 +815,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         dones = batch["dones"].to(self.device)
         truncated = batch["truncated"].to(self.device)
         critic_obs = batch["critic"].to(self.device)
+        critic_next_obs = batch["next_critic"].to(self.device)
         critic_next_obs = batch["next_critic"].to(self.device)
 
         obs = self._maybe_normalize_obs(obs, update=True)
@@ -881,6 +884,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             next_obs,
             expert_actions,
             critic_obs,
+            critic_next_obs,
         )
         aux_names = tuple(sorted(aux_losses))
         if self._aux_loss_names is None:
