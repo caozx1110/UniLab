@@ -234,6 +234,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         critic_normalize_parameters: bool = True,
         actor_config: Mapping[str, Any] | None = None,
         actor_ema_half_lives: Sequence[float] = (),
+        velocity_target_slice: tuple[int, int] | None = None,
     ):
         self.actor_normalize_parameters = bool(actor_normalize_parameters)
         self.critic_normalize_parameters = bool(critic_normalize_parameters)
@@ -245,6 +246,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         self.obs_dim = obs_dim
         self.critic_obs_dim = critic_obs_dim
         self.action_dim = action_dim
+        self.velocity_target_slice = velocity_target_slice
         self.update_count = 0
         self._device_type = self.device.type
         self._performance_tier = resolve_learner_performance_tier(self.device)
@@ -774,7 +776,14 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         """
         obs_all = torch.cat([obs, next_obs], dim=0)
         with self._autocast():
-            actions_all, actor_info_all = self.actor(obs_all, training=True)
+            if self.velocity_target_slice is not None and hasattr(self.actor, "velocity_estimator_mode"):
+                start, end = self.velocity_target_slice
+                target = critic_obs[:, start:end]
+                actions_all, actor_info_all = self.actor(
+                    obs_all, training=True, velocity_target=torch.cat((target, target), dim=0)
+                )
+            else:
+                actions_all, actor_info_all = self.actor(obs_all, training=True)
             actions = actions_all.chunk(2, dim=0)[0]
             log_probs = actor_info_all["log_prob"].chunk(2, dim=0)[0]
             q_values, _ = self.critic(critic_obs, actions, training=False)
