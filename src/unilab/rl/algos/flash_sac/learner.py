@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, Sequence, cast
@@ -22,6 +23,7 @@ from unilab.rl.algos.common.learner_base import (
 )
 from unilab.rl.algos.common.normalization import EmpiricalNormalization
 from unilab.rl.algos.common.performance import resolve_learner_performance_tier
+from unilab.rl.algos.flash_sac.actor_ema import ActorEMA
 from unilab.rl.algos.flash_sac.actor_spec import (
     FlashSACActorSpec,
     build_builtin_actor_semantics,
@@ -36,6 +38,8 @@ from unilab.rl.algos.flash_sac.network import (
     FlashSACDoubleCritic,
     FlashSACTemperature,
 )
+
+_LOGGER = logging.getLogger(__name__)
 from unilab.rl.algos.flash_sac.objectives import (
     build_lr_lambda,
     compute_categorical_td_target,
@@ -229,6 +233,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         actor_normalize_parameters: bool = True,
         critic_normalize_parameters: bool = True,
         actor_config: Mapping[str, Any] | None = None,
+        actor_ema_half_lives: Sequence[float] = (),
     ):
         self.actor_normalize_parameters = bool(actor_normalize_parameters)
         self.critic_normalize_parameters = bool(critic_normalize_parameters)
@@ -377,6 +382,11 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             _disable_parameter_normalization(self.critic)
             self.target_critic.load_state_dict(self.critic.state_dict())
             cast(Any, self.critic).normalize_parameters = _noop_normalize_parameters
+        self.actor_ema = ActorEMA(self.actor, actor_ema_half_lives)
+        if self.actor_ema.half_lives and (graph_requested or self._dp_whole_cycle_cuda_graph):
+            raise ValueError(
+                "Actor EMA requires eager update cycles; disable whole-cycle CUDA graph capture"
+            )
         self.temperature = FlashSACTemperature(temp_initial_value).to(self.device)
         self._optimizer_grad_scale = torch.ones((), device=self.device)
         self._optimizer_found_inf = torch.zeros((), device=self.device)
@@ -890,6 +900,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         if not self._capture_update_cycle:
             self.actor_scheduler.step()
         cast(Any, self.actor).normalize_parameters()
+        self.actor_ema.update(self.actor)
 
         temp_value = self.temperature()
         temp_loss = temp_value * (entropy - self.target_entropy)
@@ -1175,11 +1186,15 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         ):
             for key, value in module.state_dict().items():
                 tensors[f"{prefix}.{key}"] = value
+        for half_life, state in zip(self.actor_ema.half_lives, self.actor_ema.live_state_dicts()):
+            for key, value in state.items():
+                tensors[f"actor_ema.{half_life:g}.{key}"] = value
         return tensors
 
     def get_state_dict(self) -> dict[str, Any]:
         return {
             "actor": self.actor.state_dict(),
+            "actor_ema": self.actor_ema.state_dict(),
             "critic": self.critic.state_dict(),
             "target_critic": self.target_critic.state_dict(),
             "temperature": self.temperature.state_dict(),
@@ -1206,6 +1221,23 @@ class FlashSACLearner(WholeCycleLearnerMixin):
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         validate_actor_semantics(state_dict.get("actor_semantics"), self._actor_semantics)
         self.actor.load_state_dict(state_dict["actor"])
+        saved_ema = state_dict.get("actor_ema")
+        saved_half_lives = (
+            tuple(float(value) for value in saved_ema.get("half_lives", ()))
+            if isinstance(saved_ema, dict)
+            else None
+        )
+        if saved_half_lives != self.actor_ema.half_lives:
+            if self.actor_ema.half_lives:
+                _LOGGER.warning(
+                    "Checkpoint EMA state is missing or uses half-lives %s; "
+                    "reinitializing EMA from the restored actor with %s",
+                    saved_half_lives,
+                    self.actor_ema.half_lives,
+                )
+            self.actor_ema = ActorEMA(self.actor, self.actor_ema.half_lives)
+        elif saved_ema is not None:
+            self.actor_ema.load_state_dict(saved_ema)
         self.critic.load_state_dict(state_dict["critic"])
         self.target_critic.load_state_dict(state_dict["target_critic"])
         self.temperature.load_state_dict(state_dict["temperature"])
