@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from unilab.rl.algos.flash_sac import learner as flash_sac_module
+from unilab.rl.algos.flash_sac.actor_ema import ActorEMA
 from unilab.rl.algos.flash_sac.learner import FlashSACLearner, RewardNormalizer
 from unilab.rl.algos.flash_sac.objectives import compute_categorical_td_target
 from unilab.rl.logging.metric_schema import normalize_metric_map
@@ -738,6 +739,49 @@ def test_flashsac_state_dict_round_trip():
     restored.load_state_dict(state_dict)
 
     assert restored.get_state_dict()["update_count"] == learner.get_state_dict()["update_count"]
+
+
+def test_actor_ema_matches_offline_recurrence_and_tracks_buffers() -> None:
+    actor = torch.nn.Sequential(
+        torch.nn.Linear(2, 2),
+        torch.nn.BatchNorm1d(2),
+    )
+    with torch.no_grad():
+        actor[0].weight.fill_(1.0)
+        actor[0].bias.zero_()
+        actor[1].running_mean.copy_(torch.tensor([2.0, 4.0]))
+    ema = ActorEMA(actor, (2.0,))
+    initial = {key: value.detach().clone() for key, value in actor.state_dict().items()}
+    with torch.no_grad():
+        actor[0].weight.fill_(3.0)
+        actor[1].running_mean.copy_(torch.tensor([6.0, 8.0]))
+    ema.update(actor)
+
+    alpha = 1.0 - 2.0 ** -0.5
+    expected_weight = initial["0.weight"] * (1.0 - alpha) + actor[0].weight * alpha
+    expected_mean = initial["1.running_mean"] * (1.0 - alpha) + actor[1].running_mean * alpha
+    actual = ema.actor_state_dict(2.0)
+    torch.testing.assert_close(actual["0.weight"], expected_weight)
+    torch.testing.assert_close(actual["1.running_mean"], expected_mean)
+    assert ema.updates == 1
+
+
+def test_flashsac_ema_round_trip_and_disabled_path() -> None:
+    learner = _make_small_learner(actor_ema_half_lives=(15000.0,))
+    batch = _make_small_batch()
+    learner.update_actor(batch)
+    state_dict = learner.get_state_dict()
+    assert state_dict["actor_ema"]["updates"] == 1
+
+    restored = _make_small_learner(actor_ema_half_lives=(15000.0,))
+    restored.load_state_dict(state_dict)
+    assert restored.actor_ema.updates == 1
+    for key, value in learner.actor_ema.actor_state_dict(15000.0).items():
+        torch.testing.assert_close(value, restored.actor_ema.actor_state_dict(15000.0)[key])
+
+    disabled = _make_small_learner()
+    disabled.update_actor(batch)
+    assert disabled.actor_ema.half_lives == ()
 
 
 def test_reward_normalizer_tracks_discounted_returns() -> None:
