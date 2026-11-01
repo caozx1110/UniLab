@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import math
 from typing import cast
 
@@ -160,13 +161,21 @@ class NormalTanhPolicy(nn.Module):
         self.std_bias = nn.Parameter(torch.zeros(action_dim))
         self.log_std_min = log_std_min
         self.log_std_max = log_std_max
+        # 可选直通截断：前向与 tanh 映射同中点、同斜率并截断到 [min, max]，
+        # 反向梯度不随饱和消失，std 卡在上限后仍能被拉回。默认保持 tanh 映射。
+        self.straight_through = os.environ.get("UNILAB_FLASHSAC_STD_PARAM") == "straight_through"
 
     def get_mean_and_std(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         mean = F.linear(x, self.mean_w.w.weight, self.mean_bias)
         raw_log_std = F.linear(x, self.std_w.w.weight, self.std_bias)
-        log_std = self.log_std_min + (self.log_std_max - self.log_std_min) * 0.5 * (
-            1.0 + torch.tanh(raw_log_std)
-        )
+        if self.straight_through:
+            half = 0.5 * (self.log_std_max - self.log_std_min)
+            linear = self.log_std_min + half + half * raw_log_std
+            log_std = linear - (linear - linear.clamp(self.log_std_min, self.log_std_max)).detach()
+        else:
+            log_std = self.log_std_min + (self.log_std_max - self.log_std_min) * 0.5 * (
+                1.0 + torch.tanh(raw_log_std)
+            )
         std = torch.exp(log_std)
         return mean, std
 
