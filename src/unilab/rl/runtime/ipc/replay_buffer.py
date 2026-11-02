@@ -692,6 +692,10 @@ class ReplayBuffer:
             "truncated": self._trunc_col,
             "critic": getattr(self, "_critic_sl", None),
             "next_critic": getattr(self, "_ncritic_sl", None),
+            # Issue134: trailing next-critic column (grouped reward channel).
+            "next_critic_tail": (
+                self._ncritic_sl.stop - 1 if hasattr(self, "_ncritic_sl") else None
+            ),
         }.get(field_name)
         if field is None:
             raise KeyError(f"Replay field {field_name!r} is unavailable")

@@ -140,6 +140,9 @@ def build_double_buffer_runner(
             _algo_param(cfg.algo, "critic_normalize_parameters", True)
         ),
     }
+    reward_groups = _algo_param(cfg.algo, "reward_groups", None)
+    if reward_groups is not None:
+        learner_kwargs["reward_groups"] = reward_groups
     learner = FlashSACLearner(device=device, **learner_kwargs)
 
     return DoubleBufferOffPolicyRunner(

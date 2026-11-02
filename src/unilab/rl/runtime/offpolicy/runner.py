@@ -67,8 +67,9 @@ def update_reward_stats_from_replay(
     if replay_source is None:
         raise RuntimeError("Reward statistics require the device-authoritative replay source")
 
+    grouped = bool(getattr(learner, "reward_global_channel", False))
     end_ptr, committed_fields = replay_source.read_committed_fields(
-        ("rewards", "dones"),
+        ("rewards", "dones", "next_critic_tail") if grouped else ("rewards", "dones"),
         start_ptr=start_ptr,
     )
     count = end_ptr - start_ptr
@@ -86,6 +87,13 @@ def update_reward_stats_from_replay(
     rewards = committed_fields["rewards"][-count:]
     dones = committed_fields["dones"][-count:]
     num_steps = count // num_envs
+    if grouped:
+        learner.update_reward_stats(
+            rewards.view(num_steps, num_envs),
+            dones.view(num_steps, num_envs),
+            reward_global=committed_fields["next_critic_tail"][-count:].view(num_steps, num_envs),
+        )
+        return end_ptr
     learner.update_reward_stats(
         rewards.view(num_steps, num_envs),
         dones.view(num_steps, num_envs),

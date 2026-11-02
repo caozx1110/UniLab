@@ -14,6 +14,7 @@ import torch.optim as optim
 from unilab.rl.algos.common.compile import get_torch_compile_for_device
 from unilab.rl.algos.common.learner_base import (
     WholeCycleLearnerMixin,
+    polyak_update_target,
     fused_adam_supported,
     mps_bf16_autocast_supported,
     resolve_amp_selection,
@@ -229,6 +230,7 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         actor_normalize_parameters: bool = True,
         critic_normalize_parameters: bool = True,
         actor_config: Mapping[str, Any] | None = None,
+        reward_groups: Mapping[str, Any] | None = None,
     ):
         self.actor_normalize_parameters = bool(actor_normalize_parameters)
         self.critic_normalize_parameters = bool(critic_normalize_parameters)
@@ -359,9 +361,27 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 noise_zeta_mu=actor_noise_zeta_mu,
                 noise_zeta_max=actor_noise_zeta_max,
             )
+        # Issue134: optional second value head for a reward group. The last
+        # critic-observation column carries that group's per-step reward
+        # (same units as the total reward); it is stripped before both heads.
+        self.reward_groups: dict[str, Any] | None = None
+        if reward_groups:
+            if set(reward_groups) != {"global_gamma", "global_terms"}:
+                raise ValueError(f"reward_groups keys must be global_gamma/global_terms: {reward_groups}")
+            self.reward_groups = {
+                "global_gamma": float(reward_groups["global_gamma"]),
+                "global_terms": [str(name) for name in reward_groups["global_terms"]],
+            }
+        self.reward_global_channel = self.reward_groups is not None
+        if self.reward_global_channel:
+            assert self.reward_groups is not None
+            if n_step != 1:
+                raise ValueError("reward_groups requires n_step=1")
+            self.global_gamma = float(self.reward_groups["global_gamma"])
+        critic_input_dim = self.critic_obs_dim - int(self.reward_global_channel)
         self.critic = FlashSACDoubleCritic(
             num_blocks=critic_num_blocks,
-            input_dim=self.critic_obs_dim + action_dim,
+            input_dim=critic_input_dim + action_dim,
             hidden_dim=critic_hidden_dim,
             num_bins=num_atoms,
             min_v=critic_min_v,
@@ -370,6 +390,18 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         )
         self.target_critic = copy.deepcopy(self.critic).to(self.device)
         self.target_critic.eval()
+        if self.reward_global_channel:
+            self.critic_global = FlashSACDoubleCritic(
+                num_blocks=critic_num_blocks,
+                input_dim=critic_input_dim + action_dim,
+                hidden_dim=critic_hidden_dim,
+                num_bins=num_atoms,
+                min_v=critic_min_v,
+                max_v=critic_max_v,
+                device=self.device,
+            )
+            self.target_critic_global = copy.deepcopy(self.critic_global).to(self.device)
+            self.target_critic_global.eval()
         if not self.actor_normalize_parameters:
             _disable_parameter_normalization(self.actor)
             cast(Any, self.actor).normalize_parameters = _noop_normalize_parameters
@@ -377,6 +409,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             _disable_parameter_normalization(self.critic)
             self.target_critic.load_state_dict(self.critic.state_dict())
             cast(Any, self.critic).normalize_parameters = _noop_normalize_parameters
+            if self.reward_global_channel:
+                _disable_parameter_normalization(self.critic_global)
+                self.target_critic_global.load_state_dict(self.critic_global.state_dict())
+                cast(Any, self.critic_global).normalize_parameters = _noop_normalize_parameters
         self.temperature = FlashSACTemperature(temp_initial_value).to(self.device)
         self._optimizer_grad_scale = torch.ones((), device=self.device)
         self._optimizer_found_inf = torch.zeros((), device=self.device)
@@ -398,6 +434,13 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             if normalize_reward
             else None
         )
+        # Each head normalizes its own reward with its own discount (the
+        # Bellman gamma and the discounted-return statistics must agree).
+        self.reward_normalizer_global = (
+            RewardNormalizer(gamma=self.global_gamma, g_max=normalized_g_max, device=self.device)
+            if normalize_reward and self.reward_global_channel
+            else None
+        )
 
         # GradScaler is only needed for fp16 (cuda); bf16 doesn't need it.
         self.scaler: Any | None = (
@@ -415,6 +458,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             optimizer_kwargs["capturable"] = True
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=lr_peak, **optimizer_kwargs)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=lr_peak, **optimizer_kwargs)
+        if self.reward_global_channel:
+            self.critic_global_optimizer = optim.Adam(
+                self.critic_global.parameters(), lr=lr_peak, **optimizer_kwargs
+            )
         self.temperature_optimizer = optim.Adam(
             self.temperature.parameters(), lr=lr_peak, **optimizer_kwargs
         )
@@ -429,6 +476,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         )
         self.actor_scheduler = optim.lr_scheduler.LambdaLR(self.actor_optimizer, scheduler_fn)
         self.critic_scheduler = optim.lr_scheduler.LambdaLR(self.critic_optimizer, scheduler_fn)
+        if self.reward_global_channel:
+            self.critic_global_scheduler = optim.lr_scheduler.LambdaLR(
+                self.critic_global_optimizer, scheduler_fn
+            )
         self.temperature_scheduler = optim.lr_scheduler.LambdaLR(
             self.temperature_optimizer, scheduler_fn
         )
@@ -461,6 +512,8 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 "FlashSAC CUDA compile mode requires bf16 (or fp32); "
                 "fp16 GradScaler is incompatible with the whole-cycle graph"
             )
+        if self._compile_full_update_cycle and self.reward_global_channel:
+            raise ValueError("reward_groups do not support the whole-cycle CUDA graph")
         if self._compile_full_update_cycle:
             if obs_normalization:
                 raise ValueError(
@@ -590,6 +643,10 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             self._full_actor_objective = compile_fn(  # type: ignore[method-assign]
                 self._full_actor_objective, **compile_kwargs
             )
+            if self.reward_global_channel:
+                self._full_grouped_critic_objective = compile_fn(  # type: ignore[method-assign]
+                    self._full_grouped_critic_objective, **compile_kwargs
+                )
             return
         if not self.compile_actor_inference:
             self.actor.get_mean_and_std = compile_fn(  # type: ignore[method-assign]
@@ -659,10 +716,44 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         self,
         rewards: torch.Tensor,
         dones: torch.Tensor,
+        reward_global: torch.Tensor | None = None,
     ) -> None:
         if self.reward_normalizer is None:
             return
+        if self.reward_global_channel:
+            if reward_global is None:
+                raise ValueError("reward_groups require the global reward channel")
+            assert self.reward_normalizer_global is not None
+            self.reward_normalizer_global.update_from_transitions(reward_global, dones)
+            rewards = rewards - reward_global
         self.reward_normalizer.update_from_transitions(rewards, dones)
+
+    def _split_group_rewards(
+        self, rewards: torch.Tensor, critic_next_obs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return normalized (local, global) rewards from the trailing channel."""
+        reward_global = critic_next_obs[:, -1]
+        reward_local = rewards - reward_global
+        if self.reward_normalizer is not None:
+            assert self.reward_normalizer_global is not None
+            reward_local = self.reward_normalizer.normalize(reward_local)
+            reward_global = self.reward_normalizer_global.normalize(reward_global)
+        return reward_local, reward_global
+
+    def _reward_denominator(self, normalizer: RewardNormalizer | None) -> torch.Tensor:
+        if normalizer is None:
+            return torch.ones((), device=self.device)
+        return torch.maximum(
+            torch.sqrt(normalizer.rms.var + normalizer.eps),
+            normalizer.g_r_max / max(normalizer.g_max, normalizer.eps),
+        ).reshape(())
+
+    def global_q_scale(self) -> torch.Tensor:
+        """Convert the global head's normalized Q into local-head units."""
+        return (
+            self._reward_denominator(self.reward_normalizer_global)
+            / self._reward_denominator(self.reward_normalizer)
+        ).detach()
 
     def _critic_objective(
         self,
@@ -695,8 +786,13 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         actions: torch.Tensor,
         expert_actions: torch.Tensor,
         temp_value: torch.Tensor,
+        q_values_global: torch.Tensor | None = None,
+        global_q_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         min_q = torch.min(q_values[0], q_values[1])
+        if q_values_global is not None:
+            assert global_q_scale is not None
+            min_q = min_q + global_q_scale * torch.min(q_values_global[0], q_values_global[1])
         actor_loss = (temp_value.detach() * log_probs - min_q).mean()
         if self.actor_bc_alpha > 0:
             bc_loss = torch.mean((actions - expert_actions) ** 2)
@@ -749,12 +845,86 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         )
         return critic_loss, reward_scale_std
 
+    def _grouped_td_targets(
+        self,
+        actions: torch.Tensor,
+        reward_local: torch.Tensor,
+        reward_global: torch.Tensor,
+        next_obs: torch.Tensor,
+        dones: torch.Tensor,
+        truncated: torch.Tensor,
+        obs_all: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Target distributions of both heads from one next-action sample.
+
+        The entropy bonus enters the local head only, so the summed value
+        counts it once.
+        """
+        with torch.no_grad():
+            with self._autocast():
+                next_actions, actor_info = self.actor(next_obs, training=False)
+                actor_entropy = self.temperature().detach() * actor_info["log_prob"]
+                act_all = torch.cat([actions, next_actions], dim=0)
+                targets = []
+                for target_critic, reward, entropy, gamma in (
+                    (self.target_critic, reward_local, actor_entropy, self.gamma),
+                    (
+                        self.target_critic_global,
+                        reward_global,
+                        torch.zeros_like(actor_entropy),
+                        self.global_gamma,
+                    ),
+                ):
+                    qs_all, q_info_all = target_critic(obs_all, act_all, training=True)
+                    next_q_log_probs = select_min_q_log_probs(
+                        qs_all.chunk(2, dim=1)[1], q_info_all["log_prob"].chunk(2, dim=1)[1]
+                    )
+                    targets.append(
+                        compute_categorical_td_target(
+                            support=cast(torch.Tensor, target_critic.predictor.support),
+                            target_log_probs=next_q_log_probs,
+                            reward=reward,
+                            dones=dones,
+                            truncated=truncated,
+                            actor_entropy=entropy,
+                            gamma=gamma,
+                        )
+                    )
+        return act_all, targets[0], targets[1]
+
+    def _full_grouped_critic_objective(
+        self,
+        actions: torch.Tensor,
+        reward_local: torch.Tensor,
+        reward_global: torch.Tensor,
+        next_obs: torch.Tensor,
+        dones: torch.Tensor,
+        truncated: torch.Tensor,
+        critic_obs: torch.Tensor,
+        critic_next_obs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        obs_all = torch.cat([critic_obs, critic_next_obs], dim=0)
+        act_all, target_local, target_global = self._grouped_td_targets(
+            actions, reward_local, reward_global, next_obs, dones, truncated, obs_all
+        )
+        losses = []
+        with self._autocast():
+            for critic, target in (
+                (self.critic, target_local),
+                (self.critic_global, target_global),
+            ):
+                _, pred_info_all = critic(obs_all, act_all, training=True)
+                pred_log_probs = pred_info_all["log_prob"].chunk(2, dim=1)[0]
+                losses.append(-(target.unsqueeze(0) * pred_log_probs).sum(dim=-1).mean())
+        return losses[0], losses[1]
+
     def _full_actor_objective(
         self,
         obs: torch.Tensor,
         next_obs: torch.Tensor,
         expert_actions: torch.Tensor,
         critic_obs: torch.Tensor,
+        global_q_scale: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
         """Full actor/critic forward and actor objective.
 
@@ -768,8 +938,17 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             actions = actions_all.chunk(2, dim=0)[0]
             log_probs = actor_info_all["log_prob"].chunk(2, dim=0)[0]
             q_values, _ = self.critic(critic_obs, actions, training=False)
+            q_values_global = None
+            if global_q_scale is not None:
+                q_values_global, _ = self.critic_global(critic_obs, actions, training=False)
             actor_loss, entropy = self._actor_objective(
-                log_probs, q_values, actions, expert_actions, self.temperature()
+                log_probs,
+                q_values,
+                actions,
+                expert_actions,
+                self.temperature(),
+                q_values_global,
+                global_q_scale,
             )
             aux_losses = validate_aux_losses(
                 actor_info_all.get("aux_losses"), context="FlashSAC actor"
@@ -798,6 +977,12 @@ class FlashSACLearner(WholeCycleLearnerMixin):
 
         obs = self._maybe_normalize_obs(obs, update=True)
         next_obs = self._maybe_normalize_obs(next_obs, update=False)
+
+        if self.reward_global_channel:
+            return self._update_grouped_critic(
+                actions, rewards, next_obs, dones, truncated, critic_obs, critic_next_obs,
+                read_metrics=read_metrics,
+            )
 
         if self.reward_normalizer is not None:
             rewards = self.reward_normalizer.normalize(rewards)
@@ -842,6 +1027,82 @@ class FlashSACLearner(WholeCycleLearnerMixin):
             metric_tensors,
         )
 
+    def _update_grouped_critic(
+        self,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        next_obs: torch.Tensor,
+        dones: torch.Tensor,
+        truncated: torch.Tensor,
+        critic_obs: torch.Tensor,
+        critic_next_obs: torch.Tensor,
+        *,
+        read_metrics: bool,
+    ) -> dict[str, float]:
+        if self.scaler is not None:
+            raise ValueError("reward_groups do not support fp16 GradScaler")
+        reward_local, reward_global = self._split_group_rewards(rewards, critic_next_obs)
+        loss_local, loss_global = self._full_grouped_critic_objective(
+            actions,
+            reward_local,
+            reward_global,
+            next_obs,
+            dones,
+            truncated,
+            critic_obs[:, :-1],
+            critic_next_obs[:, :-1],
+        )
+        critic_loss = loss_local + loss_global
+        optimizers = (self.critic_optimizer, self.critic_global_optimizer)
+        for optimizer in optimizers:
+            self._zero_optimizer_gradients(optimizer)
+        if self._finite_check_ok(critic_loss, read_metrics):
+            critic_loss.backward()
+            parameters = [*self.critic.parameters(), *self.critic_global.parameters()]
+            self._sync_loss_gradients(parameters, critic_loss)
+            for optimizer in optimizers:
+                self._arm_optimizer_finite_gate(optimizer, critic_loss)
+                optimizer.step()
+        self.critic_scheduler.step()
+        self.critic_global_scheduler.step()
+        self.critic.normalize_parameters()
+        self.critic_global.normalize_parameters()
+        if not read_metrics:
+            self._pending_cycle_critic_metric_values = torch.stack(
+                [critic_loss.detach().reshape(())]
+                + (
+                    [self._reward_denominator(self.reward_normalizer)]
+                    if self.reward_normalizer is not None
+                    else []
+                )
+            )
+            return {}
+        names: tuple[str, ...] = ("Loss/critic", "Loss/critic_local", "Loss/critic_global")
+        tensors: tuple[torch.Tensor, ...] = (critic_loss, loss_local, loss_global)
+        if self.reward_normalizer is not None:
+            assert self.reward_normalizer_global is not None
+            names = (*names, "Train/reward_scale_std", "Train/reward_scale_std_global",
+                     "Train/global_q_scale", "Train/reward_global_mean")
+            tensors = (
+                *tensors,
+                torch.sqrt(self.reward_normalizer.rms.var),
+                torch.sqrt(self.reward_normalizer_global.rms.var),
+                self.global_q_scale(),
+                critic_next_obs[:, -1].mean(),
+            )
+        return self._read_metric_tensors(names, tensors)
+
+    def soft_update_target(self) -> None:
+        super().soft_update_target()
+        if not self.reward_global_channel:
+            return
+        tau: float | torch.Tensor
+        if self._device_type == "cuda":
+            tau = self._target_tau * self._whole_cycle_finite_gate().to(self._target_tau.dtype)
+        else:
+            tau = self.tau
+        polyak_update_target(self.target_critic_global, self.critic_global, tau)
+
     def update_actor(
         self,
         batch: dict[str, torch.Tensor],
@@ -857,11 +1118,16 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         next_obs = self._maybe_normalize_obs(next_obs, update=False)
 
         self._pending_actor_metric_values = None
+        global_q_scale = None
+        if self.reward_global_channel:
+            critic_obs = critic_obs[:, :-1]
+            global_q_scale = self.global_q_scale()
         actor_loss, entropy, aux_losses = self._full_actor_objective(
             obs,
             next_obs,
             expert_actions,
             critic_obs,
+            global_q_scale,
         )
         aux_names = tuple(sorted(aux_losses))
         if self._aux_loss_names is None:
@@ -1201,6 +1467,23 @@ class FlashSACLearner(WholeCycleLearnerMixin):
                 self.reward_normalizer.state_dict() if self.reward_normalizer is not None else None
             ),
             "update_count": self.update_count,
+            **self._global_head_state_dict(),
+        }
+
+    def _global_head_state_dict(self) -> dict[str, Any]:
+        if not self.reward_global_channel:
+            return {}
+        return {
+            "critic_global": self.critic_global.state_dict(),
+            "target_critic_global": self.target_critic_global.state_dict(),
+            "critic_global_optimizer": self.critic_global_optimizer.state_dict(),
+            "critic_global_scheduler": self.critic_global_scheduler.state_dict(),
+            "reward_normalizer_global": (
+                self.reward_normalizer_global.state_dict()
+                if self.reward_normalizer_global is not None
+                else None
+            ),
+            "reward_groups": copy.deepcopy(self.reward_groups),
         }
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
@@ -1220,4 +1503,15 @@ class FlashSACLearner(WholeCycleLearnerMixin):
         if self.reward_normalizer is not None and state_dict.get("reward_normalizer"):
             self.reward_normalizer.load_state_dict(state_dict["reward_normalizer"])
         self.update_count = int(state_dict.get("update_count", 0))
+        if self.reward_global_channel:
+            if state_dict.get("reward_groups") != self.reward_groups:
+                raise ValueError("Checkpoint reward_groups differ from the learner configuration")
+            self.critic_global.load_state_dict(state_dict["critic_global"])
+            self.target_critic_global.load_state_dict(state_dict["target_critic_global"])
+            self.critic_global_optimizer.load_state_dict(state_dict["critic_global_optimizer"])
+            self.critic_global_scheduler.load_state_dict(state_dict["critic_global_scheduler"])
+            if self.reward_normalizer_global is not None:
+                self.reward_normalizer_global.load_state_dict(state_dict["reward_normalizer_global"])
+        elif "critic_global" in state_dict:
+            raise ValueError("Checkpoint has a global value head but reward_groups is disabled")
         self._reset_update_cycle_graph()
