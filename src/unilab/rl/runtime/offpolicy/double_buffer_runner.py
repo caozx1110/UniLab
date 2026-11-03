@@ -201,6 +201,19 @@ class _LearnerInferenceScheduler:
         self.policy_version += 1
 
 
+def _build_replay_batch_transform(spec: Mapping[str, Any] | None) -> Callable | None:
+    if spec is None:
+        return None
+    from importlib import import_module
+
+    builder = str(spec["builder"])
+    module_path, _, attr = builder.partition(":") if ":" in builder else builder.rpartition(".")
+    transform = getattr(import_module(module_path), attr)(**dict(spec.get("kwargs") or {}))
+    if not callable(transform):
+        raise TypeError(f"replay batch transform {builder!r} is not callable")
+    return transform
+
+
 class DoubleBufferOffPolicyRunner(OffPolicyRunner):
     """Single-device off-policy runner with a double-buffered device batch."""
 
@@ -224,6 +237,7 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         inference_epoch: int = 0,
         collector_metrics_interval: int | None = None,
         tf32_matmul_policy: Any | None = None,
+        replay_batch_transform: Mapping[str, Any] | None = None,
         **kwargs,
     ):
         kwargs["device"] = require_offpolicy_replay_device(kwargs.get("device"))
@@ -303,6 +317,10 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
         # Kept only for source-compatible construction. It is
         # intentionally not retained as a latency SLA anywhere in the runtime.
         self.learner_prepare_hook = learner_prepare_hook
+        # Optional owner-declared per-update replay batch transform
+        # ({"builder": "pkg.module:callable", "kwargs": {...}}), e.g. data
+        # augmentation; None leaves sampled batches untouched.
+        self.replay_batch_transform = _build_replay_batch_transform(replay_batch_transform)
         self.target_frequency = max(int(target_frequency), 1)
         self.policy_before_critic = bool(policy_before_critic)
         # Per-rank CPU block owned by this rank's collector (multi-GPU DP);
@@ -2342,6 +2360,8 @@ class DoubleBufferOffPolicyRunner(OffPolicyRunner):
                             s = update_idx * self.batch_size
                             e = s + self.batch_size
                             batch = {k: v[s:e] for k, v in large_batch.items()}
+                            if self.replay_batch_transform is not None:
+                                batch = self.replay_batch_transform(batch)
                             read_deferred_critic_metrics = (
                                 update_idx == self.updates_per_step - 1
                                 and not callable(deferred_update_metrics)

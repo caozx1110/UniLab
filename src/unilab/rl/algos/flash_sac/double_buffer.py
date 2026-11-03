@@ -144,6 +144,7 @@ def build_double_buffer_runner(
     if reward_groups is not None:
         learner_kwargs["reward_groups"] = reward_groups
     learner = FlashSACLearner(device=device, **learner_kwargs)
+    replay_batch_transform = _algo_param(cfg.algo, "replay_batch_transform", None)
 
     return DoubleBufferOffPolicyRunner(
         learner=learner,
@@ -179,6 +180,7 @@ def build_double_buffer_runner(
         inference_placement=inference_placement,
         runtime_settings=runtime_settings,
         log_interval=int(cfg.training.log_interval),
+        replay_batch_transform=replay_batch_transform,
         replay_pipeline_factory=partial(
             AgeBiasedReplayPipeline,
             decay_step=int(_algo_param(cfg.algo, "decay_step", 0)),
